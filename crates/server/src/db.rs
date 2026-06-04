@@ -192,6 +192,130 @@ pub async fn upsert_trades(pool: &PgPool, symbol: &str, rows: &[TradeRow]) -> Re
     Ok(())
 }
 
+// --- Sub-second candle synthesis from trades --------------------------------
+
+/// Translate a TF into the Postgres interval literal we feed to `time_bucket`.
+/// Only S1/S5 are synthesized off trades; native-kline TFs read from the
+/// `candles` table instead.
+fn subsec_bucket_interval(tf: protocol::Timeframe) -> &'static str {
+    match tf {
+        protocol::Timeframe::S1 => "1 second",
+        protocol::Timeframe::S5 => "5 seconds",
+        _ => panic!("subsec_bucket_interval called with non-subsec TF: {tf:?}"),
+    }
+}
+
+/// Synthesize the most recent `limit` S1/S5 candles for `symbol` by bucketing
+/// the `trades` hypertable. Uses Timescale's `first` / `last` ordered
+/// aggregates over `agg_id` to lock down OHLC ordering even when multiple
+/// trades share a millisecond. Empty buckets (no trades in that second)
+/// don't appear — BTCUSDT volume makes that vanishingly rare for S5 and
+/// only occasional for S1.
+pub async fn fetch_subsec_snapshot(
+    pool: &PgPool,
+    symbol: &str,
+    tf: protocol::Timeframe,
+    limit: i64,
+) -> Result<Vec<Candle>> {
+    let interval = subsec_bucket_interval(tf);
+    let sql = format!(
+        "SELECT \
+            time_bucket(INTERVAL '{interval}', ts) AS open_time, \
+            first(price, agg_id) AS open, \
+            max(price) AS high, \
+            min(price) AS low, \
+            last(price, agg_id) AS close, \
+            sum(qty) AS volume, \
+            sum(qty * price) AS quote_volume, \
+            count(*)::int AS trades, \
+            sum(CASE WHEN NOT is_buyer_maker THEN qty ELSE 0 END) AS taker_buy_vol \
+         FROM trades \
+         WHERE symbol = $1 \
+         GROUP BY open_time \
+         ORDER BY open_time DESC \
+         LIMIT $2",
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    let bar_ms = tf.duration_ms();
+    let mut candles = build_subsec_candles(rows, bar_ms)?;
+    candles.reverse();
+    Ok(candles)
+}
+
+/// Synthesize up to `count` S1/S5 candles strictly older than `before_ms`
+/// for `symbol`. Same shape as the snapshot but with an exclusive upper bound.
+pub async fn fetch_subsec_history_page(
+    pool: &PgPool,
+    symbol: &str,
+    tf: protocol::Timeframe,
+    before_ms: i64,
+    count: i64,
+) -> Result<Vec<Candle>> {
+    let interval = subsec_bucket_interval(tf);
+    let before = Utc.timestamp_millis_opt(before_ms).single().unwrap_or_else(|| {
+        Utc.timestamp_opt(0, 0).unwrap()
+    });
+    let sql = format!(
+        "SELECT \
+            time_bucket(INTERVAL '{interval}', ts) AS open_time, \
+            first(price, agg_id) AS open, \
+            max(price) AS high, \
+            min(price) AS low, \
+            last(price, agg_id) AS close, \
+            sum(qty) AS volume, \
+            sum(qty * price) AS quote_volume, \
+            count(*)::int AS trades, \
+            sum(CASE WHEN NOT is_buyer_maker THEN qty ELSE 0 END) AS taker_buy_vol \
+         FROM trades \
+         WHERE symbol = $1 AND ts < $2 \
+         GROUP BY open_time \
+         ORDER BY open_time DESC \
+         LIMIT $3",
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(before)
+        .bind(count)
+        .fetch_all(pool)
+        .await?;
+
+    let bar_ms = tf.duration_ms();
+    let mut candles = build_subsec_candles(rows, bar_ms)?;
+    candles.reverse();
+    Ok(candles)
+}
+
+fn build_subsec_candles(
+    rows: Vec<sqlx::postgres::PgRow>,
+    bar_ms: i64,
+) -> Result<Vec<Candle>> {
+    rows.into_iter()
+        .map(|r| -> Result<Candle> {
+            let open_time: DateTime<Utc> = r.try_get("open_time")?;
+            let open_time_ms = open_time.timestamp_millis();
+            Ok(Candle {
+                open_time: open_time_ms,
+                close_time: open_time_ms + bar_ms - 1,
+                open: r.try_get("open")?,
+                high: r.try_get("high")?,
+                low: r.try_get("low")?,
+                close: r.try_get("close")?,
+                volume: r.try_get("volume")?,
+                quote_volume: Some(r.try_get("quote_volume")?),
+                trades: Some(r.try_get("trades")?),
+                taker_buy_vol: Some(r.try_get("taker_buy_vol")?),
+            })
+        })
+        .collect()
+}
+
 /// Read up to `count` closed bars for `(symbol, tf)` strictly older than
 /// `before_ms`, returned chronologically (oldest first).
 pub async fn fetch_history_page(

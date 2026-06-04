@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use protocol::Timeframe;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use futures::future::try_join_all;
 use sqlx::PgPool;
 use std::{collections::HashMap, time::Duration as StdDuration};
@@ -315,10 +315,198 @@ async fn flush_buffer(pool: &PgPool, buffer: &mut HashMap<String, Vec<TradeRow>>
     }
 }
 
+// --- Sub-second aggregator --------------------------------------------------
+
+/// Minimum gap between consecutive *open-bar* tick emissions for a synthesized
+/// TF. At ~100 aggTrades/sec emitting per trade would push 100 Hz to the
+/// gateway forwarder — too chatty over the wire. 100ms throttling caps each
+/// synthesized TF at ~10 Hz of open-bar updates, matching the trade-batch and
+/// book-delta cadence. Closed-bar emissions always fire immediately.
+const SUBSEC_EMIT_THROTTLE_MS: i64 = 100;
+
+/// Rolling state for one in-progress sub-second bar.
+#[derive(Clone, Debug)]
+struct PartialBar {
+    open_time_ms: i64,
+    close_time_ms: i64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    quote_volume: f64,
+    trades: i32,
+    taker_buy_vol: f64,
+    /// Wall-clock of the last open-bar tick we emitted for this bar. Used to
+    /// throttle open-bar emits without affecting close-bar emits.
+    last_emit_ms: i64,
+}
+
+/// Fold the aggTrade stream into rolling S1 / S5 bars per symbol and emit
+/// them on the kline broadcast. The DB writer ignores synthesized TFs (the
+/// trades table is the source of truth); the gateway treats live S1/S5 ticks
+/// identically to the native TFs.
+///
+/// Resilience: on `RecvError::Lagged` the in-progress bars are discarded —
+/// any open/high/low/close we'd accumulate from a partial sequence would be
+/// wrong. The next trade after the gap starts a fresh bar; the snapshot
+/// query against `trades` will reconstruct the missed window when a client
+/// subscribes.
+pub async fn run_subsec_aggregator(
+    symbol: String,
+    mut trade_rx: broadcast::Receiver<TradeTick>,
+    kline_tx: broadcast::Sender<Tick>,
+) -> Result<()> {
+    info!(symbol = %symbol, "subsec aggregator task started");
+    const SUBSEC_TFS: [Timeframe; 2] = [Timeframe::S1, Timeframe::S5];
+    let mut bars: HashMap<Timeframe, PartialBar> = HashMap::new();
+
+    loop {
+        match trade_rx.recv().await {
+            Ok(tick) => {
+                if tick.symbol != symbol {
+                    continue;
+                }
+                for &tf in &SUBSEC_TFS {
+                    update_bar(&mut bars, tf, &tick.trade, &symbol, &kline_tx);
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(skipped = n, "subsec aggregator lagged trade broadcast");
+                bars.clear();
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                info!("trade broadcast closed; subsec aggregator exiting");
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn update_bar(
+    bars: &mut HashMap<Timeframe, PartialBar>,
+    tf: Timeframe,
+    trade: &TradeRow,
+    symbol: &str,
+    kline_tx: &broadcast::Sender<Tick>,
+) {
+    let bar_ms = tf.duration_ms();
+    let ts_ms = trade.ts.timestamp_millis();
+    // Align to TF boundary. The SQL fallback path (fetch_subsec_snapshot)
+    // uses time_bucket with the same TF, which agrees with this integer
+    // floor for any TF whose epoch-aligned origin matches (it does for
+    // sub-second TFs against the Unix epoch).
+    let bar_open = (ts_ms / bar_ms) * bar_ms;
+    let bar_close = bar_open + bar_ms - 1;
+    let qty_quote = trade.qty * trade.price;
+    let taker_buy = if trade.is_buyer_maker { 0.0 } else { trade.qty };
+
+    match bars.get(&tf) {
+        Some(bar) if bar.open_time_ms == bar_open => {
+            // Same bar — accumulate.
+            let mut updated = bar.clone();
+            updated.high = updated.high.max(trade.price);
+            updated.low = updated.low.min(trade.price);
+            updated.close = trade.price;
+            updated.volume += trade.qty;
+            updated.quote_volume += qty_quote;
+            updated.trades += 1;
+            updated.taker_buy_vol += taker_buy;
+            if ts_ms - updated.last_emit_ms >= SUBSEC_EMIT_THROTTLE_MS {
+                emit_tick(&updated, tf, symbol, false, kline_tx);
+                updated.last_emit_ms = ts_ms;
+            }
+            bars.insert(tf, updated);
+        }
+        Some(bar) if bar.open_time_ms < bar_open => {
+            // Bar rollover. Close the previous (always emit close), start fresh.
+            let prev = bar.clone();
+            emit_tick(&prev, tf, symbol, true, kline_tx);
+            let new_bar = PartialBar {
+                open_time_ms: bar_open,
+                close_time_ms: bar_close,
+                open: trade.price,
+                high: trade.price,
+                low: trade.price,
+                close: trade.price,
+                volume: trade.qty,
+                quote_volume: qty_quote,
+                trades: 1,
+                taker_buy_vol: taker_buy,
+                last_emit_ms: ts_ms,
+            };
+            emit_tick(&new_bar, tf, symbol, false, kline_tx);
+            bars.insert(tf, new_bar);
+        }
+        None => {
+            // First trade we've seen — initialize the bar.
+            let new_bar = PartialBar {
+                open_time_ms: bar_open,
+                close_time_ms: bar_close,
+                open: trade.price,
+                high: trade.price,
+                low: trade.price,
+                close: trade.price,
+                volume: trade.qty,
+                quote_volume: qty_quote,
+                trades: 1,
+                taker_buy_vol: taker_buy,
+                last_emit_ms: ts_ms,
+            };
+            emit_tick(&new_bar, tf, symbol, false, kline_tx);
+            bars.insert(tf, new_bar);
+        }
+        Some(_) => {
+            // Trade older than the current bar. The aggTrade stream is
+            // monotonic in practice; this branch is a defensive no-op.
+        }
+    }
+}
+
+fn emit_tick(
+    bar: &PartialBar,
+    tf: Timeframe,
+    symbol: &str,
+    is_closed: bool,
+    tx: &broadcast::Sender<Tick>,
+) {
+    let open_time = match Utc.timestamp_millis_opt(bar.open_time_ms).single() {
+        Some(t) => t,
+        None => return,
+    };
+    let close_time = match Utc.timestamp_millis_opt(bar.close_time_ms).single() {
+        Some(t) => t,
+        None => return,
+    };
+    let kline = KlineRow {
+        open_time,
+        close_time,
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        volume: bar.volume,
+        quote_volume: bar.quote_volume,
+        trades: bar.trades,
+        taker_buy_vol: bar.taker_buy_vol,
+    };
+    let _ = tx.send(Tick {
+        symbol: symbol.to_string(),
+        tf,
+        kline,
+        is_closed,
+    });
+}
+
 /// Drain the broadcast channel forever, UPSERTing every **closed** kline
 /// into the `candles` table. Open (in-progress) bars are streamed to
 /// gateway clients but not persisted — only the final bar is canonical, and
 /// the next closed-bar UPSERT replaces any earlier persisted state.
+///
+/// Synthesized sub-second bars (S1/S5 from the aggregator) ride the same
+/// broadcast for live forwarding but are *not* persisted — the `trades`
+/// table is the source of truth for those, and snapshot/history-page reads
+/// derive them on demand via `time_bucket`.
 ///
 /// On `RecvError::Lagged`, log and skip — the broadcast capacity is large
 /// enough that lag indicates the DB is very slow, not a normal blip.
@@ -329,7 +517,7 @@ pub async fn run_db_writer(
     info!("db writer task started");
     loop {
         match rx.recv().await {
-            Ok(tick) if tick.is_closed => {
+            Ok(tick) if tick.is_closed && tick.tf.is_native_kline() => {
                 let rows = std::slice::from_ref(&tick.kline);
                 if let Err(e) =
                     db::upsert_klines(&pool, &tick.symbol, tick.tf.as_str(), rows).await
@@ -342,7 +530,7 @@ pub async fn run_db_writer(
                     );
                 }
             }
-            Ok(_) => { /* open bar; skip persistence */ }
+            Ok(_) => { /* open bar OR synthesized subsec; skip persistence */ }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(skipped = n, "db writer lagged behind broadcast");
             }

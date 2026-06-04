@@ -77,7 +77,27 @@ async fn main() -> Result<()> {
         })
     };
 
-    // Drop bootstrap receivers — the writers' receivers are canonical.
+    // Sub-second aggregator: subscribes to trades, emits synthesized S1/S5
+    // bars on the kline broadcast so the gateway treats live sub-second
+    // ticks identically to the native TFs. The DB writer filters these
+    // out — sub-second bars live only in the `trades` table.
+    let subsec_aggregator = {
+        let rx = trade_tx.subscribe();
+        let kline_tx = kline_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ingest::run_subsec_aggregator(
+                SYMBOL.to_string(),
+                rx,
+                kline_tx,
+            )
+            .await
+            {
+                warn!(error = ?e, "subsec aggregator task exited with error");
+            }
+        })
+    };
+
+    // Drop bootstrap receivers — the writers' / aggregator's receivers are canonical.
     drop(_kline_bootstrap_rx);
     drop(_trade_bootstrap_rx);
 
@@ -126,6 +146,7 @@ async fn main() -> Result<()> {
     info!("shutdown requested");
     gateway_handle.abort();
     ingest_handle.abort();
+    subsec_aggregator.abort();
     trade_writer.abort();
     kline_writer.abort();
     Ok(())
