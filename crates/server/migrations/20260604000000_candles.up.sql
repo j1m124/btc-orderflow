@@ -1,7 +1,12 @@
 -- Initial schema: one OHLCV hypertable for every (symbol, tf, bar). The
--- forward-looking columns (quote_volume, trades, taker_buy_vol) are populated
--- from Binance kline data but not on the wire today; they unlock per-bar
--- delta / VWAP / aggression-ratio indicators without needing a trade-tape.
+-- forward-looking columns (quote_volume, trades, taker_buy_vol) unlock per-bar
+-- VWAP / trade-count / aggression-ratio indicators without a trade-tape.
+--
+-- They're left NULL-able even though Binance always populates them — that's
+-- for exchange-portability, not a backfill TODO. Bybit/OKX/Deribit kline APIs
+-- don't ship `trades` or `taker_buy_vol`; Coinbase + Kraken don't ship
+-- `quote_volume` either. Keep NULL allowed so future non-Binance ingest paths
+-- can write what they have without an ALTER COLUMN dance.
 
 CREATE TABLE IF NOT EXISTS candles (
     symbol         TEXT             NOT NULL,

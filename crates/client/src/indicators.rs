@@ -1,23 +1,18 @@
-//! Chart indicators. v1 design (locked in via /grill-me):
+//! Chart indicators. Surviving built-ins after the BTC-orderflow strip:
+//! Volume, Trades (both pane-only histograms) and Bollinger Bands (overlay,
+//! retained in-tree but not user-spawnable). Per-chart `Vec<IndicatorInstance>`
+//! on `ChartState`; stateless trait with per-instance output cache; recompute
+//! on each `apply_tick` / `tick_clock` / params edit.
 //!
-//! - Per-chart `Vec<IndicatorInstance>` on `ChartState`; stateless trait with
-//!   per-instance output cache; recompute on each `apply_tick` / `tick_clock`
-//!   / params edit.
-//! - Six built-ins: SMA, EMA, Bollinger Bands, Volume, MACD, RSI.
-//! - Overlay indicators paint inside the main candle pane; pane indicators
-//!   live in their own sub-canvas below it.
-//! - Settings UI is hand-written per kind and hosted in a singleton floating
-//!   window. Picker is a `SymbolPicker`-style modal.
-//! - Persistence keyed by chart-id under `terminal_demo.indicators.v1`.
+//! Settings UI is hand-written per kind and hosted in a singleton floating
+//! window. Picker is a `SymbolPicker`-style modal.
+//! Persistence keyed by chart-id under `terminal_demo.indicators.v1`.
 
 pub mod bb;
 pub mod instance;
 pub mod kind;
-pub mod ma_suite;
-pub mod macd;
 pub mod math;
 pub mod output;
-pub mod rsi;
 pub mod trades;
 pub mod volume;
 
@@ -27,10 +22,7 @@ pub use instance::{
     palette_color_for,
 };
 pub use kind::{IndicatorKind, PaneKind, Placement, Source};
-pub use ma_suite::{MaEntry, MaFlavor, MaSuiteParams};
-pub use macd::MacdParams;
 pub use output::{IndicatorOutput, Series, ValueReadout};
-pub use rsi::RsiParams;
 pub use trades::TradesParams;
 pub use volume::VolumeParams;
 
@@ -66,9 +58,9 @@ pub struct KindEntry {
     pub spawn: fn() -> Box<dyn IndicatorKind>,
 }
 
-/// Available kinds in the picker. Stripped to Volume-only for the BTC
-/// orderflow fork; the other built-ins (MA Suite, Bollinger Bands, Trades,
-/// MACD, RSI) remain in the tree but aren't user-spawnable.
+/// Available kinds in the picker. Stripped to Volume + Trades for the BTC
+/// orderflow fork; the other built-ins (MA Suite, Bollinger Bands, MACD, RSI)
+/// remain in the tree but aren't user-spawnable.
 pub fn kind_entries() -> Vec<KindEntry> {
     vec![
         KindEntry {
@@ -77,6 +69,13 @@ pub fn kind_entries() -> Vec<KindEntry> {
             description: "Per-bar volume histogram".into(),
             category: Category::Volume,
             spawn: || Box::new(VolumeParams::default()),
+        },
+        KindEntry {
+            kind_id: "trades",
+            name: "Trades".into(),
+            description: "Per-bar trade count histogram".into(),
+            category: Category::Volume,
+            spawn: || Box::new(TradesParams::default()),
         },
     ]
 }
@@ -93,9 +92,12 @@ pub fn build_kind(
         "volume" => serde_json::from_value::<VolumeParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
-        // The other built-ins (ma_suite, bb, trades, macd, rsi) are no longer
-        // user-spawnable. If a legacy persisted state references them they're
-        // dropped on load.
+        "trades" => serde_json::from_value::<TradesParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy
+        // persisted state referencing removed kinds (ma_suite, macd, rsi) or
+        // bb is dropped on load.
         _ => None,
     }
 }

@@ -749,6 +749,18 @@ fn live_status_from_proto(s: proto::LiveStatus) -> LiveStatus {
 }
 
 fn candle_from_proto(c: proto::Candle) -> Candle {
+    // Per-bar VWAP = quote_volume / base_volume. When the wire ships a non-
+    // zero base volume and a quote-volume column, the ratio is the bar's
+    // true volume-weighted price — what Anchored VWAP and similar indicators
+    // accumulate against. Zero-volume bars get `None` so the painter skips
+    // them rather than drawing a flat 0-line.
+    let vwap = c.quote_volume.and_then(|qv| {
+        if c.volume > 0.0 {
+            Some(qv / c.volume)
+        } else {
+            None
+        }
+    });
     Candle::new_full(
         c.open_time,
         c.close_time,
@@ -757,8 +769,8 @@ fn candle_from_proto(c: proto::Candle) -> Candle {
         c.low,
         c.close,
         c.volume,
-        None,
-        None,
+        vwap,
+        c.trades,
     )
 }
 

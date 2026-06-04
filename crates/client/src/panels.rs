@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
+    App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, Global,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div,
     prelude::FluentBuilder as _,

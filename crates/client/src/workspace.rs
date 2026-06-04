@@ -4,7 +4,7 @@ use std::time::Duration;
 use gpui::{
     AnyView, App, AppContext as _, Context, DismissEvent, Entity, FocusHandle,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
-    Styled as _, Task, Window, div,
+    Styled as _, Task, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Root,
@@ -18,7 +18,7 @@ use crate::indicator_picker::{
     IndicatorPickerEvent, IndicatorPickerIntent, IndicatorPickerState, OpenIndicatorPicker,
 };
 use crate::indicator_settings::{IndicatorSettingsView, OpenIndicatorSettings};
-use crate::panels::{self, ContentPanel, Kind, LastFocusedChart, LastFocusedTabPanel};
+use crate::panels::{self, ContentPanel, Kind, LastFocusedChart};
 use crate::persistence::{self, WorkspaceState};
 use crate::symbol_picker::{OpenSymbolPicker, PickerEvent, PickerIntent, SymbolPickerState};
 use crate::top_bar::{
@@ -456,6 +456,223 @@ impl TerminalWorkspace {
         .detach();
         self.floating_code_editor = Some(FloatingCodeEditorSlot { window: win, editor });
     }
+
+    fn on_set_active_tool(
+        &mut self,
+        action: &crate::drawings::actions::SetActiveTool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tool) = crate::drawings::tool::Tool::from_id(action.0.as_ref()) else {
+            return;
+        };
+        crate::drawings::tool::set_current_tool(tool, cx);
+    }
+
+    fn on_select_drawing(
+        &mut self,
+        action: &crate::drawings::actions::SelectDrawing,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| s.set_selected(Some((symbol, id)), cx));
+    }
+
+    fn on_delete_drawing(
+        &mut self,
+        action: &crate::drawings::actions::DeleteDrawing,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| {
+            s.delete(symbol.as_ref(), id, cx);
+        });
+    }
+
+    fn on_toggle_drawing_hidden(
+        &mut self,
+        action: &crate::drawings::actions::ToggleDrawingHidden,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| s.toggle_hidden(symbol.as_ref(), id, cx));
+    }
+
+    fn on_toggle_drawing_tf_filter(
+        &mut self,
+        action: &crate::drawings::actions::ToggleDrawingTfFilter,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tf) = crate::services::market_data::Timeframe::from_str(action.tf.as_ref()) else {
+            return;
+        };
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| s.toggle_tf_filter(symbol.as_ref(), id, tf, cx));
+    }
+
+    fn on_reset_drawing_tf_filter(
+        &mut self,
+        action: &crate::drawings::actions::ResetDrawingTfFilter,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| s.reset_tf_filter(symbol.as_ref(), id, cx));
+    }
+
+    fn on_clear_chart_drawings(
+        &mut self,
+        _: &crate::drawings::actions::ClearChartDrawings,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Workspace-level fallback when the action is dispatched from the
+        // top-bar Objects popover (no chart panel in the focus chain). The
+        // chart panel itself also has a handler — that one wins when the
+        // dispatch originates from the chart's right-click menu.
+        let symbol: Option<SharedString> = cx
+            .try_global::<LastFocusedChart>()
+            .and_then(|g| g.0.borrow().clone())
+            .and_then(|w| w.upgrade())
+            .and_then(|p| {
+                let p = p.read(cx);
+                if p.kind() == Kind::Chart {
+                    p.chart_state.as_ref().map(|s| s.symbol().clone())
+                } else {
+                    None
+                }
+            });
+        let Some(symbol) = symbol else { return };
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| {
+            s.clear_symbol(symbol.as_ref(), cx);
+        });
+    }
+
+    fn on_clear_all_drawings(
+        &mut self,
+        _: &crate::drawings::actions::ClearAllDrawings,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| {
+            s.clear_all(cx);
+        });
+    }
+
+    fn on_edit_horizontal_ray_text(
+        &mut self,
+        action: &crate::drawings::actions::EditHorizontalRayText,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::{
+            WindowExt as _,
+            dialog::{DialogButtonProps, DialogFooter, DialogHeader, DialogTitle},
+            input::{Input, InputState},
+            v_flex,
+        };
+
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        let existing_text: Option<String> = {
+            let svc_read = svc.read(cx);
+            svc_read
+                .for_symbol(symbol.as_ref())
+                .iter()
+                .find(|d| d.id == id)
+                .and_then(|d| match &d.shape {
+                    crate::drawings::shapes::DrawingShape::HorizontalRay(r) => r.text.clone(),
+                    _ => None,
+                })
+        };
+
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("Label…");
+            if let Some(t) = existing_text {
+                state = state.default_value(t);
+            }
+            state
+        });
+
+        let input_for_dialog = input.clone();
+        let svc_for_dialog = svc.clone();
+        let symbol_for_dialog = symbol.clone();
+
+        window.open_dialog(cx, move |dialog, _w, _cx| {
+            let input_for_ok = input_for_dialog.clone();
+            let svc_for_ok = svc_for_dialog.clone();
+            let symbol_for_ok = symbol_for_dialog.clone();
+            dialog
+                .max_w(px(360.))
+                .button_props(DialogButtonProps::default().ok_text("Save").on_ok(
+                    move |_ev, _w, cx| {
+                        let value = input_for_ok.read(cx).value().trim().to_string();
+                        let new_text = if value.is_empty() { None } else { Some(value) };
+                        svc_for_ok.update(cx, |s, cx| {
+                            s.update_ray_text(symbol_for_ok.as_ref(), id, new_text, cx)
+                        });
+                        true
+                    },
+                ))
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .child(
+                            DialogHeader::new()
+                                .px_4()
+                                .pt_4()
+                                .child(DialogTitle::new().child("Edit ray label")),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .child(Input::new(&input_for_dialog).cleanable(true)),
+                        )
+                        .child(DialogFooter::new().px_4().pb_2()),
+                )
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -502,6 +719,15 @@ impl Render for TerminalWorkspace {
             .on_action(cx.listener(Self::on_open_indicator_picker))
             .on_action(cx.listener(Self::on_open_indicator_settings))
             .on_action(cx.listener(Self::on_toggle_floating_code_editor))
+            .on_action(cx.listener(Self::on_set_active_tool))
+            .on_action(cx.listener(Self::on_select_drawing))
+            .on_action(cx.listener(Self::on_delete_drawing))
+            .on_action(cx.listener(Self::on_toggle_drawing_hidden))
+            .on_action(cx.listener(Self::on_toggle_drawing_tf_filter))
+            .on_action(cx.listener(Self::on_reset_drawing_tf_filter))
+            .on_action(cx.listener(Self::on_clear_chart_drawings))
+            .on_action(cx.listener(Self::on_clear_all_drawings))
+            .on_action(cx.listener(Self::on_edit_horizontal_ray_text))
             .relative()
             .size_full()
             .flex()

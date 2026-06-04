@@ -96,8 +96,15 @@ impl Timeframe {
 /// Wire-narrow OHLCV bar. Timestamps are millis since the Unix epoch.
 ///
 /// The `date` display string the client renders in axis labels is derived
-/// client-side at deserialize time; the DB carries `quote_volume`,
-/// `taker_buy_vol`, and `trades` columns the wire skips for v1 (see Q11).
+/// client-side at deserialize time. `quote_volume` and `trades` are shipped
+/// so Anchored VWAP and trade-count indicators can render without a separate
+/// stream; `taker_buy_vol` stays DB-only until aggression indicators land.
+///
+/// Both extras are `Option` for exchange-portability, NOT as a v1 TODO.
+/// Binance kline endpoints populate them on every bar, but Bybit/OKX/Coinbase/
+/// Deribit kline APIs are missing one or both fields (see audit notes) — when
+/// ingest generalizes beyond Binance, those rows will legitimately carry
+/// `None`. Keep these Optional even if the current DB rows are always full.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candle {
     pub open_time: i64,
@@ -107,6 +114,8 @@ pub struct Candle {
     pub low: f64,
     pub close: f64,
     pub volume: f64,
+    pub quote_volume: Option<f64>,
+    pub trades: Option<i32>,
 }
 
 // --- Connection status ------------------------------------------------------

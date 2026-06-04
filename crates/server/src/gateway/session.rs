@@ -306,6 +306,8 @@ fn kline_to_wire(k: &KlineRow) -> Candle {
         low: k.low,
         close: k.close,
         volume: k.volume,
+        quote_volume: Some(k.quote_volume),
+        trades: Some(k.trades),
     }
 }
 

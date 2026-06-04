@@ -20,18 +20,15 @@ use gpui::{
     Subscription, WeakEntity, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, InteractiveElementExt as _, Sizable as _,
+    ActiveTheme as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
-    h_flex,
-    input::{Input, InputEvent, InputState},
-    v_flex,
+    h_flex, v_flex,
 };
 use serde::Deserialize;
 
 use crate::indicators::{
-    BbParams, COLOR_PALETTE_SIZE, InstanceId, MaEntry, MaFlavor, MaSuiteParams, MacdParams,
-    Placement, RsiParams, Source, palette_color_for,
+    BbParams, COLOR_PALETTE_SIZE, InstanceId, Placement, Source, palette_color_for,
 };
 use crate::panels::ContentPanel;
 
@@ -60,18 +57,6 @@ pub struct IndicatorSettingsView {
     /// (read at event-time, so retarget-after-create still routes correctly).
     /// Cleared and rebuilt whenever `color_states` is rebuilt.
     _subscriptions: Vec<Subscription>,
-    /// MA-row index whose period is currently being edited inline
-    /// (double-click). `None` when no period field is in edit mode.
-    /// Cleared on retarget so a swap-target doesn't accidentally show
-    /// the previous instance's edit chrome.
-    editing_period: Option<usize>,
-    /// Live InputState for the inline period editor. Owned here so the
-    /// text + cursor + selection survive across renders. Allocated on
-    /// double-click, dropped on commit/cancel.
-    period_input: Option<Entity<InputState>>,
-    /// PressEnter / Blur subscription on `period_input`. Cleared together
-    /// with `period_input`.
-    period_input_sub: Option<Subscription>,
 }
 
 impl IndicatorSettingsView {
@@ -87,9 +72,6 @@ impl IndicatorSettingsView {
             focus: cx.focus_handle(),
             color_states: Vec::new(),
             _subscriptions: Vec::new(),
-            editing_period: None,
-            period_input: None,
-            period_input_sub: None,
         };
         this.rebuild_color_states(window, cx);
         this
@@ -98,8 +80,6 @@ impl IndicatorSettingsView {
     /// Retarget when the user clicks a different chip while the window is
     /// already open. View re-renders against the new instance, and color
     /// picker states are reconstructed for the new kind's slot count.
-    /// Any in-flight period edit is discarded — its semantics were tied
-    /// to the previous instance.
     pub fn retarget(
         &mut self,
         target: WeakEntity<ContentPanel>,
@@ -109,66 +89,7 @@ impl IndicatorSettingsView {
     ) {
         self.target = target;
         self.instance_id = instance_id;
-        self.editing_period = None;
-        self.period_input = None;
-        self.period_input_sub = None;
         self.rebuild_color_states(window, cx);
-        cx.notify();
-    }
-
-    /// Start editing the period for MA row `idx`: allocate an InputState
-    /// pre-populated with the current value, subscribe to PressEnter/Blur
-    /// to commit, and mark the row as being edited.
-    fn begin_period_edit(
-        &mut self,
-        idx: usize,
-        initial: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let state = cx.new(|cx| InputState::new(window, cx).default_value(format!("{}", initial)));
-        let sub = cx.subscribe(&state, move |this, input_state, ev: &InputEvent, cx| match ev {
-            InputEvent::PressEnter { .. } | InputEvent::Blur => {
-                let raw = input_state.read(cx).value();
-                this.commit_period_edit(idx, raw.as_ref(), cx);
-            }
-            _ => {}
-        });
-        // Focus the input so the user can type right away.
-        state.read(cx).focus_handle(cx).focus(window, cx);
-        self.editing_period = Some(idx);
-        self.period_input = Some(state);
-        self.period_input_sub = Some(sub);
-        cx.notify();
-    }
-
-    /// Parse `raw` as a positive integer and apply it to MA row `idx`.
-    /// Invalid input is silently ignored (the existing value is kept).
-    /// Clears the edit state either way.
-    fn commit_period_edit(&mut self, idx: usize, raw: &str, cx: &mut Context<Self>) {
-        let trimmed = raw.trim();
-        if let Ok(v) = trimmed.parse::<usize>() {
-            let new_period = v.max(2);
-            let target = self.target.clone();
-            let id = self.instance_id;
-            if let Some(panel) = target.upgrade() {
-                panel.update(cx, |p, cx| {
-                    if let Some(chart) = p.chart_state.as_mut() {
-                        chart.update_indicator(id, |kind| {
-                            mutate::<MaSuiteParams>(kind, |x| {
-                                if let Some(e) = x.entries.get_mut(idx) {
-                                    e.period = new_period;
-                                }
-                            });
-                        });
-                        cx.notify();
-                    }
-                });
-            }
-        }
-        self.editing_period = None;
-        self.period_input = None;
-        self.period_input_sub = None;
         cx.notify();
     }
 
@@ -246,34 +167,9 @@ impl Render for IndicatorSettingsView {
         if self.color_states.len() != snapshot.color_slot_labels.len() {
             self.rebuild_color_states(window, cx);
         }
-        // MA Suite renders its colors inline per row (one color picker
-        // beside each MA's period) and opts out of the bottom common
-        // color section, so the form reads as a single list rather than
-        // two disconnected sections.
-        let kind_id_inline_colors = snapshot.kind_id == "ma_suite";
         let kind_body = match snapshot.kind_id {
-            "ma_suite" => {
-                // Snapshot the color-state entities + edit state up front
-                // so the per-row builder can capture them without
-                // re-borrowing self inside cx.listeners below.
-                let color_states_snapshot: Vec<Entity<ColorPickerState>> =
-                    self.color_states.clone();
-                let editing = self.editing_period;
-                let period_input = self.period_input.clone();
-                render_ma_suite(
-                    &snapshot,
-                    target.clone(),
-                    id,
-                    &color_states_snapshot,
-                    editing,
-                    period_input,
-                    cx,
-                )
-            }
             "bb" => render_bb(&snapshot, target.clone(), id, cx),
             "volume" => render_volume(&snapshot, target.clone(), id, cx),
-            "macd" => render_macd(&snapshot, target.clone(), id, cx),
-            "rsi" => render_rsi(&snapshot, target.clone(), id, cx),
             _ => div()
                 .text_color(muted)
                 .child("Unknown indicator kind")
@@ -282,18 +178,13 @@ impl Render for IndicatorSettingsView {
         let label = snapshot.label.clone();
 
         // Generic color section: one row per slot the kind declares. Skipped
-        // for kinds that wear their colors inline (MA Suite) and for kinds
-        // with no slots (Volume).
-        let color_rows: Vec<gpui::AnyElement> = if kind_id_inline_colors {
-            Vec::new()
-        } else {
-            snapshot
-                .color_slot_labels
-                .iter()
-                .zip(self.color_states.iter())
-                .map(|(slot_label, state)| color_row(slot_label.clone(), state, cx))
-                .collect()
-        };
+        // for kinds with no slots (Volume).
+        let color_rows: Vec<gpui::AnyElement> = snapshot
+            .color_slot_labels
+            .iter()
+            .zip(self.color_states.iter())
+            .map(|(slot_label, state)| color_row(slot_label.clone(), state, cx))
+            .collect();
         let has_color_section = !color_rows.is_empty();
 
         let mut root = v_flex()
@@ -349,308 +240,6 @@ fn missing_body(msg: &'static str, muted: Hsla) -> impl IntoElement {
 /// Mutations route through `update_indicator` so the recompute + color-
 /// slot resync happen in one place.
 #[allow(clippy::too_many_arguments)]
-fn render_ma_suite(
-    snap: &InstanceSnapshot,
-    target: WeakEntity<ContentPanel>,
-    id: InstanceId,
-    color_states: &[Entity<ColorPickerState>],
-    editing_period: Option<usize>,
-    period_input: Option<Entity<InputState>>,
-    cx: &mut Context<IndicatorSettingsView>,
-) -> gpui::AnyElement {
-    // Snapshot the entry list out of `params` so the per-row closures
-    // don't have to re-read it. The order matters — colors[i] maps to
-    // entries[i].
-    let entries: Vec<MaEntry> = snap
-        .params
-        .pointer("/entries")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let muted = cx.theme().muted_foreground;
-    let mut col = v_flex().gap_3();
-    for (idx, entry) in entries.iter().enumerate() {
-        let color_state = color_states.get(idx).cloned();
-        let editing = editing_period == Some(idx);
-        let input_for_row = if editing { period_input.clone() } else { None };
-        col = col.child(render_ma_row(
-            idx,
-            entry.clone(),
-            target.clone(),
-            id,
-            color_state,
-            editing,
-            input_for_row,
-            cx,
-        ));
-    }
-    // Footer "+ Add MA" button. Empty suites still render this row, so
-    // a user who removes everything can re-add. Adding seeds a fresh
-    // default entry; `update_indicator` resyncs the color slot Vec.
-    let target_add = target.clone();
-    col = col.child(div().h(px(1.)).bg(cx.theme().border));
-    col = col.child(
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(
-                div()
-                    .w(px(90.))
-                    .text_sm()
-                    .text_color(muted)
-                    .child(SharedString::from(format!("{} MA", entries.len()))),
-            )
-            .child(
-                Button::new(SharedString::from(format!("ma-suite-add-{}", id)))
-                    .label(SharedString::from("+ Add MA"))
-                    .xsmall()
-                    .ghost()
-                    .on_click(cx.listener(move |_this, _ev, _w, cx| {
-                        let Some(panel) = target_add.upgrade() else {
-                            return;
-                        };
-                        panel.update(cx, |p, cx| {
-                            if let Some(chart) = p.chart_state.as_mut() {
-                                chart.update_indicator(id, |kind| {
-                                    mutate::<MaSuiteParams>(kind, |x| {
-                                        x.entries.push(MaEntry::default_new());
-                                    });
-                                });
-                                cx.notify();
-                            }
-                        });
-                    })),
-            ),
-    );
-    col.into_any_element()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_ma_row(
-    idx: usize,
-    entry: MaEntry,
-    target: WeakEntity<ContentPanel>,
-    id: InstanceId,
-    color_state: Option<Entity<ColorPickerState>>,
-    is_editing_period: bool,
-    period_input: Option<Entity<InputState>>,
-    cx: &mut Context<IndicatorSettingsView>,
-) -> gpui::AnyElement {
-    let muted = cx.theme().muted_foreground;
-    let row_id = SharedString::from(format!("ma-row-{}-{}", id, idx));
-
-    // Inline color picker for this entry. Tiny — sits next to the label
-    // so each row's color reads at a glance without scrolling to a
-    // separate color section.
-    let color_picker = color_state.map(|state| {
-        ColorPicker::new(&state)
-            .small()
-            .featured_colors(featured_palette())
-    });
-
-    // Flavor toggle: two small buttons; selected one uses .primary().
-    let flavor_btns = {
-        let mut row = h_flex().gap_1();
-        for flavor in [MaFlavor::Sma, MaFlavor::Ema] {
-            let target = target.clone();
-            let is_active = entry.flavor == flavor;
-            let btn_id = SharedString::from(format!("ma-flavor-{}-{}-{:?}", id, idx, flavor));
-            let mut btn = Button::new(btn_id).label(SharedString::from(flavor.tag())).xsmall();
-            btn = if is_active { btn.primary() } else { btn.ghost() };
-            btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
-                let Some(panel) = target.upgrade() else {
-                    return;
-                };
-                panel.update(cx, |p, cx| {
-                    if let Some(chart) = p.chart_state.as_mut() {
-                        chart.update_indicator(id, |kind| {
-                            mutate::<MaSuiteParams>(kind, |x| {
-                                if let Some(e) = x.entries.get_mut(idx) {
-                                    e.flavor = flavor;
-                                }
-                            });
-                        });
-                        cx.notify();
-                    }
-                });
-            }));
-            row = row.child(btn);
-        }
-        row
-    };
-
-    // Period control: stepper buttons flanking either an inline Input
-    // (double-click swap mode) or a static value div. The static div
-    // carries the on_double_click handler that opens the input.
-    let target_dec = target.clone();
-    let target_inc = target.clone();
-    let period_value_id = SharedString::from(format!("ma-period-val-{}-{}", id, idx));
-    let entry_period = entry.period;
-    let period_value: gpui::AnyElement = if is_editing_period {
-        if let Some(state) = period_input {
-            // Render the live input. PressEnter / Blur subscriptions are
-            // already wired on the parent view; here we just place the
-            // widget and constrain its width to match the static text
-            // it's replacing.
-            div()
-                .w(px(48.))
-                .child(Input::new(&state).small().appearance(true))
-                .into_any_element()
-        } else {
-            // Defensive: editing_period was set but input was dropped
-            // mid-render. Fall back to static so the row still draws.
-            div()
-                .min_w(px(28.))
-                .text_sm()
-                .child(SharedString::from(format!("{}", entry_period)))
-                .into_any_element()
-        }
-    } else {
-        div()
-            .id(period_value_id)
-            .min_w(px(28.))
-            .text_sm()
-            .cursor_pointer()
-            .child(SharedString::from(format!("{}", entry_period)))
-            .on_double_click(cx.listener(move |this, _ev, window, cx| {
-                this.begin_period_edit(idx, entry_period, window, cx);
-            }))
-            .into_any_element()
-    };
-    let period_stepper = h_flex()
-        .gap_1()
-        .items_center()
-        .child(
-            Button::new(SharedString::from(format!("ma-period-dec-{}-{}", id, idx)))
-                .label(SharedString::from("\u{2212}"))
-                .xsmall()
-                .ghost()
-                .on_click(cx.listener(move |_this, _ev, _w, cx| {
-                    apply_ma_entry_mutation(&target_dec, id, idx, cx, |e| {
-                        e.period = step_period(e.period, -1);
-                    });
-                })),
-        )
-        .child(period_value)
-        .child(
-            Button::new(SharedString::from(format!("ma-period-inc-{}-{}", id, idx)))
-                .label(SharedString::from("+"))
-                .xsmall()
-                .ghost()
-                .on_click(cx.listener(move |_this, _ev, _w, cx| {
-                    apply_ma_entry_mutation(&target_inc, id, idx, cx, |e| {
-                        e.period = step_period(e.period, 1);
-                    });
-                })),
-        );
-
-    // Source toggle row — same six-button layout as elsewhere, scoped
-    // to this entry. Keeps the form keyboard-free (no dropdowns).
-    let source_btns = {
-        let mut row = h_flex().gap_1();
-        for src_ref in Source::ALL {
-            let src = *src_ref;
-            let target = target.clone();
-            let is_active = entry.source == src;
-            let btn_id = SharedString::from(format!("ma-src-{}-{}-{}", id, idx, src.label()));
-            let mut btn = Button::new(btn_id).label(SharedString::from(src.label())).xsmall();
-            btn = if is_active { btn.primary() } else { btn.ghost() };
-            btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
-                apply_ma_entry_mutation(&target, id, idx, cx, |e| {
-                    e.source = src;
-                });
-            }));
-            row = row.child(btn);
-        }
-        row
-    };
-
-    // Per-row remove button. Removing also shrinks the color-slot Vec
-    // via `update_indicator`'s `sync_colors` call; the settings view's
-    // render-time count check then rebuilds the picker states.
-    let target_rm = target.clone();
-    let remove_btn = Button::new(SharedString::from(format!("ma-remove-{}-{}", id, idx)))
-        .label(SharedString::from("\u{00d7}"))
-        .xsmall()
-        .ghost()
-        .on_click(cx.listener(move |_this, _ev, _w, cx| {
-            let Some(panel) = target_rm.upgrade() else {
-                return;
-            };
-            panel.update(cx, |p, cx| {
-                if let Some(chart) = p.chart_state.as_mut() {
-                    chart.update_indicator(id, |kind| {
-                        mutate::<MaSuiteParams>(kind, |x| {
-                            if idx < x.entries.len() {
-                                x.entries.remove(idx);
-                            }
-                        });
-                    });
-                    cx.notify();
-                }
-            });
-        }));
-
-    // First row groups everything compact: [label] [color] [flavor]
-    // [period] [×]. Spacer pushes the remove button to the right.
-    let mut first_row = h_flex()
-        .gap_3()
-        .items_center()
-        .child(
-            div()
-                .w(px(60.))
-                .text_sm()
-                .text_color(muted)
-                .child(SharedString::from(format!("MA {}", idx + 1))),
-        );
-    if let Some(picker) = color_picker {
-        first_row = first_row.child(picker);
-    }
-    first_row = first_row
-        .child(flavor_btns)
-        .child(period_stepper)
-        .child(div().flex_1())
-        .child(remove_btn);
-
-    v_flex()
-        .id(row_id)
-        .gap_1()
-        .child(first_row)
-        .child(
-            h_flex()
-                .gap_3()
-                .items_center()
-                .child(div().w(px(60.)).text_sm().text_color(muted).child("Source"))
-                .child(source_btns),
-        )
-        .into_any_element()
-}
-
-/// Apply a per-entry mutation to an MA Suite instance. Looks up the
-/// chart and the suite kind, runs `f` on the entry at `idx`, and lets
-/// `update_indicator` handle the recompute + color-slot resync.
-fn apply_ma_entry_mutation(
-    target: &WeakEntity<ContentPanel>,
-    id: InstanceId,
-    idx: usize,
-    cx: &mut Context<IndicatorSettingsView>,
-    f: impl FnOnce(&mut MaEntry),
-) {
-    let Some(panel) = target.upgrade() else {
-        return;
-    };
-    panel.update(cx, |p, cx| {
-        if let Some(chart) = p.chart_state.as_mut() {
-            chart.update_indicator(id, |kind| {
-                mutate::<MaSuiteParams>(kind, |x| {
-                    if let Some(e) = x.entries.get_mut(idx) {
-                        f(e);
-                    }
-                });
-            });
-            cx.notify();
-        }
-    });
-}
 
 fn render_bb(
     snap: &InstanceSnapshot,
@@ -723,98 +312,6 @@ fn render_volume(
                     cx,
                 )),
         )
-        .into_any_element()
-}
-
-fn render_macd(
-    snap: &InstanceSnapshot,
-    target: WeakEntity<ContentPanel>,
-    id: InstanceId,
-    cx: &mut Context<IndicatorSettingsView>,
-) -> gpui::AnyElement {
-    let fast = snap.params.pointer("/fast").and_then(|v| v.as_u64()).unwrap_or(12) as usize;
-    let slow = snap.params.pointer("/slow").and_then(|v| v.as_u64()).unwrap_or(26) as usize;
-    let sig = snap.params.pointer("/signal").and_then(|v| v.as_u64()).unwrap_or(9) as usize;
-    let s = read_source(&snap.params).unwrap_or(Source::Close);
-    v_flex()
-        .gap_2()
-        .child(period_row("Fast", fast, target.clone(), id, |kind, delta| {
-            mutate::<MacdParams>(kind, |x| {
-                x.fast = step_period(x.fast, delta).min(x.slow.saturating_sub(1).max(2));
-            });
-        }, cx))
-        .child(period_row("Slow", slow, target.clone(), id, |kind, delta| {
-            mutate::<MacdParams>(kind, |x| {
-                x.slow = step_period(x.slow, delta).max(x.fast + 1);
-            });
-        }, cx))
-        .child(period_row("Signal", sig, target.clone(), id, |kind, delta| {
-            mutate::<MacdParams>(kind, |x| {
-                x.signal = step_period(x.signal, delta);
-            });
-        }, cx))
-        .child(source_row(
-            "Source",
-            s,
-            target,
-            id,
-            |kind, src| {
-                mutate::<MacdParams>(kind, |x| x.source = src);
-            },
-            cx,
-        ))
-        .into_any_element()
-}
-
-fn render_rsi(
-    snap: &InstanceSnapshot,
-    target: WeakEntity<ContentPanel>,
-    id: InstanceId,
-    cx: &mut Context<IndicatorSettingsView>,
-) -> gpui::AnyElement {
-    let p = snap.params.pointer("/period").and_then(|v| v.as_u64()).unwrap_or(14) as usize;
-    let ob = snap.params.pointer("/overbought").and_then(|v| v.as_f64()).unwrap_or(70.0);
-    let os = snap.params.pointer("/oversold").and_then(|v| v.as_f64()).unwrap_or(30.0);
-    let s = read_source(&snap.params).unwrap_or(Source::Close);
-    v_flex()
-        .gap_2()
-        .child(period_row("Period", p, target.clone(), id, |kind, delta| {
-            mutate::<RsiParams>(kind, |x| x.period = step_period(x.period, delta));
-        }, cx))
-        .child(float_row(
-            "Overbought",
-            format!("{:.0}", ob),
-            target.clone(),
-            id,
-            |kind, delta| {
-                mutate::<RsiParams>(kind, |x| {
-                    x.overbought = (x.overbought + delta as f64 * 5.0).clamp(x.oversold + 5.0, 95.0);
-                });
-            },
-            cx,
-        ))
-        .child(float_row(
-            "Oversold",
-            format!("{:.0}", os),
-            target.clone(),
-            id,
-            |kind, delta| {
-                mutate::<RsiParams>(kind, |x| {
-                    x.oversold = (x.oversold + delta as f64 * 5.0).clamp(5.0, x.overbought - 5.0);
-                });
-            },
-            cx,
-        ))
-        .child(source_row(
-            "Source",
-            s,
-            target,
-            id,
-            |kind, src| {
-                mutate::<RsiParams>(kind, |x| x.source = src);
-            },
-            cx,
-        ))
         .into_any_element()
 }
 

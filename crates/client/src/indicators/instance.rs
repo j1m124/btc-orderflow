@@ -137,15 +137,13 @@ fn derive_slot_default(primary: Hsla, slot: usize) -> Hsla {
     }
 }
 
-/// Per-kind default sub-pane height (px). Locked design choices: volume 90,
-/// trades 90, MACD 140, RSI 140; falls back to 140 for unknown kinds. Used
-/// only when an instance lands in `Placement::Pane`.
+/// Per-kind default sub-pane height (px). Histogram panes (volume, trades)
+/// get a slim 90px slot; anything else falls back to 140px. Used only when
+/// an instance lands in `Placement::Pane`.
 pub fn default_pane_height(kind_id: &str) -> f32 {
     match kind_id {
         "volume" => 90.0,
         "trades" => 90.0,
-        "macd" => 140.0,
-        "rsi" => 140.0,
         _ => 140.0,
     }
 }
