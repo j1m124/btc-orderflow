@@ -6,6 +6,7 @@
 
 pub mod parse;
 pub mod rest;
+pub mod ws;
 
 /// Base hostname for the REST API (USDⓂ-Futures).
 pub const REST_BASE: &str = "https://fapi.binance.com";

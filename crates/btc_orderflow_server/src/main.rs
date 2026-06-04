@@ -1,26 +1,30 @@
 //! btc_orderflow_server — entry point.
 //!
-//! Current boot path: parse env → init tracing → connect TimescaleDB → run
-//! migrations → REST-backfill every timeframe for BTCUSDT up to "now" →
-//! exit. WS ingest and the gateway listener are added in follow-up commits.
+//! Boot sequence (Q10, this commit completes the ingest side):
+//!   1. env → init tracing
+//!   2. connect TimescaleDB → run migrations
+//!   3. spawn DB writer task (subscribes to broadcast)
+//!   4. spawn Binance ingest task (gap-heal REST → connect WS → broadcast →
+//!      reconnect-with-gap-heal on every drop)
+//!   5. block on Ctrl-C
+//!
+//! The WS gateway listener (axum router on 127.0.0.1:8787) lands in the
+//! next commit.
 
 use anyhow::{Context, Result};
-use btc_orderflow_protocol::Timeframe;
 use chrono::Duration as ChronoDuration;
 use sqlx::postgres::PgPoolOptions;
-use tracing::info;
+use tokio::sync::broadcast;
+use tracing::{info, warn};
 
 mod binance;
 mod db;
 mod ingest;
 
-/// Hardcoded for v1. The combined-stream WS plus the REST gap-heal both key
-/// off this single value. A real multi-symbol story lives behind a config
-/// flag the day a second venue lands.
+/// Hardcoded for v1 (Q14b: BTCUSDT whitelist).
 const SYMBOL: &str = "BTCUSDT";
 
-/// Cold-start backfill window. Matches the DB retention policy (Q9/Q10) —
-/// no reason to fetch what Timescale would drop on the next chunk eviction.
+/// Cold-start backfill window. Matches the DB retention policy (Q9/Q10).
 const COLD_START_DAYS: i64 = 7;
 
 #[tokio::main]
@@ -41,22 +45,50 @@ async fn main() -> Result<()> {
         .await
         .context("run sqlx migrations")?;
 
-    info!(symbol = SYMBOL, days = COLD_START_DAYS, "starting REST backfill");
-    let rest = binance::rest::RestClient::default();
-    let counts = ingest::backfill_symbol(
-        &pool,
-        &rest,
-        SYMBOL,
-        ChronoDuration::days(COLD_START_DAYS),
-    )
-    .await
-    .context("rest backfill")?;
+    let (tx, _bootstrap_rx) = broadcast::channel::<binance::parse::Tick>(ingest::BROADCAST_CAPACITY);
 
-    for (tf, n) in Timeframe::ALL.iter().zip(counts.iter()) {
-        info!(tf = tf.as_str(), rows = n, "tf backfill total");
-    }
+    // DB writer holds a permanent Receiver so the broadcast never runs out
+    // of consumers (which would otherwise drop every send during the gap
+    // between Binance connect and the gateway's first client).
+    let writer_rx = tx.subscribe();
+    let writer_pool = pool.clone();
+    let writer = tokio::spawn(async move {
+        if let Err(e) = ingest::run_db_writer(writer_pool, writer_rx).await {
+            warn!(error = ?e, "db writer task exited with error");
+        }
+    });
 
-    info!("skeleton boot complete; WS ingest + gateway land next");
+    // Drop the bootstrap receiver from main — the writer's receiver is the
+    // canonical one, and any future gateway subs clone from `tx`.
+    drop(_bootstrap_rx);
+
+    let ingest_handle = {
+        let pool = pool.clone();
+        let rest = binance::rest::RestClient::default();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ingest::run_binance_ingest(
+                pool,
+                rest,
+                tx,
+                SYMBOL.to_string(),
+                ChronoDuration::days(COLD_START_DAYS),
+            )
+            .await
+            {
+                warn!(error = ?e, "binance ingest task exited with error");
+            }
+        })
+    };
+
+    info!("ingest stack up; waiting for Ctrl-C");
+    tokio::signal::ctrl_c()
+        .await
+        .context("install Ctrl-C handler")?;
+
+    info!("shutdown requested");
+    ingest_handle.abort();
+    writer.abort();
     Ok(())
 }
 

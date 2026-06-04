@@ -16,10 +16,27 @@ use btc_orderflow_protocol::Timeframe;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures::future::try_join_all;
 use sqlx::PgPool;
-use tracing::{debug, info};
+use std::time::Duration as StdDuration;
+use tokio::sync::broadcast;
+use tracing::{debug, info, warn};
 
-use crate::binance::{KLINES_PAGE_LIMIT, parse::KlineRow, rest::RestClient};
+use crate::binance::{
+    KLINES_PAGE_LIMIT,
+    parse::{KlineRow, Tick},
+    rest::RestClient,
+    ws,
+};
 use crate::db;
+
+/// Capacity of the Binance-tick broadcast channel. Slow consumers exceeding
+/// this fall behind and recover by either skipping or resubscribing; the
+/// gateway turns a `RecvError::Lagged` into a `Resnap` for affected
+/// subscriptions (Q14a-7).
+pub const BROADCAST_CAPACITY: usize = 4096;
+
+/// Min/max wait between Binance WS reconnect attempts.
+const RECONNECT_MIN: StdDuration = StdDuration::from_secs(1);
+const RECONNECT_MAX: StdDuration = StdDuration::from_secs(30);
 
 /// Backfill one (symbol, tf) up to "now", picking up where the DB left off
 /// or starting `cold_start` ago for a fresh table. Returns the number of
@@ -101,4 +118,92 @@ pub async fn backfill_symbol(
         async move { backfill_one(&pool, rest, &symbol, tf, cold_start).await }
     });
     try_join_all(futures).await
+}
+
+// --- Live ingest orchestrator ----------------------------------------------
+
+/// Drain the broadcast channel forever, UPSERTing every **closed** kline
+/// into the `candles` table. Open (in-progress) bars are streamed to
+/// gateway clients but not persisted — only the final bar is canonical, and
+/// the next closed-bar UPSERT replaces any earlier persisted state.
+///
+/// On `RecvError::Lagged`, log and skip — the broadcast capacity is large
+/// enough that lag indicates the DB is very slow, not a normal blip.
+pub async fn run_db_writer(
+    pool: PgPool,
+    mut rx: broadcast::Receiver<Tick>,
+) -> Result<()> {
+    info!("db writer task started");
+    loop {
+        match rx.recv().await {
+            Ok(tick) if tick.is_closed => {
+                let rows = std::slice::from_ref(&tick.kline);
+                if let Err(e) =
+                    db::upsert_klines(&pool, &tick.symbol, tick.tf.as_str(), rows).await
+                {
+                    warn!(
+                        symbol = %tick.symbol,
+                        tf = tick.tf.as_str(),
+                        error = ?e,
+                        "db upsert failed"
+                    );
+                }
+            }
+            Ok(_) => { /* open bar; skip persistence */ }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(skipped = n, "db writer lagged behind broadcast");
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                info!("broadcast closed; db writer exiting");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Run the Binance ingest loop forever: gap-heal → connect WS → stream until
+/// disconnect → backoff → repeat. The first gap-heal is the cold-start; every
+/// subsequent one is just the gap accumulated during the prior outage.
+pub async fn run_binance_ingest(
+    pool: PgPool,
+    rest: RestClient,
+    broadcast_tx: broadcast::Sender<Tick>,
+    symbol: String,
+    cold_start: ChronoDuration,
+) -> Result<()> {
+    let mut backoff = RECONNECT_MIN;
+    info!(symbol = %symbol, "binance ingest task started");
+    loop {
+        // Heal any gap between the latest DB row and now. Cheap after the
+        // first iteration (just a few seconds of bars to catch up).
+        match backfill_symbol(&pool, &rest, &symbol, cold_start).await {
+            Ok(counts) => {
+                for (tf, n) in Timeframe::ALL.iter().zip(counts.iter()) {
+                    if *n > 0 {
+                        debug!(tf = tf.as_str(), rows = n, "gap-heal applied");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = ?e, "gap-heal failed; will retry on next reconnect cycle");
+            }
+        }
+
+        // Stream until the connection drops or errors.
+        match ws::connect_and_stream(&symbol, &broadcast_tx).await {
+            Ok(()) => {
+                info!("binance ws closed cleanly; reconnecting");
+                backoff = RECONNECT_MIN;
+            }
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "binance ws error; reconnecting after backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+            }
+        }
+    }
 }
