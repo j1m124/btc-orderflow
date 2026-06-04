@@ -17,14 +17,19 @@ use super::{
     parse::{CombinedStreamMsg, InboundEvent},
 };
 
-/// Build the combined-stream URL for
-/// `(symbol × native-kline TFs) ∪ aggTrade ∪ depth@100ms`. S1/S5 are excluded
-/// — Binance USD-M futures doesn't publish `kline_1s` / `kline_5s`, so those
-/// bars are synthesized from the aggTrade stream by the sub-second aggregator.
+/// Binance Futures partitions WS streams across two endpoint families and
+/// silently drops events for streams that don't belong to the connected
+/// family:
+///   * `/market/stream` carries klines + aggTrade (trade-derived feeds).
+///   * `/stream` (unrouted / public) carries diff-depth.
+/// A single connection therefore cannot cover our full feed set; we open one
+/// per family and fan into the shared `BroadcastTxs`.
 ///
-/// Output looks like
-/// `wss://fstream.binance.com/stream?streams=btcusdt@kline_1m/.../btcusdt@aggTrade/btcusdt@depth@100ms`.
-fn combined_url(symbol: &str) -> String {
+/// Build the combined-stream URL for the market endpoint:
+/// `(symbol × native-kline TFs) ∪ aggTrade`. S1/S5 are excluded — Binance
+/// USD-M futures doesn't publish `kline_1s` / `kline_5s`, so those bars are
+/// synthesized from the aggTrade stream by the sub-second aggregator.
+pub fn market_combined_url(symbol: &str) -> String {
     let s = symbol.to_lowercase();
     let mut streams: Vec<String> = Timeframe::ALL
         .iter()
@@ -32,21 +37,32 @@ fn combined_url(symbol: &str) -> String {
         .map(|tf| format!("{s}@kline_{}", tf.as_str()))
         .collect();
     streams.push(format!("{s}@aggTrade"));
-    streams.push(format!("{s}@depth@100ms"));
-    format!("{}/stream?streams={}", WS_BASE, streams.join("/"))
+    format!("{}/market/stream?streams={}", WS_BASE, streams.join("/"))
 }
 
-/// Connect to Binance, parse every kline / aggTrade event, and fan into the
-/// right typed broadcast. Returns when the connection drops (either side);
-/// the caller decides whether to reconnect.
-pub async fn connect_and_stream(symbol: &str, txs: &BroadcastTxs) -> Result<()> {
-    let url = combined_url(symbol);
-    info!(symbol, "connecting to Binance combined stream");
+/// Combined-stream URL for the public endpoint, carrying diff-depth only.
+/// Routed `/public/stream` isn't documented; bare `/stream` works and returns
+/// the same `{stream, data}` envelope as the market endpoint.
+pub fn public_combined_url(symbol: &str) -> String {
+    let s = symbol.to_lowercase();
+    format!("{}/stream?streams={s}@depth@100ms", WS_BASE)
+}
 
-    let (mut ws, _resp) = connect_async(&url)
+/// Connect to the given combined-stream URL, parse every event, and fan into
+/// the right typed broadcast. Returns when the connection drops (either side);
+/// the caller decides whether to reconnect. `label` is purely for logging so
+/// the two concurrent connections (market vs public) can be told apart.
+pub async fn connect_and_stream(
+    label: &'static str,
+    url: &str,
+    txs: &BroadcastTxs,
+) -> Result<()> {
+    info!(label, url = %url, "connecting to Binance combined stream");
+
+    let (mut ws, _resp) = connect_async(url)
         .await
         .with_context(|| format!("connect to {url}"))?;
-    info!(symbol, "binance combined stream connected");
+    info!(label, "binance combined stream connected");
 
     loop {
         let msg = match ws.next().await {

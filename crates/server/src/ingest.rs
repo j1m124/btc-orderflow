@@ -735,10 +735,12 @@ pub async fn run_db_writer(
     }
 }
 
-/// Run the Binance ingest loop forever: kline+trade gap-heal in parallel →
-/// connect WS → stream until disconnect → backoff → repeat. The first gap-
-/// heal pair is the cold-start; subsequent passes only cover the outage
-/// window.
+/// Run the Binance ingest forever. Binance Futures partitions streams across
+/// two endpoint families — `/market` (kline + aggTrade) and `/stream`
+/// (diff-depth) — so we drive two concurrent WS connections, each with its
+/// own reconnect/backoff state. The market loop also runs the kline+trade
+/// REST gap-heal between connect attempts; the depth loop has no gap-heal
+/// (the book maintainer fetches its own REST snapshot on every bootstrap).
 pub async fn run_binance_ingest(
     pool: PgPool,
     rest: RestClient,
@@ -746,14 +748,24 @@ pub async fn run_binance_ingest(
     symbol: String,
     cold_start: ChronoDuration,
 ) -> Result<()> {
-    let mut backoff = RECONNECT_MIN;
     info!(symbol = %symbol, "binance ingest task started");
+    let market = run_market_loop(pool, rest, txs.clone(), symbol.clone(), cold_start);
+    let public = run_public_loop(txs, symbol);
+    // Both loops are infinite; tokio::join! returns only if both ever return.
+    let (_, _) = tokio::join!(market, public);
+    Ok(())
+}
+
+/// Gap-heal → connect to `/market/stream` → stream until disconnect → backoff.
+async fn run_market_loop(
+    pool: PgPool,
+    rest: RestClient,
+    txs: BroadcastTxs,
+    symbol: String,
+    cold_start: ChronoDuration,
+) {
+    let mut backoff = RECONNECT_MIN;
     loop {
-        // Heal any gap. Kline gap-heal fans out 9 parallel REST loops (one
-        // per TF); trade gap-heal is one cursor-driven sequential loop.
-        // Running them in parallel overlaps wait times for the typical
-        // tiny gap and lets the slower side dominate the wall clock for a
-        // big cold start.
         let kline_fut = backfill_symbol(&pool, &rest, &symbol, cold_start);
         let trade_fut = backfill_trades(&pool, &rest, &symbol);
         let (kline_res, trade_res) = tokio::join!(kline_fut, trade_fut);
@@ -778,17 +790,42 @@ pub async fn run_binance_ingest(
             warn!(error = ?e, "trade gap-heal failed; will retry on next reconnect cycle");
         }
 
-        // Stream until the connection drops or errors.
-        match ws::connect_and_stream(&symbol, &txs).await {
+        let url = ws::market_combined_url(&symbol);
+        match ws::connect_and_stream("market", &url, &txs).await {
             Ok(()) => {
-                info!("binance ws closed cleanly; reconnecting");
+                info!("binance market ws closed cleanly; reconnecting");
                 backoff = RECONNECT_MIN;
             }
             Err(e) => {
                 warn!(
                     error = ?e,
                     backoff_ms = backoff.as_millis() as u64,
-                    "binance ws error; reconnecting after backoff"
+                    "binance market ws error; reconnecting after backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+            }
+        }
+    }
+}
+
+/// Connect to the depth combined-stream → stream → backoff. No REST gap-heal:
+/// the book maintainer fetches a fresh `/fapi/v1/depth?limit=1000` snapshot on
+/// every bootstrap attempt and resyncs from a buffered diff.
+async fn run_public_loop(txs: BroadcastTxs, symbol: String) {
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        let url = ws::public_combined_url(&symbol);
+        match ws::connect_and_stream("public", &url, &txs).await {
+            Ok(()) => {
+                info!("binance public ws closed cleanly; reconnecting");
+                backoff = RECONNECT_MIN;
+            }
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "binance public ws error; reconnecting after backoff"
                 );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(RECONNECT_MAX);
