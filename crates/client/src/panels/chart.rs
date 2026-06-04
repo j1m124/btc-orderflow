@@ -40,27 +40,6 @@ use crate::indicators::{
 use crate::panels::LastFocusedChart;
 use crate::services::market_data::{self, Candle, Timeframe};
 
-/// Insert thousands separators into an integer. Used by the OHLCV legend's
-/// trade-count row so large prints don't read as an unbroken digit run.
-fn thousands(n: i64) -> String {
-    let s = n.abs().to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    if n < 0 {
-        let mut neg = String::from("-");
-        neg.push_str(&out);
-        neg
-    } else {
-        out
-    }
-}
-
 /// Format a bar's open_time in the user's chosen timezone for crosshair /
 /// OHLC pill display. `Candle::date` is frozen at ingestion time using
 /// `Local`, so the pre-formatted string ignores any later Settings change —
@@ -2585,29 +2564,6 @@ pub fn render(
                                 .text_color(theme_foreground)
                                 .child(format!("C {:.2}", c.close)),
                         )
-                        .when(c.vwap.is_some(), |this| {
-                            // VWAP row — only present when the bar has a value.
-                            // Render "—" inline rather than skipping the row so
-                            // older or developing bars don't reflow the pill.
-                            this.child(
-                                div()
-                                    .text_color(theme_muted_foreground)
-                                    .child(match c.vwap {
-                                        Some(v) => format!("VWAP {:.2}", v),
-                                        None => "VWAP —".to_string(),
-                                    }),
-                            )
-                        })
-                        .when(c.trades.is_some(), |this| {
-                            this.child(
-                                div()
-                                    .text_color(theme_muted_foreground)
-                                    .child(match c.trades {
-                                        Some(n) => format!("N {}", thousands(n as i64)),
-                                        None => "N —".to_string(),
-                                    }),
-                            )
-                        })
                         .when(!change_text.is_empty(), |this| {
                             this.child(div().text_color(change_color).child(change_text))
                         })

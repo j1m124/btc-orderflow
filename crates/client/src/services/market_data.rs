@@ -11,7 +11,7 @@
 //!     frames to per-SubKey state
 //!   - exp-backoff reconnect (1s → 30s cap) that forever-retries
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use protocol as proto;
@@ -221,6 +221,14 @@ pub struct MarketDataService {
     refcounts: HashMap<SubKey, usize>,
     next_sub_id: u32,
 
+    /// SubKeys with an outstanding `HistoryPage` request awaiting a reply.
+    /// The chart fires `load_older` on every scroll-wheel/x-axis-drag tick
+    /// while the leftmost bar is within a viewport of the canvas edge; without
+    /// this guard a fast scroll bursts N identical requests (all keyed on the
+    /// unchanged `candles.first().open_time`) and the server returns N copies
+    /// of the same page → duplicated prepends.
+    history_in_flight: HashSet<SubKey>,
+
     /// Outbound queue drained by the connection driver task. Sends from
     /// here are non-blocking; while disconnected they buffer until the
     /// driver reconnects, at which point a `resubscribe_all` flushes any
@@ -278,6 +286,7 @@ impl MarketDataService {
             by_id: HashMap::new(),
             refcounts: HashMap::new(),
             next_sub_id: 0,
+            history_in_flight: HashSet::new(),
             to_ws,
             release_tx,
             conn_status: LiveStatus::Connecting,
@@ -370,6 +379,11 @@ impl MarketDataService {
         let Some(sub_id) = self.sub_ids.get(&key).copied() else {
             return;
         };
+        // One in-flight HistoryPage per (symbol, tf); reset on response,
+        // snapshot, resnap, or release.
+        if !self.history_in_flight.insert(key.clone()) {
+            return;
+        }
         let before_ms = self
             .candles
             .get(&key)
@@ -429,6 +443,7 @@ impl MarketDataService {
         };
         let bars: Vec<Candle> = candles.into_iter().map(candle_from_proto).collect();
         self.candles.insert(key.clone(), bars);
+        self.history_in_flight.remove(&key);
         cx.emit(KlineEvent::Resnap {
             symbol: key.symbol.clone().into(),
             tf: key.tf,
@@ -465,6 +480,7 @@ impl MarketDataService {
         let Some(key) = self.by_id.get(&id).cloned() else {
             return;
         };
+        self.history_in_flight.remove(&key);
         if candles.is_empty() {
             cx.emit(KlineEvent::HistoryCapped {
                 symbol: key.symbol.clone().into(),
@@ -472,11 +488,23 @@ impl MarketDataService {
             });
             return;
         }
-        let added = candles.len();
-        let prepend: Vec<Candle> = candles.into_iter().map(candle_from_proto).collect();
         let existing = self.candles.entry(key.clone()).or_default();
+        // Defensive: server returns `open_time < before_ms`, so a fresh
+        // request can't overlap — but a HistoryPage that races a Snapshot /
+        // Resnap (which replaces the buffer) can. Drop anything not strictly
+        // older than the current leftmost bar.
+        let cutoff = existing.first().map(|c| c.open_time);
+        let mut prepend: Vec<Candle> = candles
+            .into_iter()
+            .map(candle_from_proto)
+            .filter(|c| cutoff.map_or(true, |t| c.open_time < t))
+            .collect();
+        if prepend.is_empty() {
+            return;
+        }
+        let added = prepend.len();
         let mut merged = Vec::with_capacity(prepend.len() + existing.len());
-        merged.extend(prepend);
+        merged.append(&mut prepend);
         merged.append(existing);
         *existing = merged;
         cx.emit(KlineEvent::Prepended {
@@ -494,6 +522,7 @@ impl MarketDataService {
             return;
         };
         self.candles.insert(key.clone(), Vec::new());
+        self.history_in_flight.remove(&key);
         cx.emit(KlineEvent::Resnap {
             symbol: key.symbol.clone().into(),
             tf: key.tf,
@@ -564,6 +593,7 @@ impl MarketDataService {
             }
             self.candles.remove(&key);
             self.statuses.remove(&key);
+            self.history_in_flight.remove(&key);
         }
     }
 }
