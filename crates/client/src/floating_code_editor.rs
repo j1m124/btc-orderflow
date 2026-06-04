@@ -16,7 +16,7 @@ use gpui_component::{
     input::{Input, InputState},
 };
 
-actions!(btc_orderflow, [ToggleFloatingCodeEditor]);
+actions!(client, [ToggleFloatingCodeEditor]);
 
 const PLACEHOLDER_SCRIPT: &str = "\
 // Future scripting surface — under construction.

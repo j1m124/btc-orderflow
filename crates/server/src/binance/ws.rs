@@ -7,7 +7,7 @@
 //! loop that also runs a gap-heal between connections.
 
 use anyhow::{Context, Result, anyhow};
-use btc_orderflow_protocol::Timeframe;
+use protocol::Timeframe;
 use futures::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message};

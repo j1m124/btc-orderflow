@@ -1,4 +1,4 @@
-//! Live market-data service backed by a WebSocket to `btc_orderflow_server`.
+//! Live market-data service backed by a WebSocket to `server`.
 //!
 //! Public types (Candle, Timeframe, Session, LiveStatus, KlineEvent, SubKey,
 //! MarketDataService, MarketDataServiceHandle, SubscriptionHandle) keep the
@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use btc_orderflow_protocol as proto;
+use protocol as proto;
 use chrono::{Local, TimeZone as _};
 use futures::{
     SinkExt, StreamExt,

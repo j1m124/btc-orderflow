@@ -1,5 +1,5 @@
 [package]
-name = "btc_orderflow_protocol"
+name = "protocol"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

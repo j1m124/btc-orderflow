@@ -21,7 +21,7 @@
 //! ```
 
 use anyhow::{Context, Result, anyhow};
-use btc_orderflow_protocol::Timeframe;
+use protocol::Timeframe;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;

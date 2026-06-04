@@ -979,7 +979,7 @@ fn render_keymap(cx: &mut Context<SettingsView>) -> impl IntoElement {
 // ---------------------------------------------------------------------------
 
 #[derive(gpui::Action, Clone, PartialEq, Eq, serde::Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct SetTimezone(pub Option<SharedString>);
 
 /// Apply a timezone choice. `None` ≡ Auto; `Some("UTC"|...)` parses via

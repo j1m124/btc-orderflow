@@ -30,7 +30,7 @@ use crate::panels::ContentPanel;
 /// target chart from `LastFocusedChart` (mirroring `OpenSymbolPicker`'s
 /// pattern). Toggling re-fires while open → close.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct OpenIndicatorPicker;
 
 /// Confirm the top-ranked row. Bound on the picker; falls through to a
@@ -38,12 +38,12 @@ pub struct OpenIndicatorPicker;
 /// focus is parked on the search input. No keyboard row navigation —
 /// mouse hover is the only way to target a non-top result.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct ConfirmIndicatorPick;
 
 /// Close without confirming (Esc).
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct CloseIndicatorPicker;
 
 /// Where to add the picked indicator. The workspace resolves the chart

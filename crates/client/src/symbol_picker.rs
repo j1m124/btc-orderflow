@@ -94,7 +94,7 @@ impl FilterTab {
 ///
 /// `kind` is `"chart"` or `"watchlist"`.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct OpenSymbolPicker {
     pub kind: SharedString,
 }
@@ -103,17 +103,17 @@ pub struct OpenSymbolPicker {
 /// Workspace-scoped, no payload — the highlighted ticker lives on the picker
 /// state.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct ConfirmPickerSelection;
 
 /// Dispatched on Esc inside the picker. Closes without confirming.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct ClosePicker;
 
 /// Dispatched on ArrowDown/ArrowUp; `delta` is +1 or -1.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct MovePickerHighlight(pub i32);
 
 pub struct SymbolPickerState {

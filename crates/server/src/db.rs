@@ -6,7 +6,7 @@
 //! ergonomics outweighs the lost safety net (Q14a-3 review).
 
 use anyhow::Result;
-use btc_orderflow_protocol::Candle;
+use protocol::Candle;
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::{PgPool, QueryBuilder, Row};
 use tracing::info;

@@ -28,7 +28,7 @@ impl RestClient {
     pub fn new(base: &str) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(15))
-            .user_agent("btc_orderflow_server/0.1")
+            .user_agent("server/0.1")
             .build()
             .expect("reqwest client builder");
         Self {

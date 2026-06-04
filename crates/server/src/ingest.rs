@@ -12,7 +12,7 @@
 //! configuration is trivial and stays well under Binance's REST weight cap.
 
 use anyhow::{Context, Result};
-use btc_orderflow_protocol::Timeframe;
+use protocol::Timeframe;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures::future::try_join_all;
 use sqlx::PgPool;

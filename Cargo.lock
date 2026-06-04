@@ -725,62 +725,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "btc_orderflow"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "btc_orderflow_protocol",
- "chrono",
- "chrono-tz",
- "console_error_panic_hook",
- "console_log",
- "futures",
- "gpui",
- "gpui-component",
- "gpui-component-assets",
- "gpui_platform",
- "log",
- "reqwest",
- "serde",
- "serde_json",
- "tracing-wasm",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
- "ws_stream_wasm",
-]
-
-[[package]]
-name = "btc_orderflow_protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "btc_orderflow_server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "btc_orderflow_protocol",
- "chrono",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "built"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -983,6 +927,33 @@ dependencies = [
  "glob",
  "libc",
  "libloading",
+]
+
+[[package]]
+name = "client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "console_error_panic_hook",
+ "console_log",
+ "futures",
+ "gpui",
+ "gpui-component",
+ "gpui-component-assets",
+ "gpui_platform",
+ "log",
+ "protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tracing-wasm",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+ "ws_stream_wasm",
 ]
 
 [[package]]
@@ -4863,6 +4834,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "psm"
 version = "0.1.31"
 source = "git+https://github.com/rust-lang/stacker?branch=master#1d45da4653e1d6e5d273cf20e215b372d84ade5e"
@@ -5894,6 +5873,27 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "futures",
+ "protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

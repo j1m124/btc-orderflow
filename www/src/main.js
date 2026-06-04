@@ -24,7 +24,7 @@ async function init() {
 
   try {
     suppressMobileKeyboard();
-    const wasm = await import('./wasm/btc_orderflow.js');
+    const wasm = await import('./wasm/client.js');
     await wasm.default();
     await wasm.run();
 

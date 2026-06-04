@@ -19,9 +19,9 @@ fi
 
 echo -e "${GREEN}Step 1: cargo build --target wasm32-unknown-unknown ${RELEASE_FLAG}${NC}"
 cd "$PROJECT_ROOT"
-cargo build -p btc_orderflow --lib --target wasm32-unknown-unknown $RELEASE_FLAG
+cargo build -p client --lib --target wasm32-unknown-unknown $RELEASE_FLAG
 
-WASM_PATH="$PROJECT_ROOT/target/wasm32-unknown-unknown/$BUILD_MODE/btc_orderflow.wasm"
+WASM_PATH="$PROJECT_ROOT/target/wasm32-unknown-unknown/$BUILD_MODE/client.wasm"
 if [[ ! -f "$WASM_PATH" ]]; then
     echo -e "${RED}Error: WASM file not found at: $WASM_PATH${NC}"
     exit 1

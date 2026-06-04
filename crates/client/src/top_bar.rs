@@ -13,37 +13,37 @@ use serde::Deserialize;
 
 use crate::panels::PANEL_KINDS;
 
-actions!(btc_orderflow, [ResetLayout, SaveLayout, ManageLayouts]);
+actions!(client, [ResetLayout, SaveLayout, ManageLayouts]);
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct AddPanel(pub SharedString);
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct ApplyLayout(pub SharedString);
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct DeleteLayout(pub SharedString);
 
 /// Dispatched by the watchlist when a row is clicked. The workspace routes it
 /// to the focused chart (falling back to the first chart in the dock).
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct FocusSymbol(pub SharedString);
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct AddWatchlistSymbol(pub SharedString);
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct RemoveWatchlistSymbol(pub SharedString);
 
 /// Dispatched by the Settings dialog's Theme dropdown.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct SetTheme(pub SharedString);
 
 pub struct TopBar {

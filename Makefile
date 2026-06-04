@@ -30,13 +30,13 @@ install: ## Install all dependencies
 check: check-protocol check-client check-server ## Type-check every crate against its target
 
 check-protocol: ## Type-check the shared wire-protocol crate
-	@cargo check -p btc_orderflow_protocol
+	@cargo check -p protocol
 
 check-client: ## Type-check the wasm client crate
-	@cargo check -p btc_orderflow --target wasm32-unknown-unknown
+	@cargo check -p client --target wasm32-unknown-unknown
 
 check-server: ## Type-check the native server crate
-	@cargo check -p btc_orderflow_server
+	@cargo check -p server
 
 # --- Database --------------------------------------------------------------
 
@@ -54,12 +54,12 @@ db-psql: ## Open a psql shell in the running DB container
 
 db-migration: ## Generate a reversible migration: `make db-migration NAME=add_thing`
 	@if [ -z "$(NAME)" ]; then echo "usage: make db-migration NAME=<snake_case_name>"; exit 1; fi
-	@sqlx migrate add -r --source crates/btc_orderflow_server/migrations $(NAME)
+	@sqlx migrate add -r --source crates/server/migrations $(NAME)
 
 # --- Run server ------------------------------------------------------------
 
-server: ## Run the native server (cargo run -p btc_orderflow_server)
-	@cargo run -p btc_orderflow_server
+server: ## Run the native server (cargo run -p server)
+	@cargo run -p server
 
 # --- Frontend build --------------------------------------------------------
 

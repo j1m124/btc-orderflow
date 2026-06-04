@@ -84,7 +84,7 @@ use crate::symbol_picker::OpenSymbolPicker;
 /// dispatches up through *this* panel (not whichever element had focus when the
 /// menu opened), keeping multiple Chart panels independent.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct ChangeChartTimeframe(pub SharedString);
 
 // Drawing-delete + clear actions now live in `crate::drawings::actions` so
@@ -96,19 +96,19 @@ pub struct ChangeChartTimeframe(pub SharedString);
 /// `LastFocusedChart` round-trip needed — context menus bubble from the
 /// element they were opened on).
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct MoveIndicatorPaneUp(pub u64);
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct MoveIndicatorPaneDown(pub u64);
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct ToggleIndicatorHidden(pub u64);
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct RemoveIndicator(pub u64);
 
 /// Reset the chart's viewport to its default trailing window (x-axis) and
@@ -116,7 +116,7 @@ pub struct RemoveIndicator(pub u64);
 /// context menu — mirrors what double-clicking either axis would do, but in
 /// one shot.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct ResetChartScale;
 
 /// Snap the viewport so the latest bar lands at the default trailing offset
@@ -125,7 +125,7 @@ pub struct ResetChartScale;
 /// pans the canvas horizontally. Dispatched from the floating bottom-right
 /// button and from the right-click context menu.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct GoToLatest;
 
 // ============================================================================

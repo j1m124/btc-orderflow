@@ -1,4 +1,4 @@
-//! btc_orderflow_server — entry point.
+//! server — entry point.
 //!
 //! Boot sequence (Q5/Q10):
 //!   1. env → init tracing
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("btc_orderflow_server=info,sqlx=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("server=info,sqlx=warn"));
     fmt().with_env_filter(filter).init();
 }
 

@@ -39,7 +39,7 @@ use crate::panels::ContentPanel;
 /// Carries the instance id; the workspace resolves the target chart via
 /// `LastFocusedChart` (the chip body click on the chip already sets it).
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
+#[action(namespace = client, no_json)]
 pub struct OpenIndicatorSettings(pub u64);
 
 /// The hosted view inside the floating settings window. Holds a weak handle

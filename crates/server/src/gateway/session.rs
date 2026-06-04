@@ -16,7 +16,7 @@
 //! tasks can write concurrently without contending on the socket.
 
 use axum::extract::ws::{Message, WebSocket};
-use btc_orderflow_protocol::{
+use protocol::{
     Candle, Channel, ClientFrame, ServerFrame, SubId, Timeframe,
 };
 use futures::{SinkExt, StreamExt};
