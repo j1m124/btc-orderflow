@@ -729,6 +729,7 @@ name = "btc_orderflow"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "btc_orderflow_protocol",
  "chrono",
  "chrono-tz",
  "console_error_panic_hook",
