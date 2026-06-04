@@ -2,7 +2,7 @@
 //! and `ChartPrefsGlobal` — are written here at startup and updated live by
 //! the Settings dialog. Renderers read them on each paint.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use chrono::{DateTime, FixedOffset, Local, Offset as _, TimeZone as _};
 use chrono_tz::Tz;
@@ -13,13 +13,11 @@ use crate::persistence::{self, ChartPrefs, GeneralPrefs, TzPref};
 static DEFAULT_VIEW: AtomicU32 = AtomicU32::new(0x42700000); // 60.0_f32.to_bits()
 static RIGHT_BUFFER: AtomicU32 = AtomicU32::new(0x3ECCCCCD); // 0.40_f32.to_bits()
 static Y_PADDING: AtomicU32 = AtomicU32::new(0x3D4CCCCD); // 0.05_f32.to_bits()
-static SESSION_MARKERS: AtomicBool = AtomicBool::new(true);
 
 fn store_atomic_chart_prefs(p: &ChartPrefs) {
     DEFAULT_VIEW.store(p.default_view.to_bits(), Ordering::Relaxed);
     RIGHT_BUFFER.store(p.right_buffer.to_bits(), Ordering::Relaxed);
     Y_PADDING.store(p.y_padding.to_bits(), Ordering::Relaxed);
-    SESSION_MARKERS.store(p.session_markers, Ordering::Relaxed);
 }
 
 pub fn chart_default_view() -> f32 {
@@ -32,10 +30,6 @@ pub fn chart_right_buffer() -> f32 {
 
 pub fn chart_y_padding() -> f32 {
     f32::from_bits(Y_PADDING.load(Ordering::Relaxed))
-}
-
-pub fn chart_session_markers() -> bool {
-    SESSION_MARKERS.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Default)]

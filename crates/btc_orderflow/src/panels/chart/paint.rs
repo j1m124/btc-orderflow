@@ -6,7 +6,6 @@
 //! that live in `chart.rs`'s mouse handlers).
 
 use chrono::{DateTime, Datelike as _, FixedOffset, TimeZone as _};
-use chrono_tz::US::Eastern;
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, IntoElement, ParentElement as _,
     PaintQuad, PathBuilder, Pixels, Point, SharedString, Styled as _, TextRun, Window, canvas,
@@ -53,149 +52,6 @@ pub(super) struct MainChartColors {
     pub axis_bg: Hsla,
     /// Thin divider between the chart area and the axis gutters.
     pub axis_border: Hsla,
-    /// Colour for the ETH session-boundary dashed lines (RTH open/close
-    /// markers). Slightly more saturated than `grid` so the dashes read as a
-    /// distinct annotation rather than another grid line.
-    pub session_marker: Hsla,
-}
-
-/// RTH session boundary in ET. `Open` = 09:30 (pre → RTH transition);
-/// `Close` = 16:00 (RTH → post transition). Drives both the dashed line in
-/// `paint_main_chart` and the "Open"/"Close" label divs emitted from the
-/// chart-render path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SessionBoundary {
-    Open,
-    Close,
-}
-
-/// One session-boundary occurrence: canvas-relative x (pixels) + which
-/// boundary it represents. Computed once in chart-render via
-/// `compute_session_markers`, then used to (a) draw the dashed line via
-/// `paint_main_chart` and (b) emit "Open"/"Close" labels above the chart.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct SessionMarker {
-    pub x: f32,
-    pub kind: SessionBoundary,
-}
-
-/// Hardcoded RTH session boundaries in ET wall-clock minutes-from-midnight.
-/// Half-day (early-close) sessions are ignored — the existing
-/// `ext_session_tag` classifier in chart.rs takes the same simplification, so
-/// markers and labels agree on session classification.
-const RTH_OPEN_MIN: u32 = 9 * 60 + 30;
-const RTH_CLOSE_MIN: u32 = 16 * 60;
-
-/// Locate the two `Candle`s in `candles` whose `open_time`s bracket
-/// `target_ms`. Returns `(i, frac)` such that the boundary sits at
-/// `index = i + frac` in candle-space. Returns `None` when:
-/// - the buffer is empty
-/// - `target_ms` lies outside the visible bars' time span (no bracketing pair)
-/// - bracketing bars are non-monotonic (defensive — shouldn't happen)
-/// - the gap between the bracketing bars exceeds `max_gap_ms`, which signals
-///   a closed-market gap (weekend, holiday, overnight). Without this check,
-///   a Saturday 09:30 ET boundary would bracket Friday's last bar and
-///   Monday's first bar and draw a spurious line in the weekend gap.
-fn bracket_index(candles: &[Candle], target_ms: i64, max_gap_ms: i64) -> Option<(usize, f32)> {
-    if candles.len() < 2 {
-        return None;
-    }
-    // Binary search by open_time. `candles` is sorted by open_time so we can
-    // partition on the first bar whose open_time >= target_ms.
-    let pos = candles.partition_point(|c| c.open_time < target_ms);
-    if pos == 0 || pos >= candles.len() {
-        // target_ms is before the first bar or after the last — no bracket.
-        return None;
-    }
-    let a = &candles[pos - 1];
-    let b = &candles[pos];
-    let span = b.open_time - a.open_time;
-    if span <= 0 || span > max_gap_ms {
-        return None;
-    }
-    let frac = ((target_ms - a.open_time) as f64 / span as f64).clamp(0.0, 1.0) as f32;
-    Some((pos - 1, frac))
-}
-
-/// Walk the ET-local day range of `candles` (the *visible* slice already
-/// trimmed by the caller) and emit a `SessionMarker` for each 09:30 and 16:00
-/// boundary that falls between two adjacent bars. Days without bracketing
-/// bars (weekends, holidays, missing data) emit nothing.
-///
-/// The caller is responsible for the activation gate (Extended session, not
-/// 1d timeframe, pref enabled) — this function blindly computes whatever
-/// boundaries fit the bars.
-pub(super) fn compute_session_markers(
-    candles: &[Candle],
-    start_idx: usize,
-    view_start: f32,
-    view_size: f32,
-    canvas_w: f32,
-    y_axis_gap: f32,
-    candle_interval_ms: i64,
-) -> Vec<SessionMarker> {
-    if candles.len() < 2 {
-        return Vec::new();
-    }
-    let chart_w = (canvas_w - y_axis_gap).max(0.0);
-    // Two adjacent bars from the same trading day are separated by exactly
-    // `candle_interval_ms`. A gap larger than ~2× the interval signals a
-    // closed-market hole — weekend, holiday, or overnight on intraday
-    // timeframes — and any boundary that falls inside such a hole should
-    // NOT produce a line (otherwise Saturday 09:30 ET would appear at the
-    // Friday→Monday boundary). 2× is a soft buffer for missing single bars.
-    let max_gap_ms = candle_interval_ms.saturating_mul(2);
-    let mut out: Vec<SessionMarker> = Vec::new();
-    // Iterate ET-local days from the first bar's date to the last bar's date,
-    // emitting up to two boundaries per day. Dates rather than ms so DST
-    // shifts are absorbed by chrono_tz when we re-materialise wall-clock
-    // 09:30 / 16:00.
-    let Some(first_et) = Eastern
-        .timestamp_millis_opt(candles.first().unwrap().open_time)
-        .single()
-    else {
-        return out;
-    };
-    let Some(last_et) = Eastern
-        .timestamp_millis_opt(candles.last().unwrap().open_time)
-        .single()
-    else {
-        return out;
-    };
-    let mut day = first_et.date_naive();
-    let last_day = last_et.date_naive();
-    // Safety bound — at 1m timeframe the visible buffer holds ~5k bars
-    // (~3.5 days); 400 days is well past anything a user can zoom out to
-    // and protects against pathological inputs.
-    for _ in 0..400 {
-        if day > last_day {
-            break;
-        }
-        for (boundary_min, kind) in [
-            (RTH_OPEN_MIN, SessionBoundary::Open),
-            (RTH_CLOSE_MIN, SessionBoundary::Close),
-        ] {
-            let Some(naive) = day.and_hms_opt(boundary_min / 60, boundary_min % 60, 0) else {
-                continue;
-            };
-            let Some(et_dt) = Eastern.from_local_datetime(&naive).single() else {
-                continue;
-            };
-            let target_ms = et_dt.timestamp_millis();
-            let Some((i, frac)) = bracket_index(candles, target_ms, max_gap_ms) else {
-                continue;
-            };
-            let global_index = (start_idx + i) as f32 + frac;
-            let x = index_to_screen(view_start, view_size, global_index, canvas_w, y_axis_gap);
-            if x < 0.0 || x > chart_w {
-                continue;
-            }
-            out.push(SessionMarker { x, kind });
-        }
-        let Some(next) = day.succ_opt() else { break };
-        day = next;
-    }
-    out
 }
 
 /// Paint a solid axis-aligned rectangle as a single GPU quad. Used for grid
@@ -381,7 +237,6 @@ pub(super) fn paint_main_chart(
     candle_interval_ms: i64,
     y_axis_gap: f32,
     colors: MainChartColors,
-    session_markers: &[SessionMarker],
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -481,37 +336,6 @@ pub(super) fn paint_main_chart(
             (chart_bottom - chart_top).max(0.0),
             colors.grid,
         );
-    }
-
-    // -- 2b. ETH session boundary lines (dashed) --
-    //
-    // Drawn after the solid grid and before candles so the candles always
-    // visually overlap the dashes (same z-order rule as the grid). Caller
-    // already filtered for Session::Extended + non-1d + pref-on; here we
-    // blindly paint whatever markers came in. Dashes are emitted as a stack
-    // of short fill_rect quads (gpui paint has no dashed primitive) using a
-    // 4-on / 3-off pattern.
-    if !session_markers.is_empty() {
-        let dash_on = 4.0_f32;
-        let dash_off = 3.0_f32;
-        let stride = dash_on + dash_off;
-        let line_h = (chart_bottom - chart_top).max(0.0);
-        for marker in session_markers {
-            let mut y = chart_top;
-            while y < chart_top + line_h {
-                let seg_h = dash_on.min(chart_top + line_h - y);
-                fill_rect(
-                    window,
-                    origin,
-                    marker.x,
-                    1.0,
-                    y,
-                    seg_h,
-                    colors.session_marker,
-                );
-                y += stride;
-            }
-        }
     }
 
     // -- 3. candles (continuous x positions) --

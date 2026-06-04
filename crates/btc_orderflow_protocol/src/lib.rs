@@ -91,33 +91,6 @@ impl Timeframe {
     }
 }
 
-// --- Session ----------------------------------------------------------------
-
-/// Trading session filter. Kept on the wire for forward-compat with equities
-/// venues; for crypto both variants are equivalent and the server treats
-/// them identically.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Session {
-    Regular,
-    Extended,
-}
-
-impl Session {
-    pub const ALL: [Session; 2] = [Session::Regular, Session::Extended];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Session::Regular => "regular",
-            Session::Extended => "extended",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        Session::ALL.into_iter().find(|sn| sn.as_str() == s)
-    }
-}
-
 // --- Candle (wire-narrow OHLCV) ---------------------------------------------
 
 /// Wire-narrow OHLCV bar. Timestamps are millis since the Unix epoch.
@@ -155,7 +128,7 @@ pub enum LiveStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Channel {
-    Candles { tf: Timeframe, session: Session },
+    Candles { tf: Timeframe },
     // Future variants (Q11):
     //   Trades,
     //   Footprint { tf: Timeframe, price_bucket: f64 },
@@ -252,7 +225,6 @@ mod tests {
             symbol: "BTCUSDT".into(),
             channel: Channel::Candles {
                 tf: Timeframe::M1,
-                session: Session::Regular,
             },
         };
         let s = serde_json::to_string(&f).unwrap();

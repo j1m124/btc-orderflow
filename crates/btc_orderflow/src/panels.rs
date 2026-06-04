@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub mod chart;
 pub mod watchlist;
 
-pub use chart::{ChangeChartSession, ChangeChartTimeframe, GoToLatest, ResetChartScale};
+pub use chart::{ChangeChartTimeframe, GoToLatest, ResetChartScale};
 
 /// Minimum interval between chart re-paints driven by tick events. 50ms = 20Hz.
 const CHART_TICK_INTERVAL_MS: i64 = 50;
@@ -101,7 +101,6 @@ pub fn build_kind(kind: Kind, window: &mut Window, cx: &mut App) -> Arc<dyn Pane
 fn live_snapshot(
     symbol: &str,
     tf: crate::services::market_data::Timeframe,
-    session: crate::services::market_data::Session,
     cx: &App,
 ) -> Option<Vec<crate::services::market_data::Candle>> {
     if !crate::services::market_data::is_live(symbol) {
@@ -114,69 +113,39 @@ fn live_snapshot(
     Some(
         handle
             .read(cx)
-            .snapshot(symbol, tf, session)
+            .snapshot(symbol, tf)
             .map(|s| s.to_vec())
             .unwrap_or_default(),
     )
 }
 
-fn ensure_sub(
+fn ensure_chart_sub(
     symbol: &str,
     tf: crate::services::market_data::Timeframe,
-    session: crate::services::market_data::Session,
     cx: &mut Context<ContentPanel>,
 ) -> crate::services::market_data::SubscriptionHandle {
     let handle = cx
         .global::<crate::services::market_data::MarketDataServiceHandle>()
         .0
         .clone();
-    handle.update(cx, |svc, cx| svc.ensure(symbol, tf, session, cx))
-}
-
-fn ensure_chart_subs(
-    symbol: &str,
-    tf: crate::services::market_data::Timeframe,
-    primary: crate::services::market_data::Session,
-    cx: &mut Context<ContentPanel>,
-) -> Vec<crate::services::market_data::SubscriptionHandle> {
-    let mut handles = vec![ensure_sub(symbol, tf, primary, cx)];
-    if primary == crate::services::market_data::Session::Regular {
-        handles.push(ensure_sub(
-            symbol,
-            tf,
-            crate::services::market_data::Session::Extended,
-            cx,
-        ));
-    }
-    handles
+    handle.update(cx, |svc, cx| svc.ensure(symbol, tf, cx))
 }
 
 #[derive(Serialize, Deserialize)]
 struct ChartPrefs {
     symbol: String,
     tf: String,
-    #[serde(default)]
-    session: Option<String>,
 }
 
 fn chart_prefs_from_info(
     info: &PanelInfo,
-) -> Option<(
-    SharedString,
-    crate::services::market_data::Timeframe,
-    crate::services::market_data::Session,
-)> {
+) -> Option<(SharedString, crate::services::market_data::Timeframe)> {
     let PanelInfo::Panel(value) = info else {
         return None;
     };
     let prefs: ChartPrefs = serde_json::from_value(value.clone()).ok()?;
     let tf = crate::services::market_data::Timeframe::from_str(&prefs.tf)?;
-    let session = prefs
-        .session
-        .as_deref()
-        .and_then(crate::services::market_data::Session::from_str)
-        .unwrap_or(crate::services::market_data::DEFAULT_SESSION);
-    Some((SharedString::from(prefs.symbol), tf, session))
+    Some((SharedString::from(prefs.symbol), tf))
 }
 
 #[derive(Clone)]
@@ -220,22 +189,17 @@ impl ContentPanel {
 
     fn new_inner(
         kind: Kind,
-        chart_prefs: Option<(
-            SharedString,
-            crate::services::market_data::Timeframe,
-            crate::services::market_data::Session,
-        )>,
+        chart_prefs: Option<(SharedString, crate::services::market_data::Timeframe)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         let mut chart_handles: Vec<crate::services::market_data::SubscriptionHandle> = Vec::new();
         let chart_state = matches!(kind, Kind::Chart).then(|| {
-            let (symbol, tf, session) = match &chart_prefs {
-                Some((s, t, sn)) => (s.clone(), *t, *sn),
+            let (symbol, tf) = match &chart_prefs {
+                Some((s, t)) => (s.clone(), *t),
                 None => {
                     let default_tf = chart::ChartState::default_timeframe();
-                    let default_session = chart::ChartState::default_session();
                     let default_symbol: SharedString = cx
                         .global::<crate::services::symbols::SymbolsServiceHandle>()
                         .0
@@ -244,12 +208,12 @@ impl ContentPanel {
                         .unwrap_or_else(|| {
                             SharedString::from(chart::ChartState::default_symbol())
                         });
-                    (default_symbol, default_tf, default_session)
+                    (default_symbol, default_tf)
                 }
             };
-            chart_handles = ensure_chart_subs(symbol.as_ref(), tf, session, cx);
-            let live = live_snapshot(symbol.as_ref(), tf, session, cx);
-            chart::ChartState::new(symbol.as_ref(), tf, session, live)
+            chart_handles = vec![ensure_chart_sub(symbol.as_ref(), tf, cx)];
+            let live = live_snapshot(symbol.as_ref(), tf, cx);
+            chart::ChartState::new(symbol.as_ref(), tf, live)
         });
         let watchlist_handles = if matches!(kind, Kind::Watchlist) {
             let h = watchlist::initial_handles(cx);
@@ -315,10 +279,9 @@ impl ContentPanel {
                         return;
                     };
                     match event {
-                        Tick { symbol, tf, session, candle, is_closed } => {
+                        Tick { symbol, tf, candle, is_closed } => {
                             if state.symbol().as_ref() != symbol.as_ref()
                                 || state.timeframe() != *tf
-                                || state.session() != *session
                             {
                                 return;
                             }
@@ -333,23 +296,21 @@ impl ContentPanel {
                                 pending.set(true);
                             }
                         }
-                        Resnap { symbol, tf, session } => {
+                        Resnap { symbol, tf } => {
                             if state.symbol().as_ref() == symbol.as_ref()
                                 && state.timeframe() == *tf
-                                && state.session() == *session
                             {
-                                let snap = live_snapshot(symbol.as_ref(), *tf, *session, cx)
+                                let snap = live_snapshot(symbol.as_ref(), *tf, cx)
                                     .unwrap_or_default();
                                 state.resnap(snap);
                                 cx.notify();
                             }
                         }
-                        Prepended { symbol, tf, session, added } => {
+                        Prepended { symbol, tf, added } => {
                             if state.symbol().as_ref() == symbol.as_ref()
                                 && state.timeframe() == *tf
-                                && state.session() == *session
                             {
-                                let snap = live_snapshot(symbol.as_ref(), *tf, *session, cx)
+                                let snap = live_snapshot(symbol.as_ref(), *tf, cx)
                                     .unwrap_or_default();
                                 state.apply_prepend(snap, *added);
                                 cx.notify();
@@ -441,10 +402,9 @@ impl ContentPanel {
             return;
         };
         let tf = state.timeframe();
-        let session = state.session();
-        let new_handles = ensure_chart_subs(target, tf, session, cx);
+        let new_handles = vec![ensure_chart_sub(target, tf, cx)];
         self.chart_sub_handles = new_handles;
-        let live = live_snapshot(target, tf, session, cx);
+        let live = live_snapshot(target, tf, cx);
         if state.switch_symbol(target, live) {
             cx.notify();
             request_layout_save(cx);
@@ -460,30 +420,10 @@ impl ContentPanel {
             return;
         };
         let symbol = state.symbol().clone();
-        let session = state.session();
-        let new_handles = ensure_chart_subs(symbol.as_ref(), tf, session, cx);
+        let new_handles = vec![ensure_chart_sub(symbol.as_ref(), tf, cx)];
         self.chart_sub_handles = new_handles;
-        let live = live_snapshot(symbol.as_ref(), tf, session, cx);
+        let live = live_snapshot(symbol.as_ref(), tf, cx);
         if state.switch_timeframe(tf, live) {
-            cx.notify();
-            request_layout_save(cx);
-        }
-    }
-
-    pub fn switch_chart_session(
-        &mut self,
-        session: crate::services::market_data::Session,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(state) = self.chart_state.as_mut() else {
-            return;
-        };
-        let symbol = state.symbol().clone();
-        let tf = state.timeframe();
-        let new_handles = ensure_chart_subs(symbol.as_ref(), tf, session, cx);
-        self.chart_sub_handles = new_handles;
-        let live = live_snapshot(symbol.as_ref(), tf, session, cx);
-        if state.switch_session(session, live) {
             cx.notify();
             request_layout_save(cx);
         }
@@ -502,12 +442,11 @@ impl ContentPanel {
         }
         let symbol = state.symbol().clone();
         let tf = state.timeframe();
-        let session = state.session();
         let handle = cx
             .global::<crate::services::market_data::MarketDataServiceHandle>()
             .0
             .clone();
-        handle.update(cx, |svc, cx| svc.load_older(symbol.as_ref(), tf, session, cx));
+        handle.update(cx, |svc, cx| svc.load_older(symbol.as_ref(), tf, cx));
     }
 
     fn on_change_chart_timeframe(
@@ -520,20 +459,6 @@ impl ContentPanel {
             return;
         };
         self.switch_chart_timeframe(tf, cx);
-    }
-
-    fn on_change_chart_session(
-        &mut self,
-        action: &ChangeChartSession,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) =
-            crate::services::market_data::Session::from_str(action.0.as_ref())
-        else {
-            return;
-        };
-        self.switch_chart_session(session, cx);
     }
 
     fn on_delete_selected_drawing(
@@ -711,7 +636,6 @@ impl Panel for ContentPanel {
             if let Ok(value) = serde_json::to_value(ChartPrefs {
                 symbol: chart.symbol().to_string(),
                 tf: chart.timeframe().as_str().to_string(),
-                session: Some(chart.session().as_str().to_string()),
             }) {
                 state.info = PanelInfo::panel(value);
             }
@@ -790,7 +714,6 @@ impl Render for ContentPanel {
                 this.track_focus(&self.focus_handle)
                     .key_context("Chart")
                     .on_action(cx.listener(Self::on_change_chart_timeframe))
-                    .on_action(cx.listener(Self::on_change_chart_session))
                     .on_action(cx.listener(Self::on_move_indicator_pane_up))
                     .on_action(cx.listener(Self::on_move_indicator_pane_down))
                     .on_action(cx.listener(Self::on_toggle_indicator_hidden))

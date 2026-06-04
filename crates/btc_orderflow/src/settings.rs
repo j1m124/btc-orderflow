@@ -653,22 +653,6 @@ fn y_padding_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
     )
 }
 
-fn session_markers_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
-    let enabled = cx.global::<ChartPrefsGlobal>().0.session_markers;
-    setting_row(
-        "ETH session markers",
-        "Show RTH Open/Close dashed lines when a chart is in Extended-hours mode.",
-        Switch::new("session-markers-toggle")
-            .checked(enabled)
-            .label(if enabled { "On" } else { "Off" })
-            .on_click(|checked, window, cx| {
-                let checked = *checked;
-                adjust_chart(cx, |p| p.session_markers = checked);
-                window.refresh();
-            }),
-    )
-}
-
 fn adjust_chart(cx: &mut gpui::App, mutate: impl FnOnce(&mut ChartPrefs)) {
     let mut prefs = cx.global::<ChartPrefsGlobal>().0.clone();
     mutate(&mut prefs);

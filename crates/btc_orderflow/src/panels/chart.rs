@@ -30,9 +30,8 @@ use gpui_component::{
 use serde::Deserialize;
 
 use self::paint::{
-    DrawingColors, MainChartColors, OverlayPaintItem, PanePaintItem, SessionBoundary,
-    SessionMarker, compute_session_markers, paint_main_chart, paint_overlay_indicators,
-    paint_sub_pane, render_drawings_overlay,
+    DrawingColors, MainChartColors, OverlayPaintItem, PanePaintItem, paint_main_chart,
+    paint_overlay_indicators, paint_sub_pane, render_drawings_overlay,
 };
 use super::ContentPanel;
 use crate::drawings::service::{DrawingId, DrawingServiceHandle};
@@ -42,28 +41,7 @@ use crate::indicators::{
     VolumeParams, palette_color_for,
 };
 use crate::panels::LastFocusedChart;
-use crate::services::market_data::{self, Candle, Session, Timeframe};
-
-/// Mirror of the server's session filter for `tick_clock`'s rollover guard:
-/// `Regular` is Mon–Fri 09:30–16:00 ET, `Extended` is Mon–Fri 04:00–20:00 ET
-/// (matches the server's ingest window — outside this range no upstream bars
-/// arrive, so `tick_clock` must not fabricate flats either).
-/// chrono-tz handles DST so EST/EDT transitions don't drift the window.
-fn in_session(ms: i64, session: Session) -> bool {
-    use chrono::{Datelike, Timelike, Weekday};
-    use chrono_tz::US::Eastern;
-    let Some(et) = chrono::TimeZone::timestamp_millis_opt(&Eastern, ms).single() else {
-        return false;
-    };
-    if matches!(et.weekday(), Weekday::Sat | Weekday::Sun) {
-        return false;
-    }
-    let mod_min = et.hour() * 60 + et.minute();
-    match session {
-        Session::Regular => mod_min >= 9 * 60 + 30 && mod_min < 16 * 60,
-        Session::Extended => mod_min >= 4 * 60 && mod_min < 20 * 60,
-    }
-}
+use crate::services::market_data::{self, Candle, Timeframe};
 
 /// Insert thousands separators into an integer. Used by the OHLCV legend's
 /// trade-count row so large prints don't read as an unbroken digit run.
@@ -100,25 +78,6 @@ fn format_user_tz(open_time: i64, cx: &gpui::App) -> String {
         .unwrap_or_default()
 }
 
-/// Pre/post-market tag for an extended bar's open_time, derived in ET so the
-/// label flips on the correct wall-clock boundary across DST. Returns "Pre"
-/// before 09:30 ET, "Post" at/after 16:00 ET, and falls back to "Ext" in the
-/// RTH window (where this label shouldn't render anyway).
-fn ext_session_tag(ms: i64) -> &'static str {
-    use chrono::Timelike;
-    use chrono_tz::US::Eastern;
-    let Some(et) = chrono::TimeZone::timestamp_millis_opt(&Eastern, ms).single() else {
-        return "Ext";
-    };
-    let mod_min = et.hour() * 60 + et.minute();
-    if mod_min < 9 * 60 + 30 {
-        "Pre"
-    } else if mod_min >= 16 * 60 {
-        "Post"
-    } else {
-        "Ext"
-    }
-}
 use crate::services::symbols::SymbolsServiceHandle;
 use crate::symbol_picker::OpenSymbolPicker;
 
@@ -130,14 +89,6 @@ use crate::symbol_picker::OpenSymbolPicker;
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = btc_orderflow, no_json)]
 pub struct ChangeChartTimeframe(pub SharedString);
-
-/// Switch the chart's trading session filter. Carries the wire string
-/// (`regular` or `extended`); the handler parses it back to a [`Session`].
-/// Dispatched from the chart's session-toggle dropdown, scoped to the panel's
-/// focus the same way as [`ChangeChartTimeframe`].
-#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = btc_orderflow, no_json)]
-pub struct ChangeChartSession(pub SharedString);
 
 // Drawing-delete + clear actions now live in `crate::drawings::actions` so
 // they're shared with workspace-wide key bindings and the Objects popover.
@@ -189,21 +140,6 @@ pub struct GoToLatest;
 /// chart's render path. `open_time` is the identity key the merge-or-append
 /// tick logic uses; for embedded / synthetic data we still need a value, so
 /// historical loaders fabricate one (see `chart_data` and `generate_candles`).
-///
-/// Fallback universe used only until the server's `GET /v1/symbols` loads (and
-/// if it never does). The live list comes from [`crate::services::symbols`];
-/// the first entry (AAPL) is the fallback default symbol.
-const FALLBACK_SYMBOLS: &[(&str, &str, &str)] = &[
-    ("AAPL", "Apple Inc.", "NASDAQ"),
-    ("MSFT", "Microsoft Corp.", "NASDAQ"),
-    ("NVDA", "NVIDIA Corp.", "NASDAQ"),
-    ("GOOGL", "Alphabet Inc.", "NASDAQ"),
-    ("TSLA", "Tesla, Inc.", "NASDAQ"),
-    ("META", "Meta Platforms", "NASDAQ"),
-    ("AMZN", "Amazon.com", "NASDAQ"),
-    ("BRK.B", "Berkshire Hathaway", "NYSE"),
-];
-
 /// Real 1h OHLC bars fetched by `scripts/fetch_chart_data.py`. Embedded so
 /// the WASM bundle is self-contained — no network call at runtime.
 const CHART_DATA_RAW: &str = include_str!("../../assets/chart_data.json");
@@ -641,10 +577,6 @@ pub struct ChartState {
     /// Selected chart timeframe. Drives backfill/subscription and the x-axis
     /// step picker.
     timeframe: Timeframe,
-    /// Trading-session filter (regular hours vs. extended). Keyed into the
-    /// market-data subscription so the chart's buffer + WS stream reflect the
-    /// user's choice.
-    session: Session,
     candles: Vec<Candle>,
     /// Fractional left-edge index of the visible window. Fractional so pan
     /// stays smooth at sub-candle granularity even though the chart paints
@@ -708,9 +640,8 @@ pub struct ChartState {
     /// horizontally. Ephemeral, never persisted.
     sticky_to_latest: bool,
     /// Indicators attached to this chart panel. Carry over on symbol /
-    /// timeframe / session switch (the user's analytical setup follows
-    /// the chart panel, not the data). Volume is seeded by default — see
-    /// `new()`.
+    /// timeframe switch (the user's analytical setup follows the chart panel,
+    /// not the data). Volume is seeded by default — see `new()`.
     indicators: Vec<IndicatorInstance>,
     /// Cached output per indicator, parallel-indexed with `indicators`.
     /// Recomputed from `candles` on `apply_tick` / `tick_clock` / `resnap`
@@ -741,9 +672,9 @@ pub struct ChartState {
     /// canvas-relative cursor used by the cross-pane crosshair pipeline.
     pane_bounds: std::collections::HashMap<InstanceId, Bounds<Pixels>>,
     /// Collapse state for the main-pane "Indicators (N) ▼" header chip.
-    /// Ephemeral — not preserved across symbol/timeframe/session switches
-    /// (those reconstruct `ChartState`), not persisted to local_storage.
-    /// Toggled by the header chip's click handler.
+    /// Ephemeral — not preserved across symbol/timeframe switches (those
+    /// reconstruct `ChartState`), not persisted to local_storage. Toggled by
+    /// the header chip's click handler.
     pub indicators_collapsed: bool,
 }
 
@@ -758,12 +689,11 @@ struct SplitterDrag {
 }
 
 impl ChartState {
-    /// Fallback default symbol, used when the server's `/v1/symbols` hasn't
-    /// loaded yet. Once it has, `ContentPanel::new` prefers the server's first
-    /// symbol. Display name/exchange are resolved at render time, so this only
-    /// needs to be a ticker.
+    /// Fallback default symbol — used by `ContentPanel::new` when no persisted
+    /// chart prefs are present and the symbols service is empty. The server
+    /// only supports BTCUSDT today (see `SUPPORTED_SYMBOL`).
     pub fn default_symbol() -> &'static str {
-        FALLBACK_SYMBOLS[0].0
+        "BTCUSDT"
     }
 
     /// Timeframe used for a freshly-opened chart.
@@ -771,61 +701,37 @@ impl ChartState {
         market_data::DEFAULT_TIMEFRAME
     }
 
-    /// Trading session used for a freshly-opened chart.
-    pub fn default_session() -> Session {
-        market_data::DEFAULT_SESSION
-    }
-
     /// Replace `self` with a fresh state for `symbol` (keeping the current
-    /// timeframe + session), but only if `symbol` differs. Returns `true` if a
-    /// switch happened (the caller can skip a redundant `cx.notify()`).
-    /// Indicators carry over: the user's analytical setup follows the chart
-    /// panel, not the data — see /grill-me locked design.
+    /// timeframe), but only if `symbol` differs. Returns `true` if a switch
+    /// happened (the caller can skip a redundant `cx.notify()`). Indicators
+    /// carry over: the user's analytical setup follows the chart panel, not
+    /// the data — see /grill-me locked design.
     pub fn switch_symbol(&mut self, symbol: &str, live_candles: Option<Vec<Candle>>) -> bool {
         if self.symbol == symbol {
             return false;
         }
         let indicators = std::mem::take(&mut self.indicators);
-        *self = Self::new(symbol, self.timeframe, self.session, live_candles);
+        *self = Self::new(symbol, self.timeframe, live_candles);
         self.adopt_indicators(indicators);
         true
     }
 
-    /// Replace `self` with a fresh state at `tf` (keeping symbol + session),
-    /// but only if `tf` differs. Returns `true` if a switch happened.
-    /// Indicators carry over (see `switch_symbol`).
+    /// Replace `self` with a fresh state at `tf` (keeping symbol), but only
+    /// if `tf` differs. Returns `true` if a switch happened. Indicators carry
+    /// over (see `switch_symbol`).
     pub fn switch_timeframe(&mut self, tf: Timeframe, live_candles: Option<Vec<Candle>>) -> bool {
         if self.timeframe == tf {
             return false;
         }
         let symbol = self.symbol.clone();
         let indicators = std::mem::take(&mut self.indicators);
-        *self = Self::new(symbol.as_ref(), tf, self.session, live_candles);
-        self.adopt_indicators(indicators);
-        true
-    }
-
-    /// Replace `self` with a fresh state at `session` (keeping symbol +
-    /// timeframe), but only if `session` differs. Returns `true` if a switch
-    /// happened. The buffer resets because the regular and extended subs hold
-    /// different bars. Indicators carry over (see `switch_symbol`).
-    pub fn switch_session(&mut self, session: Session, live_candles: Option<Vec<Candle>>) -> bool {
-        if self.session == session {
-            return false;
-        }
-        let symbol = self.symbol.clone();
-        let indicators = std::mem::take(&mut self.indicators);
-        *self = Self::new(symbol.as_ref(), self.timeframe, session, live_candles);
+        *self = Self::new(symbol.as_ref(), tf, live_candles);
         self.adopt_indicators(indicators);
         true
     }
 
     pub fn timeframe(&self) -> Timeframe {
         self.timeframe
-    }
-
-    pub fn session(&self) -> Session {
-        self.session
     }
 
     /// Reset both axes to their defaults: trailing-window viewport on x,
@@ -908,18 +814,10 @@ impl ChartState {
             return false;
         }
         const MAX_ROLL_PER_TICK: usize = 5;
-        let session = self.session;
         let mut prev = last;
         let mut added = 0;
         while now_ms > prev.close_time && added < MAX_ROLL_PER_TICK {
             let next_open = prev.open_time + dur;
-            // Mirror the server's session filter: an RTH chart must NOT
-            // synthesize bars outside 09:30–16:00 ET weekdays. Without this
-            // check, a chart sitting on the previous day's final RTH bar
-            // grows fake bars all through pre/post-market and overnight.
-            if !in_session(next_open, session) {
-                break;
-            }
             let next_close = next_open + dur - 1;
             let flat = Candle::new(
                 next_open,
@@ -1189,7 +1087,7 @@ impl ChartState {
     }
 
     /// Adopt a saved indicator list (used by `switch_*` to preserve the
-    /// user's setup across symbol / timeframe / session changes). Drops
+    /// user's setup across symbol / timeframe changes). Drops
     /// whatever the freshly-constructed state seeded (e.g., default Volume),
     /// then recomputes against the new candle buffer.
     fn adopt_indicators(&mut self, indicators: Vec<IndicatorInstance>) {
@@ -1245,7 +1143,6 @@ impl ChartState {
     pub fn new(
         symbol: &str,
         timeframe: Timeframe,
-        session: Session,
         live_candles: Option<Vec<Candle>>,
     ) -> Self {
         // A live symbol with an empty snapshot just means we haven't backfilled
@@ -1271,7 +1168,6 @@ impl ChartState {
         let mut state = Self {
             symbol: SharedString::from(symbol.to_string()),
             timeframe,
-            session,
             candles,
             view_start,
             view_size,
@@ -1701,14 +1597,10 @@ fn render_main_indicator_list(
             }),
         )
         .child(div().child(header_label));
-    let is_daily = state.timeframe == Timeframe::D1;
     let chips = if collapsed {
         Vec::new()
     } else {
-        render_indicator_chips_filtered(state, cx, move |i| {
-            i.placement == Placement::Overlay
-                && !(is_daily && i.kind_id == "session_vwap")
-        })
+        render_indicator_chips_filtered(state, cx, |i| i.placement == Placement::Overlay)
     };
     // Absolute-anchored at the main canvas's top-left (mirrors the
     // pre-move OHLC pill's `top(8) left(8)`). `items_start` so each chip
@@ -2303,7 +2195,7 @@ pub fn render(
             .clone();
         let status = svc
             .read(cx)
-            .status(state.symbol.as_ref(), state.timeframe(), state.session());
+            .status(state.symbol.as_ref(), state.timeframe());
         use market_data::LiveStatus::*;
         match status {
             Connected => (theme_chart_bullish, "LIVE"),
@@ -2327,19 +2219,13 @@ pub fn render(
     // paint — otherwise clicks drift after a y-range change.
     state.y_axis_gap_px.set(compute_y_axis_gap(y_lo, y_hi));
 
-    // This symbol's display meta (name/exchange) for the header line comes from
-    // the symbols service (`GET /v1/symbols`), falling back to the static list
-    // until it loads. The picker's own item list lives in `symbol_select`.
+    // This symbol's display meta (name/exchange) for the header line comes
+    // from the symbols service. Falls back to the bare ticker if the entry
+    // hasn't been registered yet.
     let symbols_handle = cx.global::<SymbolsServiceHandle>().0.clone();
     let symbols_svc = symbols_handle.read(cx);
     let (header_name, header_exchange) = symbols_svc
         .meta(state.symbol.as_ref())
-        .or_else(|| {
-            FALLBACK_SYMBOLS
-                .iter()
-                .find(|(t, _, _)| *t == state.symbol.as_ref())
-                .map(|(_, n, ex)| (SharedString::from(*n), SharedString::from(*ex)))
-        })
         .unwrap_or_else(|| (state.symbol.clone(), SharedString::from("")));
 
     // Header symbol button — opens the shared TradingView-style picker
@@ -2400,17 +2286,11 @@ pub fn render(
     // pane-placed instances, snapshot color + output so the closure stays
     // 'static. Per-render clone — `Series` is a `Vec<Option<f64>>`, so the
     // cost is comparable to `paint_candles.clone()` above.
-    // `is_daily` suppresses Session VWAP on 1d (locked /grill-me design): each
-    // daily bar already represents a full session, so the intraday-anchored
-    // line is conceptually meaningless. Pairs with the chip-render filter
-    // below so the chip vanishes too.
-    let is_daily = state.timeframe == Timeframe::D1;
     let paint_overlay_items: Vec<OverlayPaintItem> = state
         .indicators
         .iter()
         .zip(state.indicator_outputs.iter())
         .filter(|(i, _)| !i.hidden && i.placement == Placement::Overlay)
-        .filter(|(i, _)| !(is_daily && i.kind_id == "session_vwap"))
         .map(|(i, o)| OverlayPaintItem {
             colors: i.colors.clone(),
             output: o.clone(),
@@ -2483,34 +2363,6 @@ pub fn render(
             .collect()
     };
 
-    // ETH session boundary markers (09:30 / 16:00 ET dashed lines + Open /
-    // Close labels). Computed once here and reused by both the paint closure
-    // (lines) and the label loop below (text divs) so the two never disagree
-    // on x-coordinates. Gated to Extended-session + intraday timeframes +
-    // user pref; the daily timeframe is excluded because a single bar spans
-    // the whole session.
-    let session_markers: Vec<SessionMarker> = if state.session() == Session::Extended
-        && state.timeframe() != Timeframe::D1
-        && crate::prefs::chart_session_markers()
-    {
-        if let Some(bounds) = state.bounds {
-            let canvas_w = bounds.size.width.as_f32();
-            compute_session_markers(
-                &paint_candles,
-                paint_start_idx,
-                paint_view_start,
-                paint_view_size,
-                canvas_w,
-                paint_y_axis_gap,
-                paint_candle_interval_ms,
-            )
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
-    let paint_session_markers = session_markers.clone();
     let main_chart_colors = MainChartColors {
         bullish: theme_chart_bullish,
         bearish: theme_chart_bearish,
@@ -2521,14 +2373,6 @@ pub fn render(
         label: theme_muted_foreground,
         axis_bg: theme_background,
         axis_border: theme_border,
-        // Session-marker dashes: muted foreground at low alpha. Distinct
-        // from the solid grid (which uses theme_border) so they read as a
-        // separate annotation layer, but still quiet enough not to compete
-        // with the candles for attention.
-        session_marker: Hsla {
-            a: 0.45,
-            ..theme_muted_foreground
-        },
     };
     let entity = cx.entity();
 
@@ -3070,98 +2914,6 @@ pub fn render(
                 .into_any_element(),
         );
 
-        // Pre/post-market price indicator. Only shown when the chart is in
-        // regular-hours mode AND the extended-session stream has a more
-        // recent bar than the RTH buffer — i.e. we're currently outside
-        // 09:30–16:00 ET. The companion Extended sub is ensured by
-        // `ensure_chart_subs`; this reads its latest close and renders a
-        // muted label under the countdown.
-        if state.session() == Session::Regular {
-            let md = cx
-                .global::<market_data::MarketDataServiceHandle>()
-                .0
-                .clone();
-            let ext_last = md
-                .read(cx)
-                .snapshot(state.symbol.as_ref(), state.timeframe(), Session::Extended)
-                .and_then(|cs| cs.last().cloned());
-            if let Some(ext) = ext_last {
-                if ext.open_time > last.open_time {
-                    let delta = ext.close - last.close;
-                    let arrow = if delta >= 0.0 { '▲' } else { '▼' };
-                    let ext_color = if delta >= 0.0 {
-                        theme_chart_bullish
-                    } else {
-                        theme_chart_bearish
-                    };
-                    // Tag the price with the session the ext bar belongs to,
-                    // derived from its open_time in ET so DST doesn't mislabel.
-                    // Before 09:30 ET = Pre, at/after 16:00 ET = Post; anything
-                    // in between (shouldn't happen — the chart's RTH stream
-                    // would have a newer bar) falls back to "Ext".
-                    let tag = ext_session_tag(ext.open_time);
-                    // Anchor the pill to the extended price's own y-coordinate
-                    // so it tracks live ETH movement independently of the RTH
-                    // pill — they only stack when prices happen to coincide.
-                    let ext_price_y = price_to_screen(y_lo, y_hi, ext.close, canvas_h);
-                    if ext_price_y >= 0.0 && ext_price_y <= chart_h {
-                        // Faint guideline so the pill's vertical position is
-                        // legible against the candles.
-                        out.push(
-                            div()
-                                .absolute()
-                                .left(px(0.0))
-                                .top(px(ext_price_y - 0.5))
-                                .w(px(chart_w))
-                                .h(px(1.0))
-                                .bg(Hsla {
-                                    a: 0.30,
-                                    ..ext_color
-                                })
-                                .into_any_element(),
-                        );
-                        // Two-line pill: "{tag} {arrow}" on top, price below.
-                        // whitespace_nowrap keeps the tag and arrow together so
-                        // the narrow y-axis gutter can't split them across
-                        // extra lines.
-                        let ext_pill_h = 26.0;
-                        let ext_pill_top = (ext_price_y - ext_pill_h / 2.0)
-                            .clamp(0.0, (chart_h - ext_pill_h).max(0.0));
-                        out.push(
-                            div()
-                                .absolute()
-                                .right(px(0.0))
-                                .top(px(ext_pill_top))
-                                .w(px((y_axis_gap - 2.0).max(0.0)))
-                                .pl(px(4.0))
-                                .pr(px(4.0))
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(10.))
-                                .text_color(ext_color)
-                                .bg(theme_background)
-                                .border_1()
-                                .border_color(theme_border)
-                                .rounded(px(2.0))
-                                .child(
-                                    div()
-                                        .whitespace_nowrap()
-                                        .child(SharedString::from(format!("{} {}", tag, arrow))),
-                                )
-                                .child(
-                                    div()
-                                        .whitespace_nowrap()
-                                        .child(SharedString::from(format!("{:.2}", ext.close))),
-                                )
-                                .into_any_element(),
-                        );
-                    }
-                }
-            }
-        }
-
         out
     } else {
         Vec::new()
@@ -3327,47 +3079,6 @@ pub fn render(
         out
     } else {
         Vec::new()
-    };
-
-    // ETH session-boundary labels ("Open" / "Close") anchored to the bottom
-    // of each dashed line, just above the x-axis. Iterates `session_markers`
-    // (which the paint pass already used for the dashes) so labels and lines
-    // can't drift. Skips labels that would land within ~32px of the previous
-    // one to avoid crowding on multi-day Extended-mode views; lines
-    // themselves are kept.
-    let session_marker_labels: Vec<gpui::AnyElement> = {
-        const MIN_SESSION_LABEL_GAP_PX: f32 = 32.0;
-        let mut out: Vec<gpui::AnyElement> = Vec::new();
-        let mut last_x = f32::NEG_INFINITY;
-        for marker in &session_markers {
-            if marker.x - last_x < MIN_SESSION_LABEL_GAP_PX {
-                continue;
-            }
-            last_x = marker.x;
-            let label = match marker.kind {
-                SessionBoundary::Open => "Open",
-                SessionBoundary::Close => "Close",
-            };
-            // Tiny chip pinned just above the x-axis gutter. AXIS_GAP + 2px
-            // lifts it clear of the time-axis labels without floating in
-            // empty space. Approximate horizontal centering via -14px left
-            // offset (half a typical 4-5-char label width at 9.5px). No
-            // background so the grid behind shows through.
-            out.push(
-                div()
-                    .absolute()
-                    .bottom(px(AXIS_GAP + 2.0))
-                    .left(px(marker.x - 14.0))
-                    .text_size(px(9.5))
-                    .text_color(Hsla {
-                        a: 0.75,
-                        ..theme_muted_foreground
-                    })
-                    .child(SharedString::from(label))
-                    .into_any_element(),
-            );
-        }
-        out
     };
 
     // Position labels: small chips at the right edge of each position rect
@@ -4207,7 +3918,6 @@ pub fn render(
                             paint_candle_interval_ms,
                             paint_y_axis_gap,
                             main_chart_colors,
-                            &paint_session_markers,
                             window,
                             cx,
                         );
@@ -4357,9 +4067,6 @@ pub fn render(
         .child(drawings_overlay)
         // Text labels render as positioned divs above lines/rects.
         .children(text_labels)
-        // ETH session-boundary labels — sit alongside the canvas dashes
-        // painted by `paint_main_chart`, anchored at the top of each line.
-        .children(session_marker_labels)
         // Position price/R:R labels — wrapped in a clip surface that
         // matches the chart canvas area (excluding both axis gutters) so
         // labels drawn at a rect's right edge don't bleed past the y-axis

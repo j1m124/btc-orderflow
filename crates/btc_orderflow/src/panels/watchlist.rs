@@ -11,7 +11,7 @@ use gpui_component::{
 };
 
 use super::ContentPanel;
-use crate::services::market_data::{MarketDataServiceHandle, Session, Timeframe};
+use crate::services::market_data::{MarketDataServiceHandle, Timeframe};
 use crate::services::watchlist::{WatchlistEvent, WatchlistServiceHandle};
 use crate::top_bar::{FocusSymbol, RemoveWatchlistSymbol};
 
@@ -148,11 +148,7 @@ pub fn render(_window: &mut Window, cx: &mut Context<ContentPanel>) -> impl Into
 
     let rows = symbols.into_iter().map(move |sym| {
         let ticker = sym.clone();
-        let snap = market.read(cx).snapshot(
-            ticker.as_ref(),
-            WATCHLIST_TF,
-            crate::services::market_data::Session::Regular,
-        );
+        let snap = market.read(cx).snapshot(ticker.as_ref(), WATCHLIST_TF);
         let (last_text, abs_change_text, change_text, change_color) = match snap {
             Some(candles) if !candles.is_empty() => {
                 let day = candles.last().unwrap();
@@ -305,7 +301,7 @@ pub fn initial_handles(
         .into_iter()
         .map(|sym| {
             let h = market.update(cx, |svc, cx| {
-                svc.ensure(sym.as_ref(), WATCHLIST_TF, Session::Regular, cx)
+                svc.ensure(sym.as_ref(), WATCHLIST_TF, cx)
             });
             (sym, h)
         })
@@ -333,10 +329,8 @@ pub fn subscribe(window: &mut Window, cx: &mut Context<ContentPanel>) {
         |_this, _svc, ev: &crate::services::market_data::KlineEvent, _window, cx| {
             use crate::services::market_data::KlineEvent::*;
             match ev {
-                Tick { tf, session, .. }
-                | Resnap { tf, session, .. }
-                | Prepended { tf, session, .. } => {
-                    if *tf == WATCHLIST_TF && *session == Session::Regular {
+                Tick { tf, .. } | Resnap { tf, .. } | Prepended { tf, .. } => {
+                    if *tf == WATCHLIST_TF {
                         cx.notify();
                     }
                 }
@@ -361,7 +355,7 @@ fn reconcile_handles(this: &mut ContentPanel, cx: &mut Context<ContentPanel>) {
             next.insert(sym, existing);
         } else {
             let h = market.update(cx, |svc, cx| {
-                svc.ensure(sym.as_ref(), WATCHLIST_TF, Session::Regular, cx)
+                svc.ensure(sym.as_ref(), WATCHLIST_TF, cx)
             });
             next.insert(sym, h);
         }

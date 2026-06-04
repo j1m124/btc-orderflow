@@ -56,8 +56,7 @@ fn clear_key(key: &str) -> Result<()> {
     remove_storage_blob(key)
 }
 
-const FREE_KEY: &str = "btc_orderflow.mode.free.v3";
-const CURRENT_MODE_KEY: &str = "btc_orderflow.current_mode.v3";
+const WORKSPACE_KEY: &str = "btc_orderflow.workspace.v3";
 const LAYOUTS_KEY: &str = "btc_orderflow.layouts.v3";
 const WATCHLIST_KEY: &str = "btc_orderflow.watchlist.v3";
 const RECENTS_KEY: &str = "btc_orderflow.recents.v3";
@@ -95,76 +94,22 @@ pub fn purge_v1() {
     }
 }
 
-/// Workspace mode. Reduced to a single FreeLayout variant after the fork;
-/// the enum stays so the UI code keeps its shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    FreeLayout,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Self::FreeLayout
-    }
-}
-
-impl Mode {
-    pub const ALL: &'static [Mode] = &[Mode::FreeLayout];
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Mode::FreeLayout => "free_layout",
-        }
-    }
-
-    pub fn display(self) -> &'static str {
-        match self {
-            Mode::FreeLayout => "Free Layout",
-        }
-    }
-
-    pub fn from_id(id: &str) -> Option<Mode> {
-        Self::ALL.iter().copied().find(|m| m.id() == id)
-    }
-
-    fn key(self) -> &'static str {
-        match self {
-            Mode::FreeLayout => FREE_KEY,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ModeState {
+pub struct WorkspaceState {
     #[serde(default)]
     pub dock: Option<DockAreaState>,
 }
 
-pub fn load_mode_state(mode: Mode) -> Option<ModeState> {
-    load_json_opt(mode.key())
+pub fn load_workspace_state() -> Option<WorkspaceState> {
+    load_json_opt(WORKSPACE_KEY)
 }
 
-pub fn save_mode_state(mode: Mode, state: &ModeState) -> Result<()> {
-    save_json(mode.key(), state)
+pub fn save_workspace_state(state: &WorkspaceState) -> Result<()> {
+    save_json(WORKSPACE_KEY, state)
 }
 
-pub fn clear_mode_state(mode: Mode) -> Result<()> {
-    clear_key(mode.key())
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CurrentMode {
-    #[serde(default)]
-    pub mode: Mode,
-}
-
-pub fn load_current_mode() -> CurrentMode {
-    load_json(CURRENT_MODE_KEY)
-}
-
-pub fn save_current_mode(value: &CurrentMode) -> Result<()> {
-    save_json(CURRENT_MODE_KEY, value)
+pub fn clear_workspace_state() -> Result<()> {
+    clear_key(WORKSPACE_KEY)
 }
 
 pub fn load_font_size() -> Option<f32> {
@@ -333,12 +278,6 @@ pub struct ChartPrefs {
     pub default_view: f32,
     pub right_buffer: f32,
     pub y_padding: f32,
-    #[serde(default = "default_session_markers")]
-    pub session_markers: bool,
-}
-
-fn default_session_markers() -> bool {
-    true
 }
 
 impl Default for ChartPrefs {
@@ -347,7 +286,6 @@ impl Default for ChartPrefs {
             default_view: 60.0,
             right_buffer: 0.40,
             y_padding: 0.05,
-            session_markers: true,
         }
     }
 }

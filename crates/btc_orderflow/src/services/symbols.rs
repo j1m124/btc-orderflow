@@ -1,9 +1,7 @@
-//! Tradable-universe service (stub).
+//! Tradable-universe service.
 //!
-//! The original implementation fetched `GET /v1/symbols` from a centoflow
-//! server and held the result as a `Global`. The fork starts with a tiny
-//! hardcoded universe containing only BTC; a real BTC backend / multi-venue
-//! universe loader will replace this.
+//! The v1 universe is a tiny hardcoded list (BTCUSDT-perp on Binance). The
+//! plan is to grow it through this service as we add more symbols / venues.
 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString};
 
@@ -12,62 +10,44 @@ pub struct SymbolInfo {
     pub ticker: SharedString,
     pub name: SharedString,
     pub exchange: SharedString,
-    pub asset_class: AssetClass,
+    pub instrument: InstrumentType,
 }
 
-/// Asset-class filter tabs in the symbol picker. Today the stub universe is
-/// crypto-only; the other variants remain so the picker UI is the same as in
-/// the source repo and will light up automatically when the universe grows.
+/// Instrument category drives the symbol picker's filter tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AssetClass {
-    Stocks,
-    Funds,
+pub enum InstrumentType {
+    Spot,
+    Perp,
     Futures,
-    Forex,
-    Crypto,
-    Indices,
-    Bonds,
 }
 
-impl AssetClass {
-    pub const ALL: &'static [AssetClass] = &[
-        AssetClass::Stocks,
-        AssetClass::Funds,
-        AssetClass::Futures,
-        AssetClass::Forex,
-        AssetClass::Crypto,
-        AssetClass::Indices,
-        AssetClass::Bonds,
+impl InstrumentType {
+    pub const ALL: &'static [InstrumentType] = &[
+        InstrumentType::Spot,
+        InstrumentType::Perp,
+        InstrumentType::Futures,
     ];
 
     pub fn display(self) -> &'static str {
         match self {
-            AssetClass::Stocks => "Stocks",
-            AssetClass::Funds => "Funds",
-            AssetClass::Futures => "Futures",
-            AssetClass::Forex => "Forex",
-            AssetClass::Crypto => "Crypto",
-            AssetClass::Indices => "Indices",
-            AssetClass::Bonds => "Bonds",
+            InstrumentType::Spot => "Spot",
+            InstrumentType::Perp => "Perp",
+            InstrumentType::Futures => "Futures",
         }
     }
 
     pub fn wire_id(self) -> &'static str {
         match self {
-            AssetClass::Stocks => "stocks",
-            AssetClass::Funds => "funds",
-            AssetClass::Futures => "futures",
-            AssetClass::Forex => "forex",
-            AssetClass::Crypto => "crypto",
-            AssetClass::Indices => "indices",
-            AssetClass::Bonds => "bonds",
+            InstrumentType::Spot => "spot",
+            InstrumentType::Perp => "perp",
+            InstrumentType::Futures => "futures",
         }
     }
 }
 
-impl Default for AssetClass {
+impl Default for InstrumentType {
     fn default() -> Self {
-        AssetClass::Crypto
+        InstrumentType::Perp
     }
 }
 
@@ -84,8 +64,6 @@ impl EventEmitter<SymbolsEvent> for SymbolsService {}
 
 impl SymbolsService {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        // Subscribers read `symbols()` directly; no Loaded event needed for
-        // a hardcoded universe.
         Self {
             symbols: hardcoded_universe(),
         }
@@ -123,6 +101,6 @@ fn hardcoded_universe() -> Vec<SymbolInfo> {
         ticker: "BTCUSDT".into(),
         name: "Bitcoin / Tether".into(),
         exchange: "BINANCE".into(),
-        asset_class: AssetClass::Crypto,
+        instrument: InstrumentType::Perp,
     }]
 }

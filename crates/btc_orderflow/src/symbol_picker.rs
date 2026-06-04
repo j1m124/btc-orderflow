@@ -1,10 +1,10 @@
-//! Shared TradingView-style symbol picker. One [`SymbolPickerState`] entity is
-//! owned by the workspace; chart panels and the watchlist trigger it via the
-//! workspace's [`OpenSymbolPicker`] action.
+//! Shared symbol picker. One [`SymbolPickerState`] entity is owned by the
+//! workspace; chart panels and the watchlist trigger it via the workspace's
+//! [`OpenSymbolPicker`] action.
 //!
-//! Layout: centered 560×560 modal with a search bar, an asset-class tab row
-//! (`All` + the [`AssetClass`] variants), and a scrollable list. When the query
-//! is empty the list shows a "Recent" section above the universe.
+//! Layout: centered 560×560 modal with a search bar, an instrument-type tab
+//! row (`All` + the [`InstrumentType`] variants), and a scrollable list. When
+//! the query is empty the list shows a "Recent" section above the universe.
 
 use gpui::{
     Action, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -23,32 +23,16 @@ use serde::Deserialize;
 
 use crate::panels::ContentPanel;
 use crate::services::recents::{RecentsEvent, RecentsServiceHandle};
-use crate::services::symbols::{AssetClass, SymbolsEvent, SymbolsServiceHandle};
+use crate::services::symbols::{InstrumentType, SymbolsEvent, SymbolsServiceHandle};
 use crate::top_bar::AddWatchlistSymbol;
 
-/// Fallback universe used only until the server's `GET /v1/symbols` loads.
-/// Mirrors the (small) static list the chart panel used as a fallback before
-/// the picker took over.
-const FALLBACK_SYMBOLS: &[(&str, &str, &str)] = &[
-    ("AAPL", "Apple Inc.", "NASDAQ"),
-    ("MSFT", "Microsoft Corp.", "NASDAQ"),
-    ("NVDA", "NVIDIA Corp.", "NASDAQ"),
-    ("GOOGL", "Alphabet Inc.", "NASDAQ"),
-    ("TSLA", "Tesla, Inc.", "NASDAQ"),
-    ("META", "Meta Platforms", "NASDAQ"),
-    ("AMZN", "Amazon.com", "NASDAQ"),
-    ("BRK.B", "Berkshire Hathaway", "NYSE"),
-];
-
-/// One symbol shown in the picker list. Pure data — no widget impl. Built from
-/// [`SymbolsService`] (or the static fallback), classed by
-/// [`SymbolInfo::asset_class`].
+/// One symbol shown in the picker list.
 #[derive(Clone, Debug)]
 pub struct SymbolItem {
     pub ticker: SharedString,
     pub name: SharedString,
     pub exchange: SharedString,
-    pub asset_class: AssetClass,
+    pub instrument: InstrumentType,
 }
 
 /// What the picker should do on confirm.
@@ -72,12 +56,12 @@ impl PickerIntent {
     }
 }
 
-/// Selected filter tab. `All` short-circuits filtering; the [`AssetClass`]
-/// variants narrow to symbols whose `asset_class` matches.
+/// Selected filter tab. `All` short-circuits filtering; the [`InstrumentType`]
+/// variants narrow to symbols whose `instrument` matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilterTab {
     All,
-    Class(AssetClass),
+    Class(InstrumentType),
 }
 
 impl FilterTab {
@@ -88,16 +72,16 @@ impl FilterTab {
         }
     }
 
-    fn matches(self, class: AssetClass) -> bool {
+    fn matches(self, instrument: InstrumentType) -> bool {
         match self {
             FilterTab::All => true,
-            FilterTab::Class(c) => c == class,
+            FilterTab::Class(c) => c == instrument,
         }
     }
 
     fn all() -> Vec<FilterTab> {
         let mut tabs = vec![FilterTab::All];
-        tabs.extend(AssetClass::ALL.iter().copied().map(FilterTab::Class));
+        tabs.extend(InstrumentType::ALL.iter().copied().map(FilterTab::Class));
         tabs
     }
 }
@@ -171,8 +155,6 @@ impl SymbolPickerState {
                 cx.notify();
             }
         });
-        // Re-render when the universe loads (the list shows fallback symbols
-        // until `/v1/symbols` returns).
         let symbols_handle = cx.global::<SymbolsServiceHandle>().0.clone();
         let symbols_sub = cx.subscribe(&symbols_handle, |_this, _svc, _ev: &SymbolsEvent, cx| {
             cx.notify();
@@ -240,7 +222,7 @@ impl SymbolPickerState {
                 recents.iter().map(|s| s.ticker.clone()).collect();
             let mut rest: Vec<SymbolItem> = universe
                 .into_iter()
-                .filter(|s| self.active_tab.matches(s.asset_class))
+                .filter(|s| self.active_tab.matches(s.instrument))
                 .filter(|s| !recent_set.contains(&s.ticker))
                 .collect();
             rest.sort_by(|a, b| a.ticker.cmp(&b.ticker));
@@ -248,7 +230,7 @@ impl SymbolPickerState {
         } else {
             let mut rest: Vec<(usize, SymbolItem)> = universe
                 .into_iter()
-                .filter(|s| self.active_tab.matches(s.asset_class))
+                .filter(|s| self.active_tab.matches(s.instrument))
                 .filter_map(|s| score(&s, trimmed).map(|n| (n, s)))
                 .collect();
             // Tier ASC (best = lowest tier), tie-break alphabetically.
@@ -599,32 +581,19 @@ fn render_row(
         }))
 }
 
-/// Build the full universe — falls back to the static list until
-/// [`SymbolsService`] loads `/v1/symbols`.
+/// Build the full universe from the symbols service.
 pub fn collect_universe(cx: &gpui::App) -> Vec<SymbolItem> {
     let handle = cx.global::<SymbolsServiceHandle>().0.clone();
     let svc = handle.read(cx);
-    if svc.symbols().is_empty() {
-        FALLBACK_SYMBOLS
-            .iter()
-            .map(|(t, n, ex)| SymbolItem {
-                ticker: SharedString::from(*t),
-                name: SharedString::from(*n),
-                exchange: SharedString::from(*ex),
-                asset_class: AssetClass::Stocks,
-            })
-            .collect()
-    } else {
-        svc.symbols()
-            .iter()
-            .map(|s| SymbolItem {
-                ticker: s.ticker.clone(),
-                name: s.name.clone(),
-                exchange: s.exchange.clone(),
-                asset_class: s.asset_class,
-            })
-            .collect()
-    }
+    svc.symbols()
+        .iter()
+        .map(|s| SymbolItem {
+            ticker: s.ticker.clone(),
+            name: s.name.clone(),
+            exchange: s.exchange.clone(),
+            instrument: s.instrument,
+        })
+        .collect()
 }
 
 /// Resolve the recents list to `SymbolItem`s, filtered by the active tab.
@@ -640,7 +609,7 @@ fn collect_recents(
     let mut out: Vec<SymbolItem> = Vec::new();
     for ticker in svc.tickers().iter().take(crate::services::recents::RecentsService::DISPLAY_LIMIT) {
         if let Some(item) = universe.iter().find(|s| &s.ticker == ticker) {
-            if active_tab.matches(item.asset_class) {
+            if active_tab.matches(item.instrument) {
                 out.push(item.clone());
             }
         }

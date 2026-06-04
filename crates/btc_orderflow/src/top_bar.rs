@@ -1,4 +1,4 @@
-use crate::persistence::{Mode, SavedLayouts};
+use crate::persistence::SavedLayouts;
 use gpui::{
     Action, Context, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window,
     actions, div, px,
@@ -48,14 +48,12 @@ pub struct SetTheme(pub SharedString);
 
 pub struct TopBar {
     title: SharedString,
-    mode: Mode,
     saved_layouts: SavedLayouts,
 }
 
 impl TopBar {
     pub fn new(
         title: impl Into<SharedString>,
-        mode: Mode,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -85,17 +83,8 @@ impl TopBar {
         }
         Self {
             title: title.into(),
-            mode,
             saved_layouts: crate::persistence::load_layouts(),
         }
-    }
-
-    pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        if self.mode == mode {
-            return;
-        }
-        self.mode = mode;
-        cx.notify();
     }
 
     pub fn refresh_saved_layouts(&mut self, cx: &mut Context<Self>) {

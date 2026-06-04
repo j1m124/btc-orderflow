@@ -100,38 +100,6 @@ impl Timeframe {
     }
 }
 
-/// Trading session filter. Kept on the API for compatibility with the chart
-/// panel's selector; for crypto both variants are effectively the same.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Session {
-    Regular,
-    Extended,
-}
-
-pub const DEFAULT_SESSION: Session = Session::Regular;
-
-impl Session {
-    pub const ALL: [Session; 2] = [Session::Regular, Session::Extended];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Session::Regular => "regular",
-            Session::Extended => "extended",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Session::Regular => "RTH",
-            Session::Extended => "ETH",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        Session::ALL.into_iter().find(|sn| sn.as_str() == s)
-    }
-}
-
 /// A single OHLCV bar.
 #[derive(Clone, Debug)]
 pub struct Candle {
@@ -209,30 +177,25 @@ pub enum KlineEvent {
     Tick {
         symbol: SharedString,
         tf: Timeframe,
-        session: Session,
         candle: Candle,
         is_closed: bool,
     },
     Resnap {
         symbol: SharedString,
         tf: Timeframe,
-        session: Session,
     },
     Prepended {
         symbol: SharedString,
         tf: Timeframe,
-        session: Session,
         added: usize,
     },
     HistoryCapped {
         symbol: SharedString,
         tf: Timeframe,
-        session: Session,
     },
     StatusChanged {
         symbol: SharedString,
         tf: Timeframe,
-        session: Session,
         status: LiveStatus,
     },
 }
@@ -241,15 +204,13 @@ pub enum KlineEvent {
 pub(crate) struct SubKey {
     pub(crate) symbol: String,
     pub(crate) tf: Timeframe,
-    pub(crate) session: Session,
 }
 
 impl SubKey {
-    fn new(symbol: &str, tf: Timeframe, session: Session) -> Self {
+    fn new(symbol: &str, tf: Timeframe) -> Self {
         Self {
             symbol: symbol.to_string(),
             tf,
-            session,
         }
     }
 }
@@ -339,10 +300,9 @@ impl MarketDataService {
         &mut self,
         symbol: &str,
         tf: Timeframe,
-        session: Session,
         cx: &mut Context<Self>,
     ) -> SubscriptionHandle {
-        let key = SubKey::new(symbol, tf, session);
+        let key = SubKey::new(symbol, tf);
         let count = self.refcounts.entry(key.clone()).or_insert(0);
         *count += 1;
         let first = *count == 1;
@@ -360,7 +320,6 @@ impl MarketDataService {
                 symbol: symbol.to_string(),
                 channel: proto::Channel::Candles {
                     tf: proto_tf(tf),
-                    session: proto_session(session),
                 },
             };
             let _ = self.to_ws.unbounded_send(frame);
@@ -369,7 +328,6 @@ impl MarketDataService {
             cx.emit(KlineEvent::StatusChanged {
                 symbol: symbol.into(),
                 tf,
-                session,
                 status,
             });
         }
@@ -384,15 +342,15 @@ impl MarketDataService {
     /// no-op for call-site compatibility with the old stub.
     pub fn reconnect_all(&mut self, _cx: &mut Context<Self>) {}
 
-    pub fn snapshot(&self, symbol: &str, tf: Timeframe, session: Session) -> Option<&[Candle]> {
+    pub fn snapshot(&self, symbol: &str, tf: Timeframe) -> Option<&[Candle]> {
         self.candles
-            .get(&SubKey::new(symbol, tf, session))
+            .get(&SubKey::new(symbol, tf))
             .map(|v| v.as_slice())
     }
 
-    pub fn status(&self, symbol: &str, tf: Timeframe, session: Session) -> LiveStatus {
+    pub fn status(&self, symbol: &str, tf: Timeframe) -> LiveStatus {
         self.statuses
-            .get(&SubKey::new(symbol, tf, session))
+            .get(&SubKey::new(symbol, tf))
             .cloned()
             .unwrap_or_else(|| self.conn_status.clone())
     }
@@ -412,10 +370,9 @@ impl MarketDataService {
         &mut self,
         symbol: &str,
         tf: Timeframe,
-        session: Session,
         _cx: &mut Context<Self>,
     ) {
-        let key = SubKey::new(symbol, tf, session);
+        let key = SubKey::new(symbol, tf);
         let Some(sub_id) = self.sub_ids.get(&key).copied() else {
             return;
         };
@@ -481,7 +438,6 @@ impl MarketDataService {
         cx.emit(KlineEvent::Resnap {
             symbol: key.symbol.clone().into(),
             tf: key.tf,
-            session: key.session,
         });
     }
 
@@ -501,7 +457,6 @@ impl MarketDataService {
         cx.emit(KlineEvent::Tick {
             symbol: key.symbol.clone().into(),
             tf: key.tf,
-            session: key.session,
             candle: c,
             is_closed,
         });
@@ -520,7 +475,6 @@ impl MarketDataService {
             cx.emit(KlineEvent::HistoryCapped {
                 symbol: key.symbol.clone().into(),
                 tf: key.tf,
-                session: key.session,
             });
             return;
         }
@@ -534,7 +488,6 @@ impl MarketDataService {
         cx.emit(KlineEvent::Prepended {
             symbol: key.symbol.clone().into(),
             tf: key.tf,
-            session: key.session,
             added,
         });
     }
@@ -550,14 +503,12 @@ impl MarketDataService {
         cx.emit(KlineEvent::Resnap {
             symbol: key.symbol.clone().into(),
             tf: key.tf,
-            session: key.session,
         });
         let frame = proto::ClientFrame::Subscribe {
             id,
             symbol: key.symbol.clone(),
             channel: proto::Channel::Candles {
                 tf: proto_tf(key.tf),
-                session: proto_session(key.session),
             },
         };
         let _ = self.to_ws.unbounded_send(frame);
@@ -574,7 +525,6 @@ impl MarketDataService {
             cx.emit(KlineEvent::StatusChanged {
                 symbol: key.symbol.clone().into(),
                 tf: key.tf,
-                session: key.session,
                 status: status.clone(),
             });
         }
@@ -594,7 +544,6 @@ impl MarketDataService {
                 symbol: key.symbol.clone(),
                 channel: proto::Channel::Candles {
                     tf: proto_tf(key.tf),
-                    session: proto_session(key.session),
                 },
             };
             let _ = self.to_ws.unbounded_send(frame);
@@ -794,13 +743,6 @@ fn proto_tf(tf: Timeframe) -> proto::Timeframe {
         Timeframe::H4 => proto::Timeframe::H4,
         Timeframe::H6 => proto::Timeframe::H6,
         Timeframe::D1 => proto::Timeframe::D1,
-    }
-}
-
-fn proto_session(s: Session) -> proto::Session {
-    match s {
-        Session::Regular => proto::Session::Regular,
-        Session::Extended => proto::Session::Extended,
     }
 }
 

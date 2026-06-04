@@ -19,7 +19,7 @@ use crate::indicator_picker::{
 };
 use crate::indicator_settings::{IndicatorSettingsView, OpenIndicatorSettings};
 use crate::panels::{self, ContentPanel, Kind, LastFocusedChart, LastFocusedTabPanel};
-use crate::persistence::{self, Mode, ModeState};
+use crate::persistence::{self, WorkspaceState};
 use crate::symbol_picker::{OpenSymbolPicker, PickerEvent, PickerIntent, SymbolPickerState};
 use crate::top_bar::{
     AddPanel, AddWatchlistSymbol, ApplyLayout, DeleteLayout, FocusSymbol, ManageLayouts,
@@ -33,7 +33,6 @@ pub struct TerminalWorkspace {
     top_bar: Entity<TopBar>,
     bottom_bar: Entity<BottomBar>,
     dock_area: Entity<DockArea>,
-    mode: Mode,
     last_saved: Option<DockAreaState>,
     _save_task: Option<Task<()>>,
     focus_handle: FocusHandle,
@@ -62,10 +61,8 @@ impl TerminalWorkspace {
         let weak_self = cx.entity().downgrade();
         cx.set_global(TerminalWorkspaceHandle(weak_self));
 
-        let current = persistence::load_current_mode();
-        let mode = current.mode;
-        let mode_state = persistence::load_mode_state(mode);
-        let loaded = mode_state
+        let workspace_state = persistence::load_workspace_state();
+        let loaded = workspace_state
             .as_ref()
             .and_then(|s| s.dock.clone())
             .map(|dock_state| {
@@ -89,7 +86,7 @@ impl TerminalWorkspace {
         )
         .detach();
 
-        let top_bar = cx.new(|cx| TopBar::new("btc_orderflow", mode, window, cx));
+        let top_bar = cx.new(|cx| TopBar::new("btc_orderflow", window, cx));
         let bottom_bar = cx.new(|cx| BottomBar::new(window, cx));
 
         let symbol_picker = cx.new(|cx| SymbolPickerState::new(window, cx));
@@ -115,7 +112,6 @@ impl TerminalWorkspace {
             top_bar,
             bottom_bar,
             dock_area,
-            mode,
             last_saved: None,
             _save_task: None,
             focus_handle: cx.focus_handle(),
@@ -133,7 +129,6 @@ impl TerminalWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mode = self.mode;
         self._save_task = Some(cx.spawn_in(window, async move |this, window| {
             window
                 .background_executor()
@@ -144,11 +139,11 @@ impl TerminalWorkspace {
                 if Some(&dock_state) == this.last_saved.as_ref() {
                     return;
                 }
-                let state = ModeState {
+                let state = WorkspaceState {
                     dock: Some(dock_state.clone()),
                 };
-                if let Err(err) = persistence::save_mode_state(mode, &state) {
-                    log::warn!("save mode state failed: {err:?}");
+                if let Err(err) = persistence::save_workspace_state(&state) {
+                    log::warn!("save workspace state failed: {err:?}");
                 } else {
                     this.last_saved = Some(dock_state);
                 }
@@ -184,8 +179,8 @@ impl TerminalWorkspace {
     ) {
         let weak = self.dock_area.downgrade();
         apply_default_layout(weak, window, cx);
-        if let Err(err) = persistence::clear_mode_state(self.mode) {
-            log::warn!("clear mode state failed: {err:?}");
+        if let Err(err) = persistence::clear_workspace_state() {
+            log::warn!("clear workspace state failed: {err:?}");
         }
     }
 

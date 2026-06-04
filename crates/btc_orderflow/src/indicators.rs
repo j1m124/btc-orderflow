@@ -18,7 +18,6 @@ pub mod macd;
 pub mod math;
 pub mod output;
 pub mod rsi;
-pub mod session_vwap;
 pub mod trades;
 pub mod volume;
 
@@ -32,7 +31,6 @@ pub use ma_suite::{MaEntry, MaFlavor, MaSuiteParams};
 pub use macd::MacdParams;
 pub use output::{IndicatorOutput, Series, ValueReadout};
 pub use rsi::RsiParams;
-pub use session_vwap::SessionVwapParams;
 pub use trades::TradesParams;
 pub use volume::VolumeParams;
 
@@ -69,8 +67,8 @@ pub struct KindEntry {
 }
 
 /// Available kinds in the picker. Stripped to Volume-only for the BTC
-/// orderflow fork; the other built-ins (MA Suite, Bollinger Bands, Session
-/// VWAP, Trades, MACD, RSI) remain in the tree but aren't user-spawnable.
+/// orderflow fork; the other built-ins (MA Suite, Bollinger Bands, Trades,
+/// MACD, RSI) remain in the tree but aren't user-spawnable.
 pub fn kind_entries() -> Vec<KindEntry> {
     vec![
         KindEntry {
@@ -95,9 +93,9 @@ pub fn build_kind(
         "volume" => serde_json::from_value::<VolumeParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
-        // The other built-ins (ma_suite, bb, session_vwap, trades, macd, rsi)
-        // are no longer user-spawnable. If a legacy persisted state references
-        // them they're dropped on load.
+        // The other built-ins (ma_suite, bb, trades, macd, rsi) are no longer
+        // user-spawnable. If a legacy persisted state references them they're
+        // dropped on load.
         _ => None,
     }
 }
