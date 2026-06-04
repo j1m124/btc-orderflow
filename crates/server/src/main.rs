@@ -1,11 +1,11 @@
 //! server — entry point.
 //!
-//! Boot sequence (Q5/Q10):
+//! Boot sequence:
 //!   1. env → init tracing
 //!   2. connect TimescaleDB → run migrations
-//!   3. spawn DB writer task (subscribes to broadcast)
-//!   4. spawn Binance ingest task (gap-heal REST → connect WS → broadcast →
-//!      reconnect-with-gap-heal on every drop)
+//!   3. spawn DB writer tasks (kline + trade) subscribed to their broadcasts
+//!   4. spawn Binance ingest task (kline+trade gap-heal REST → connect WS →
+//!      broadcast → reconnect-with-gap-heal on every drop)
 //!   5. spawn WS gateway (axum router serving GET /healthz + WS /ws)
 //!   6. block on Ctrl-C
 
@@ -20,6 +20,8 @@ mod binance;
 mod db;
 mod gateway;
 mod ingest;
+
+use binance::BroadcastTxs;
 
 /// Hardcoded for v1 (Q14b: BTCUSDT whitelist).
 const SYMBOL: &str = "BTCUSDT";
@@ -48,32 +50,49 @@ async fn main() -> Result<()> {
         .await
         .context("run sqlx migrations")?;
 
-    let (tx, _bootstrap_rx) = broadcast::channel::<binance::parse::Tick>(ingest::BROADCAST_CAPACITY);
+    let (kline_tx, _kline_bootstrap_rx) =
+        broadcast::channel::<binance::parse::Tick>(ingest::BROADCAST_CAPACITY);
+    let (trade_tx, _trade_bootstrap_rx) =
+        broadcast::channel::<binance::parse::TradeTick>(ingest::TRADE_BROADCAST_CAPACITY);
 
-    // DB writer holds a permanent Receiver so the broadcast never runs out
+    // Writer tasks hold permanent Receivers so the broadcasts never run out
     // of consumers (which would otherwise drop every send during the gap
     // between Binance connect and the gateway's first client).
-    let writer_rx = tx.subscribe();
-    let writer_pool = pool.clone();
-    let writer = tokio::spawn(async move {
-        if let Err(e) = ingest::run_db_writer(writer_pool, writer_rx).await {
-            warn!(error = ?e, "db writer task exited with error");
-        }
-    });
+    let kline_writer = {
+        let rx = kline_tx.subscribe();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ingest::run_db_writer(pool, rx).await {
+                warn!(error = ?e, "kline db writer task exited with error");
+            }
+        })
+    };
+    let trade_writer = {
+        let rx = trade_tx.subscribe();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ingest::run_trade_writer(pool, rx).await {
+                warn!(error = ?e, "trade writer task exited with error");
+            }
+        })
+    };
 
-    // Drop the bootstrap receiver from main — the writer's receiver is the
-    // canonical one, and any future gateway subs clone from `tx`.
-    drop(_bootstrap_rx);
+    // Drop bootstrap receivers — the writers' receivers are canonical.
+    drop(_kline_bootstrap_rx);
+    drop(_trade_bootstrap_rx);
 
     let ingest_handle = {
         let pool = pool.clone();
         let rest = binance::rest::RestClient::default();
-        let tx = tx.clone();
+        let txs = BroadcastTxs {
+            kline: kline_tx.clone(),
+            trade: trade_tx.clone(),
+        };
         tokio::spawn(async move {
             if let Err(e) = ingest::run_binance_ingest(
                 pool,
                 rest,
-                tx,
+                txs,
                 SYMBOL.to_string(),
                 ChronoDuration::days(COLD_START_DAYS),
             )
@@ -91,7 +110,7 @@ async fn main() -> Result<()> {
 
     let gateway_state = gateway::GatewayState {
         pool: pool.clone(),
-        broadcast_tx: tx.clone(),
+        broadcast_tx: kline_tx.clone(),
     };
     let gateway_handle = tokio::spawn(async move {
         if let Err(e) = gateway::serve(listen_addr, gateway_state).await {
@@ -107,7 +126,8 @@ async fn main() -> Result<()> {
     info!("shutdown requested");
     gateway_handle.abort();
     ingest_handle.abort();
-    writer.abort();
+    trade_writer.abort();
+    kline_writer.abort();
     Ok(())
 }
 

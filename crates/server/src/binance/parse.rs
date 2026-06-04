@@ -26,6 +26,76 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
+// --- Trade row + tick -------------------------------------------------------
+
+/// One aggregated trade (Binance aggTrade unit). The REST aggTrades endpoint
+/// and the `@aggTrade` WS stream both decode into this. `is_buyer_maker`
+/// follows Binance convention: true → resting bid was hit → taker SOLD →
+/// "sell-side" aggression; false → taker BOUGHT.
+#[derive(Clone, Debug)]
+pub struct TradeRow {
+    pub agg_id: i64,
+    pub ts: DateTime<Utc>,
+    pub price: f64,
+    pub qty: f64,
+    pub is_buyer_maker: bool,
+}
+
+impl TradeRow {
+    /// Parse one element of the `/fapi/v1/aggTrades` REST response.
+    pub fn from_rest_value(v: &Value) -> Result<Self> {
+        let obj = v.as_object().context("aggTrade element is not a JSON object")?;
+        let agg_id = obj
+            .get("a")
+            .and_then(|x| x.as_i64())
+            .context("aggTrade.a missing")?;
+        let price = obj
+            .get("p")
+            .and_then(|x| x.as_str())
+            .context("aggTrade.p missing")?
+            .parse::<f64>()
+            .context("aggTrade.p decode")?;
+        let qty = obj
+            .get("q")
+            .and_then(|x| x.as_str())
+            .context("aggTrade.q missing")?
+            .parse::<f64>()
+            .context("aggTrade.q decode")?;
+        let ts_ms = obj
+            .get("T")
+            .and_then(|x| x.as_i64())
+            .context("aggTrade.T missing")?;
+        let is_buyer_maker = obj
+            .get("m")
+            .and_then(|x| x.as_bool())
+            .context("aggTrade.m missing")?;
+        Ok(TradeRow {
+            agg_id,
+            ts: ms_to_utc(ts_ms),
+            price,
+            qty,
+            is_buyer_maker,
+        })
+    }
+}
+
+/// A trade event traveling on the internal trade broadcast. Distinct name
+/// from the wire-level [`protocol::ServerFrame::TradeTick`] frame — this is
+/// the in-process event; the gateway converts batches of these into the
+/// wire frame.
+#[derive(Clone, Debug)]
+pub struct TradeTick {
+    pub symbol: String,
+    pub trade: TradeRow,
+}
+
+/// What kind of event we just decoded off the combined-stream WS. Lets the
+/// connection loop fan out into the right typed broadcast.
+pub enum InboundEvent {
+    Kline(Tick),
+    AggTrade(TradeTick),
+}
+
 /// One kline as it lands in the `candles` table. All fields are committed
 /// from the REST response (no client-side derivation).
 #[derive(Clone, Debug)]
@@ -126,6 +196,26 @@ struct KlineEventRaw {
     k: KlineInner,
 }
 
+/// `data.k` shape for aggTrade WS events. Field renames follow Binance's
+/// single-letter convention.
+#[derive(Debug, Deserialize)]
+struct AggTradeEventRaw {
+    #[serde(rename = "e")]
+    event: String,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "a")]
+    agg_id: i64,
+    #[serde(rename = "p")]
+    price: String,
+    #[serde(rename = "q")]
+    qty: String,
+    #[serde(rename = "T")]
+    ts_ms: i64,
+    #[serde(rename = "m")]
+    is_buyer_maker: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct KlineInner {
     #[serde(rename = "t")]
@@ -167,6 +257,42 @@ pub struct Tick {
 }
 
 impl CombinedStreamMsg {
+    /// Decode the envelope into one of the inbound event variants we route.
+    /// Returns `Ok(None)` for events we don't track (different interval,
+    /// unknown event type).
+    pub fn parse_event(&self) -> Result<Option<InboundEvent>> {
+        let event = self
+            .data
+            .get("e")
+            .and_then(|v| v.as_str())
+            .context("event field `e` missing on combined-stream payload")?;
+        match event {
+            "kline" => Ok(self.parse_kline_event()?.map(InboundEvent::Kline)),
+            "aggTrade" => Ok(self.parse_agg_trade_event()?.map(InboundEvent::AggTrade)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Try to parse `self.data` as an aggTrade event.
+    fn parse_agg_trade_event(&self) -> Result<Option<TradeTick>> {
+        let raw: AggTradeEventRaw =
+            serde_json::from_value(self.data.clone()).context("decode aggTrade payload")?;
+        if raw.event != "aggTrade" {
+            return Ok(None);
+        }
+        let trade = TradeRow {
+            agg_id: raw.agg_id,
+            ts: ms_to_utc(raw.ts_ms),
+            price: parse_decimal_str(&raw.price, "aggTrade.p")?,
+            qty: parse_decimal_str(&raw.qty, "aggTrade.q")?,
+            is_buyer_maker: raw.is_buyer_maker,
+        };
+        Ok(Some(TradeTick {
+            symbol: raw.symbol,
+            trade,
+        }))
+    }
+
     /// Try to parse `self.data` as a kline event. Returns `Ok(None)` for
     /// non-kline events (we ignore them) or for events on intervals we don't
     /// track. Returns `Err` for malformed JSON we expected to be a kline.
@@ -277,6 +403,55 @@ mod tests {
         assert_eq!(tick.kline.close, 16520.30);
         assert_eq!(tick.kline.trades, 42);
         assert!(!tick.is_closed);
+    }
+
+    #[test]
+    fn parses_a_combined_stream_agg_trade() {
+        let raw = serde_json::json!({
+            "stream": "btcusdt@aggTrade",
+            "data": {
+                "e": "aggTrade",
+                "E": 1672531200900_i64,
+                "s": "BTCUSDT",
+                "a": 1234567,
+                "p": "16500.50",
+                "q": "0.123",
+                "f": 100,
+                "l": 102,
+                "T": 1672531200500_i64,
+                "m": true
+            }
+        });
+        let env: CombinedStreamMsg = serde_json::from_value(raw).unwrap();
+        let evt = env.parse_event().unwrap().expect("agg trade decoded");
+        match evt {
+            InboundEvent::AggTrade(tick) => {
+                assert_eq!(tick.symbol, "BTCUSDT");
+                assert_eq!(tick.trade.agg_id, 1234567);
+                assert!((tick.trade.price - 16500.50).abs() < 1e-9);
+                assert!((tick.trade.qty - 0.123).abs() < 1e-9);
+                assert!(tick.trade.is_buyer_maker);
+                assert_eq!(tick.trade.ts.timestamp_millis(), 1672531200500);
+            }
+            _ => panic!("expected AggTrade variant"),
+        }
+    }
+
+    #[test]
+    fn parses_an_agg_trade_rest_row() {
+        let raw = serde_json::json!({
+            "a": 26129,
+            "p": "16550.50",
+            "q": "0.250",
+            "f": 27781,
+            "l": 27781,
+            "T": 1498793709153_i64,
+            "m": false
+        });
+        let row = TradeRow::from_rest_value(&raw).unwrap();
+        assert_eq!(row.agg_id, 26129);
+        assert!((row.price - 16550.50).abs() < 1e-9);
+        assert!(!row.is_buyer_maker);
     }
 
     #[test]

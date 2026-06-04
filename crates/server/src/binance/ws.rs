@@ -1,43 +1,44 @@
 //! Binance combined-stream WebSocket client.
 //!
-//! Subscribes to every `<symbol>@kline_<tf>` stream we care about over a
-//! single connection (Q6: relay-and-persist, one Binance stream per tf).
-//! Binance hard-disconnects every connection at 24h plus may drop on
-//! network blips; the caller wraps [`connect_and_stream`] in a reconnect
-//! loop that also runs a gap-heal between connections.
+//! Subscribes to every `<symbol>@kline_<tf>` stream we care about + the
+//! `<symbol>@aggTrade` stream over a single connection. Binance hard-
+//! disconnects every connection at 24h plus may drop on network blips; the
+//! caller wraps [`connect_and_stream`] in a reconnect loop that also runs
+//! gap-heal REST passes between connections.
 
 use anyhow::{Context, Result, anyhow};
 use protocol::Timeframe;
 use futures::{SinkExt, StreamExt};
-use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
-use super::{WS_BASE, parse::CombinedStreamMsg};
+use super::{
+    BroadcastTxs, WS_BASE,
+    parse::{CombinedStreamMsg, InboundEvent},
+};
 
-/// Build the combined-stream URL for `(symbol × native-kline TFs)`. S1/S5
-/// are excluded — Binance USD-M futures doesn't publish `kline_1s` / `kline_5s`,
-/// so those bars are synthesized from aggTrades client-side / aggregator-side.
+/// Build the combined-stream URL for `(symbol × native-kline TFs) ∪ aggTrade`.
+/// S1/S5 are excluded — Binance USD-M futures doesn't publish `kline_1s` /
+/// `kline_5s`, so those bars are synthesized from the aggTrade stream by the
+/// sub-second aggregator.
 ///
 /// Output looks like
-/// `wss://fstream.binance.com/stream?streams=btcusdt@kline_1m/btcusdt@kline_5m/...`.
+/// `wss://fstream.binance.com/stream?streams=btcusdt@kline_1m/.../btcusdt@aggTrade`.
 fn combined_url(symbol: &str) -> String {
     let s = symbol.to_lowercase();
-    let streams: Vec<String> = Timeframe::ALL
+    let mut streams: Vec<String> = Timeframe::ALL
         .iter()
         .filter(|tf| tf.is_native_kline())
         .map(|tf| format!("{s}@kline_{}", tf.as_str()))
         .collect();
+    streams.push(format!("{s}@aggTrade"));
     format!("{}/stream?streams={}", WS_BASE, streams.join("/"))
 }
 
-/// Connect to Binance, parse every kline event, and broadcast it. Returns
-/// when the connection drops (either side); the caller decides whether to
-/// reconnect.
-pub async fn connect_and_stream(
-    symbol: &str,
-    broadcast_tx: &broadcast::Sender<super::parse::Tick>,
-) -> Result<()> {
+/// Connect to Binance, parse every kline / aggTrade event, and fan into the
+/// right typed broadcast. Returns when the connection drops (either side);
+/// the caller decides whether to reconnect.
+pub async fn connect_and_stream(symbol: &str, txs: &BroadcastTxs) -> Result<()> {
     let url = combined_url(symbol);
     info!(symbol, "connecting to Binance combined stream");
 
@@ -55,7 +56,7 @@ pub async fn connect_and_stream(
 
         match msg {
             Message::Text(txt) => {
-                if let Err(e) = handle_text(&txt, broadcast_tx) {
+                if let Err(e) = handle_text(&txt, txs) {
                     warn!(error = %e, "failed to handle text frame");
                 }
             }
@@ -67,7 +68,7 @@ pub async fn connect_and_stream(
                         continue;
                     }
                 };
-                if let Err(e) = handle_text(&txt, broadcast_tx) {
+                if let Err(e) = handle_text(&txt, txs) {
                     warn!(error = %e, "failed to handle binary-as-text frame");
                 }
             }
@@ -89,25 +90,33 @@ pub async fn connect_and_stream(
     }
 }
 
-fn handle_text(
-    txt: &str,
-    broadcast_tx: &broadcast::Sender<super::parse::Tick>,
-) -> Result<()> {
+fn handle_text(txt: &str, txs: &BroadcastTxs) -> Result<()> {
     let env: CombinedStreamMsg = serde_json::from_str(txt).context("decode envelope")?;
-    let tick = match env.parse_kline_event()? {
-        Some(t) => t,
-        None => return Ok(()),
+    let Some(evt) = env.parse_event()? else {
+        return Ok(());
     };
-    debug!(
-        symbol = %tick.symbol,
-        tf = tick.tf.as_str(),
-        is_closed = tick.is_closed,
-        "kline tick"
-    );
     // `send` errors when there are zero receivers; not fatal — just means
-    // the gateway hasn't subscribed yet (boot ordering) or has fully
-    // disconnected. The DB writer holds one Receiver permanently after
-    // boot, so during normal operation this is never empty.
-    let _ = broadcast_tx.send(tick);
+    // a consumer hasn't subscribed yet (boot ordering) or has fully
+    // disconnected. The writer tasks hold permanent Receivers after boot,
+    // so during normal operation this is never empty.
+    match evt {
+        InboundEvent::Kline(tick) => {
+            debug!(
+                symbol = %tick.symbol,
+                tf = tick.tf.as_str(),
+                is_closed = tick.is_closed,
+                "kline tick"
+            );
+            let _ = txs.kline.send(tick);
+        }
+        InboundEvent::AggTrade(tick) => {
+            debug!(
+                symbol = %tick.symbol,
+                agg_id = tick.trade.agg_id,
+                "agg trade"
+            );
+            let _ = txs.trade.send(tick);
+        }
+    }
     Ok(())
 }

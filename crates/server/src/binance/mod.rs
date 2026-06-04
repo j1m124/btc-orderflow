@@ -17,3 +17,16 @@ pub const WS_BASE: &str = "wss://fstream.binance.com";
 
 /// Max bars per `/fapi/v1/klines` REST page.
 pub const KLINES_PAGE_LIMIT: u32 = 1500;
+
+/// Max trades per `/fapi/v1/aggTrades` REST page (Binance hard limit).
+pub const AGGTRADES_PAGE_LIMIT: u32 = 1000;
+
+/// Bundle of typed broadcast senders threaded into the ingest path. The
+/// connection loop fans inbound events (kline, aggTrade, depth, …) into the
+/// right channel so each consumer task — DB writers, sub-second aggregator,
+/// gateway forwarders — subscribes only to what it needs.
+#[derive(Clone)]
+pub struct BroadcastTxs {
+    pub kline: tokio::sync::broadcast::Sender<parse::Tick>,
+    pub trade: tokio::sync::broadcast::Sender<parse::TradeTick>,
+}

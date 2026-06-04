@@ -11,7 +11,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use sqlx::{PgPool, QueryBuilder, Row};
 use tracing::info;
 
-use crate::binance::parse::KlineRow;
+use crate::binance::parse::{KlineRow, TradeRow};
 
 /// Run every migration in `migrations/` that hasn't been applied yet.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
@@ -137,6 +137,59 @@ pub async fn fetch_snapshot(
         .collect::<Result<Vec<_>>>()?;
     candles.reverse();
     Ok(candles)
+}
+
+// --- trades ----------------------------------------------------------------
+
+/// Latest stored `agg_id` for `symbol`, or `None` if no rows. Used as the
+/// pagination cursor for the trade gap-heal loop: the next REST call asks
+/// for `from_id = max_agg_id + 1`.
+pub async fn max_trade_agg_id(pool: &PgPool, symbol: &str) -> Result<Option<i64>> {
+    let row = sqlx::query("SELECT MAX(agg_id) AS m FROM trades WHERE symbol = $1")
+        .bind(symbol)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("m")?)
+}
+
+/// Latest stored trade `ts` for `symbol`, or `None` if no rows. Used by the
+/// gap-heal cap check — outages longer than the cap skip backfill.
+pub async fn max_trade_ts(pool: &PgPool, symbol: &str) -> Result<Option<DateTime<Utc>>> {
+    let row = sqlx::query("SELECT MAX(ts) AS t FROM trades WHERE symbol = $1")
+        .bind(symbol)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("t")?)
+}
+
+/// UPSERT a batch of trades. ON CONFLICT DO NOTHING because aggTrades are
+/// immutable once Binance issues them — re-ingest (gap-heal overlapping a
+/// live WS event) is idempotent and the existing row is canonical.
+///
+/// Postgres has a 65535-parameter cap per query; we bind 6 params per row,
+/// so the safe ceiling per call is ~10900 rows. Binance's 1000-row REST
+/// page (and the 100ms broadcast batch from the live stream) sit well under.
+pub async fn upsert_trades(pool: &PgPool, symbol: &str, rows: &[TradeRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "INSERT INTO trades (symbol, ts, agg_id, price, qty, is_buyer_maker) ",
+    );
+
+    qb.push_values(rows.iter(), |mut b, row| {
+        b.push_bind(symbol)
+            .push_bind(row.ts)
+            .push_bind(row.agg_id)
+            .push_bind(row.price)
+            .push_bind(row.qty)
+            .push_bind(row.is_buyer_maker);
+    });
+
+    qb.push(" ON CONFLICT (symbol, ts, agg_id) DO NOTHING");
+    qb.build().execute(pool).await?;
+    Ok(())
 }
 
 /// Read up to `count` closed bars for `(symbol, tf)` strictly older than
