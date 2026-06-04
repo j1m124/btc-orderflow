@@ -429,6 +429,20 @@ impl MarketDataService {
             proto::ServerFrame::Error { id, code, msg } => {
                 log::warn!("server error: id={id:?} code={code} msg={msg}");
             }
+            // Trades / Footprint / Book channels get their handlers wired in a
+            // follow-up commit. Logging at debug rather than panicking lets
+            // the server roll new frame types before the client catches up.
+            proto::ServerFrame::TradeSnapshot { .. }
+            | proto::ServerFrame::TradeTick { .. }
+            | proto::ServerFrame::TradeHistoryPage { .. }
+            | proto::ServerFrame::FootprintSnapshot { .. }
+            | proto::ServerFrame::FootprintUpdate { .. }
+            | proto::ServerFrame::FootprintHistoryPage { .. }
+            | proto::ServerFrame::BookSnapshot { .. }
+            | proto::ServerFrame::BookDelta { .. }
+            | proto::ServerFrame::BookHistoryPage { .. } => {
+                log::debug!("received orderflow frame; handler not yet wired");
+            }
         }
     }
 

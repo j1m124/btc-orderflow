@@ -15,7 +15,9 @@ use tracing::{debug, info, warn};
 
 use super::{WS_BASE, parse::CombinedStreamMsg};
 
-/// Build the combined-stream URL for `(symbol × Timeframe::ALL)`.
+/// Build the combined-stream URL for `(symbol × native-kline TFs)`. S1/S5
+/// are excluded — Binance USD-M futures doesn't publish `kline_1s` / `kline_5s`,
+/// so those bars are synthesized from aggTrades client-side / aggregator-side.
 ///
 /// Output looks like
 /// `wss://fstream.binance.com/stream?streams=btcusdt@kline_1m/btcusdt@kline_5m/...`.
@@ -23,6 +25,7 @@ fn combined_url(symbol: &str) -> String {
     let s = symbol.to_lowercase();
     let streams: Vec<String> = Timeframe::ALL
         .iter()
+        .filter(|tf| tf.is_native_kline())
         .map(|tf| format!("{s}@kline_{}", tf.as_str()))
         .collect();
     format!("{}/stream?streams={}", WS_BASE, streams.join("/"))

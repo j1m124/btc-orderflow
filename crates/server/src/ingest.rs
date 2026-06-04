@@ -103,20 +103,26 @@ pub async fn backfill_one(
     Ok(total)
 }
 
-/// Backfill every timeframe in `Timeframe::ALL` for `symbol`, in parallel.
-/// Returns the per-tf row counts in `Timeframe::ALL` order.
+/// Backfill every native-kline timeframe in `Timeframe::ALL` for `symbol`,
+/// in parallel. Returns the per-tf row counts in iteration order.
+///
+/// S1/S5 are skipped — there's no Binance REST kline endpoint for those
+/// intervals (they're synthesized from the aggTrade stream).
 pub async fn backfill_symbol(
     pool: &PgPool,
     rest: &RestClient,
     symbol: &str,
     cold_start: ChronoDuration,
 ) -> Result<Vec<usize>> {
-    let futures = Timeframe::ALL.into_iter().map(|tf| {
-        let pool = pool.clone();
-        let rest = rest;
-        let symbol = symbol.to_string();
-        async move { backfill_one(&pool, rest, &symbol, tf, cold_start).await }
-    });
+    let futures = Timeframe::ALL
+        .into_iter()
+        .filter(|tf| tf.is_native_kline())
+        .map(|tf| {
+            let pool = pool.clone();
+            let rest = rest;
+            let symbol = symbol.to_string();
+            async move { backfill_one(&pool, rest, &symbol, tf, cold_start).await }
+        });
     try_join_all(futures).await
 }
 
@@ -178,7 +184,11 @@ pub async fn run_binance_ingest(
         // first iteration (just a few seconds of bars to catch up).
         match backfill_symbol(&pool, &rest, &symbol, cold_start).await {
             Ok(counts) => {
-                for (tf, n) in Timeframe::ALL.iter().zip(counts.iter()) {
+                for (tf, n) in Timeframe::ALL
+                    .iter()
+                    .filter(|tf| tf.is_native_kline())
+                    .zip(counts.iter())
+                {
                     if *n > 0 {
                         debug!(tf = tf.as_str(), rows = n, "gap-heal applied");
                     }

@@ -95,7 +95,7 @@ pub async fn upsert_klines(
 
 /// Read the most recent `limit` closed bars for `(symbol, tf)` in
 /// chronological order. Returns the wire-narrow [`Candle`] shape (i64-ms
-/// timestamps; `taker_buy_vol` is dropped).
+/// timestamps).
 pub async fn fetch_snapshot(
     pool: &PgPool,
     symbol: &str,
@@ -103,7 +103,8 @@ pub async fn fetch_snapshot(
     limit: i64,
 ) -> Result<Vec<Candle>> {
     let rows = sqlx::query(
-        "SELECT open_time, close_time, open, high, low, close, volume, quote_volume, trades \
+        "SELECT open_time, close_time, open, high, low, close, volume, \
+                quote_volume, trades, taker_buy_vol \
          FROM candles \
          WHERE symbol = $1 AND tf = $2 \
          ORDER BY open_time DESC \
@@ -130,6 +131,7 @@ pub async fn fetch_snapshot(
                 volume: r.try_get("volume")?,
                 quote_volume: r.try_get("quote_volume")?,
                 trades: r.try_get("trades")?,
+                taker_buy_vol: r.try_get("taker_buy_vol")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -153,7 +155,8 @@ pub async fn fetch_history_page(
     });
 
     let rows = sqlx::query(
-        "SELECT open_time, close_time, open, high, low, close, volume, quote_volume, trades \
+        "SELECT open_time, close_time, open, high, low, close, volume, \
+                quote_volume, trades, taker_buy_vol \
          FROM candles \
          WHERE symbol = $1 AND tf = $2 AND open_time < $3 \
          ORDER BY open_time DESC \
@@ -181,6 +184,7 @@ pub async fn fetch_history_page(
                 volume: r.try_get("volume")?,
                 quote_volume: r.try_get("quote_volume")?,
                 trades: r.try_get("trades")?,
+                taker_buy_vol: r.try_get("taker_buy_vol")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;

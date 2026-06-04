@@ -128,6 +128,19 @@ async fn handle_text(
             }
             let tf = match channel {
                 Channel::Candles { tf, .. } => tf,
+                // Trades / Footprint / Book land their own per-channel
+                // forwarders in a follow-up commit; reject here so the
+                // wire is honest about what's wired today.
+                Channel::Trades | Channel::Footprint { .. } | Channel::Book { .. } => {
+                    send_error(
+                        write_tx,
+                        Some(id),
+                        "unsupported_channel",
+                        "channel not yet wired on the server",
+                    )
+                    .await;
+                    return;
+                }
             };
 
             // Drop any existing sub with the same id; reuse is allowed and
@@ -308,6 +321,7 @@ fn kline_to_wire(k: &KlineRow) -> Candle {
         volume: k.volume,
         quote_volume: Some(k.quote_volume),
         trades: Some(k.trades),
+        taker_buy_vol: Some(k.taker_buy_vol),
     }
 }
 
