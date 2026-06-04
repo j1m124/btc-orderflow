@@ -13,7 +13,7 @@ use gpui::{
     Subscription, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, Theme,
+    ActiveTheme as _, IconName, Sizable as _, StyledExt as _, Theme,
     WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{self, DialogButtonProps},
@@ -258,11 +258,9 @@ fn render_general(
         .gap_4()
         .child(section_header("Appearance", muted))
         .child(font_size_row(cx))
-        .child(placeholder_row("Font family", "System default", muted))
         .child(animations_row(cx))
         .child(div().px_4().child(Separator::horizontal()))
         .child(section_header("Locale", muted))
-        .child(placeholder_row("Language", "English (default)", muted))
         .child(timezone_row(tz_query, cx))
         .child(div().px_4().child(Separator::horizontal()))
         .child(section_header("Chart", muted))
@@ -382,34 +380,6 @@ fn animations_row(_cx: &mut Context<SettingsView>) -> impl IntoElement {
                 }
                 window.refresh();
             }),
-    )
-}
-
-fn placeholder_row(
-    label: &'static str,
-    value_label: &'static str,
-    muted: gpui::Hsla,
-) -> impl IntoElement {
-    setting_row(
-        label,
-        "Coming soon.",
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(
-                Button::new(SharedString::from(format!("{label}-placeholder")))
-                    .label(SharedString::from(value_label))
-                    .icon(IconName::ChevronDown)
-                    .small()
-                    .outline()
-                    .disabled(true),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("coming soon"),
-            ),
     )
 }
 

@@ -8,9 +8,6 @@
 mod drawings_view;
 mod paint;
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
 use gpui::{
     Action, AppContext as _, Bounds, ContentMask, Context, Entity, FocusHandle, Focusable as _,
     Hsla, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -137,12 +134,7 @@ pub struct GoToLatest;
 
 /// `Candle` is owned by [`crate::services::market_data`] so the live service
 /// can populate it directly — no translation layer between WS events and the
-/// chart's render path. `open_time` is the identity key the merge-or-append
-/// tick logic uses; for embedded / synthetic data we still need a value, so
-/// historical loaders fabricate one (see `chart_data` and `generate_candles`).
-/// Real 1h OHLC bars fetched by `scripts/fetch_chart_data.py`. Embedded so
-/// the WASM bundle is self-contained — no network call at runtime.
-const CHART_DATA_RAW: &str = include_str!("../../assets/chart_data.json");
+/// chart's render path.
 
 // Default candles per viewport — now user-settable via Settings → General →
 // Chart. The const remains as the seed value for the atomic in `prefs.rs`;
@@ -154,9 +146,6 @@ const CHART_MIN_VIEW: f32 = 8.0;
 /// from being crammed on screen. Users pan to reach older history, not zoom.
 /// Capped to the buffer length when fewer bars are loaded.
 const CHART_MAX_VIEW: f32 = 1000.0;
-/// Fallback candle count used only when a symbol isn't present in the
-/// embedded JSON (e.g. fetch hasn't been run, or the symbol is new).
-const CHART_FALLBACK_CANDLES: usize = 240;
 // Right-edge buffer ratio — now user-settable via Settings → General → Chart.
 // Reads at runtime through `crate::prefs::chart_right_buffer()`.
 /// Symmetric left buffer: lets the user pan/zoom-out past bar 0 into empty
@@ -173,60 +162,6 @@ const Y_FREEZE_DEADZONE_PX: f32 = 4.0;
 /// "one mouse-wheel notch" on Windows/Mac; lower values make the wheel
 /// zoom more aggressive, higher values dampen it.
 const SCROLL_ZOOM_RATE: f32 = 240.0;
-
-#[derive(Deserialize)]
-struct RawCandle {
-    t: String,
-    o: f64,
-    h: f64,
-    l: f64,
-    c: f64,
-}
-
-#[derive(Deserialize)]
-struct RawSeries {
-    bars: Vec<RawCandle>,
-}
-
-/// Parse the embedded JSON once into a symbol-keyed candle map. Lazy so the
-/// ~200KB JSON parse cost is paid on first chart open, not at startup.
-///
-/// Embedded data predates the live service and has no real `open_time`; we
-/// fabricate one (`index * 1 hour in ms`) so the merge-tick logic that runs
-/// only for live symbols stays well-defined for all candles. `volume` and
-/// `close_time` aren't carried by the JSON so they default to zero.
-fn chart_data() -> &'static HashMap<String, Vec<Candle>> {
-    static DATA: OnceLock<HashMap<String, Vec<Candle>>> = OnceLock::new();
-    DATA.get_or_init(|| {
-        let raw: HashMap<String, RawSeries> =
-            serde_json::from_str(CHART_DATA_RAW).expect("embedded chart_data.json is malformed");
-        raw.into_iter()
-            .map(|(symbol, series)| {
-                let candles: Vec<Candle> = series
-                    .bars
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, b)| {
-                        let open_time = (i as i64) * 3_600_000;
-                        Candle {
-                            open_time,
-                            close_time: open_time + 3_600_000,
-                            date: SharedString::from(b.t),
-                            open: b.o,
-                            high: b.h,
-                            low: b.l,
-                            close: b.c,
-                            volume: 0.0,
-                            vwap: None,
-                            trades: None,
-                        }
-                    })
-                    .collect();
-                (symbol, candles)
-            })
-            .collect()
-    })
-}
 
 /// Per-drag state for canvas 2D panning. X always pans from `start_view_start`;
 /// Y panning is "lazy" — `y_freeze` stays `None` until the drag accumulates
@@ -706,12 +641,12 @@ impl ChartState {
     /// happened (the caller can skip a redundant `cx.notify()`). Indicators
     /// carry over: the user's analytical setup follows the chart panel, not
     /// the data — see /grill-me locked design.
-    pub fn switch_symbol(&mut self, symbol: &str, live_candles: Option<Vec<Candle>>) -> bool {
+    pub fn switch_symbol(&mut self, symbol: &str, candles: Vec<Candle>) -> bool {
         if self.symbol == symbol {
             return false;
         }
         let indicators = std::mem::take(&mut self.indicators);
-        *self = Self::new(symbol, self.timeframe, live_candles);
+        *self = Self::new(symbol, self.timeframe, candles);
         self.adopt_indicators(indicators);
         true
     }
@@ -719,13 +654,13 @@ impl ChartState {
     /// Replace `self` with a fresh state at `tf` (keeping symbol), but only
     /// if `tf` differs. Returns `true` if a switch happened. Indicators carry
     /// over (see `switch_symbol`).
-    pub fn switch_timeframe(&mut self, tf: Timeframe, live_candles: Option<Vec<Candle>>) -> bool {
+    pub fn switch_timeframe(&mut self, tf: Timeframe, candles: Vec<Candle>) -> bool {
         if self.timeframe == tf {
             return false;
         }
         let symbol = self.symbol.clone();
         let indicators = std::mem::take(&mut self.indicators);
-        *self = Self::new(symbol.as_ref(), tf, live_candles);
+        *self = Self::new(symbol.as_ref(), tf, candles);
         self.adopt_indicators(indicators);
         true
     }
@@ -741,14 +676,6 @@ impl ChartState {
     pub fn reset_scale(&mut self) {
         self.reset_x();
         self.reset_y_auto();
-    }
-
-    /// True when this chart's symbol is served by the live market-data
-    /// service (BTC, ETH). Used by render to pick the LIVE vs Historical
-    /// badge variant and by the chart's `cx.subscribe` to filter `KlineEvent`s
-    /// to only ones for our current symbol.
-    pub fn is_live(&self) -> bool {
-        market_data::is_live(self.symbol.as_ref())
     }
 
     pub fn symbol(&self) -> &SharedString {
@@ -800,9 +727,6 @@ impl ChartState {
     /// thousands of empty bars — the reconnect / resnap path will fill the
     /// real gap when the user comes back.
     pub fn tick_clock(&mut self, now_ms: i64) -> bool {
-        if !self.is_live() {
-            return false;
-        }
         let dur = self.timeframe.duration_ms();
         if dur <= 0 {
             return false;
@@ -1135,25 +1059,12 @@ impl ChartState {
         }
     }
 
-    /// Build a chart for `symbol` at `timeframe`. `live_candles` is the initial
-    /// snapshot from `MarketDataService` (`Some`, possibly empty, for live
-    /// symbols — which is all of them now). The `None` branch is a synthetic
-    /// fallback kept only for completeness. Display name/exchange are resolved
-    /// at render time from the symbols service, so they aren't stored here.
-    pub fn new(
-        symbol: &str,
-        timeframe: Timeframe,
-        live_candles: Option<Vec<Candle>>,
-    ) -> Self {
-        // A live symbol with an empty snapshot just means we haven't backfilled
-        // yet — `Resnap` will fire and `resnap()` will fill it in.
-        let candles = match live_candles {
-            Some(c) => c,
-            None => chart_data()
-                .get(symbol)
-                .cloned()
-                .unwrap_or_else(|| generate_candles(symbol)),
-        };
+    /// Build a chart for `symbol` at `timeframe`. The initial bar buffer is
+    /// the snapshot from `MarketDataService` (possibly empty if backfill
+    /// hasn't completed yet — `Resnap` then fills it in). Display
+    /// name/exchange are resolved at render time from the symbols service,
+    /// so they aren't stored here.
+    pub fn new(symbol: &str, timeframe: Timeframe, candles: Vec<Candle>) -> Self {
         let total = candles.len() as f32;
         let view_size = crate::prefs::chart_default_view().min(total).max(1.0);
         // Default view: latest candle anchored at the right edge of the
@@ -2106,51 +2017,6 @@ fn hit_test_drawings(
     None
 }
 
-/// Deterministic per-symbol synthetic candle generator. Used as a fallback
-/// when a symbol isn't present in the embedded fetched dataset. FNV-hashes
-/// the symbol into a seed, then walks bars with sin/cos drift so each symbol
-/// gets a distinct but stable price series.
-fn generate_candles(symbol: &str) -> Vec<Candle> {
-    let mut seed: u64 = 0xcbf29ce484222325;
-    for b in symbol.bytes() {
-        seed ^= b as u64;
-        seed = seed.wrapping_mul(0x100000001b3);
-    }
-    let base = 50.0 + (seed % 800) as f64;
-    let trend_sign = if (seed >> 17) & 1 == 0 { 1.0 } else { -1.0 };
-    let trend = trend_sign * (((seed >> 9) % 7) as f64 * 0.05 + 0.05);
-
-    let mut close = base;
-    let mut v = Vec::with_capacity(CHART_FALLBACK_CANDLES);
-    for i in 0..CHART_FALLBACK_CANDLES {
-        let t = i as f64;
-        let s = ((seed.wrapping_add(i as u64 * 2654435761)) & 0xffff) as f64 / 65535.0 - 0.5;
-        let drift = (t * 0.13).sin() * (base * 0.020)
-            + (t * 0.041).cos() * (base * 0.010)
-            + s * (base * 0.015)
-            + trend;
-        let open = close + (t * 1.07 + (seed % 13) as f64).cos() * (base * 0.005);
-        close = (open + drift).max(base * 0.30);
-        let amp = (base * 0.005) + ((t * 0.21).sin().abs() * base * 0.012);
-        let high = open.max(close) + amp;
-        let low = (open.min(close) - amp).max(base * 0.20);
-        let open_time = (i as i64) * 3_600_000;
-        v.push(Candle {
-            open_time,
-            close_time: open_time + 3_600_000,
-            date: SharedString::from(format!("D{:03}", i + 1)),
-            open,
-            high,
-            low,
-            close,
-            volume: 0.0,
-            vwap: None,
-            trades: None,
-        });
-    }
-    v
-}
-
 pub fn render(
     state: &ChartState,
     focus: FocusHandle,
@@ -2184,11 +2050,9 @@ pub fn render(
         )
     };
 
-    // LIVE / Reconnecting / Disconnected / Historical badge in the header.
-    // For live symbols, mirrors the market-data service's connection state;
-    // for embedded / synthetic symbols it just says "Historical" so the
-    // mixed-data design is legible to the user.
-    let (badge_color, badge_label): (Hsla, &'static str) = if state.is_live() {
+    // LIVE / Reconnecting / Disconnected badge in the header. Mirrors the
+    // market-data service's connection state.
+    let (badge_color, badge_label): (Hsla, &'static str) = {
         let svc = cx
             .global::<market_data::MarketDataServiceHandle>()
             .0
@@ -2203,8 +2067,6 @@ pub fn render(
             Reconnecting { attempts } if attempts >= 4 => (theme_chart_bearish, "Disconnected"),
             Reconnecting { .. } => (theme_chart_5, "Reconnecting…"),
         }
-    } else {
-        (theme_muted_foreground, "Historical")
     };
 
     // Single `y_range` + `visible_slice` snapshot threaded through the rest
@@ -2815,8 +2677,8 @@ pub fn render(
     // pill on the right axis, and a "M:SS" countdown to the next bar open.
     // Only live symbols have a developing bar; for historical charts this
     // collapses to an empty vec so we don't paint a stale last-close marker.
-    let live_price_chrome: Vec<gpui::AnyElement> = if let (true, Some(bounds), Some(last)) =
-        (state.is_live(), state.bounds, state.candles.last())
+    let live_price_chrome: Vec<gpui::AnyElement> = if let (Some(bounds), Some(last)) =
+        (state.bounds, state.candles.last())
     {
         let canvas_w = bounds.size.width.as_f32();
         let canvas_h = bounds.size.height.as_f32();

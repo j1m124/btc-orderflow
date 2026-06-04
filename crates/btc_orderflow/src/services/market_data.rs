@@ -159,12 +159,6 @@ impl Candle {
     }
 }
 
-/// Whether a display symbol has a live feed. The v1 server only ingests
-/// BTCUSDT (see `SUPPORTED_SYMBOL` in `btc_orderflow_server::gateway::session`).
-pub fn is_live(display_symbol: &str) -> bool {
-    display_symbol == "BTCUSDT"
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum LiveStatus {
     Connecting,

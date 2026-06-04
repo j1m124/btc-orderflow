@@ -102,21 +102,16 @@ fn live_snapshot(
     symbol: &str,
     tf: crate::services::market_data::Timeframe,
     cx: &App,
-) -> Option<Vec<crate::services::market_data::Candle>> {
-    if !crate::services::market_data::is_live(symbol) {
-        return None;
-    }
+) -> Vec<crate::services::market_data::Candle> {
     let handle = cx
         .global::<crate::services::market_data::MarketDataServiceHandle>()
         .0
         .clone();
-    Some(
-        handle
-            .read(cx)
-            .snapshot(symbol, tf)
-            .map(|s| s.to_vec())
-            .unwrap_or_default(),
-    )
+    handle
+        .read(cx)
+        .snapshot(symbol, tf)
+        .map(|s| s.to_vec())
+        .unwrap_or_default()
 }
 
 fn ensure_chart_sub(
@@ -300,8 +295,7 @@ impl ContentPanel {
                             if state.symbol().as_ref() == symbol.as_ref()
                                 && state.timeframe() == *tf
                             {
-                                let snap = live_snapshot(symbol.as_ref(), *tf, cx)
-                                    .unwrap_or_default();
+                                let snap = live_snapshot(symbol.as_ref(), *tf, cx);
                                 state.resnap(snap);
                                 cx.notify();
                             }
@@ -310,8 +304,7 @@ impl ContentPanel {
                             if state.symbol().as_ref() == symbol.as_ref()
                                 && state.timeframe() == *tf
                             {
-                                let snap = live_snapshot(symbol.as_ref(), *tf, cx)
-                                    .unwrap_or_default();
+                                let snap = live_snapshot(symbol.as_ref(), *tf, cx);
                                 state.apply_prepend(snap, *added);
                                 cx.notify();
                             }
