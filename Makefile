@@ -1,4 +1,4 @@
-.PHONY: help dev build build-wasm build-wasm-dev build-web check check-client check-protocol check-server server clean install
+.PHONY: help dev build build-wasm build-wasm-dev build-web check check-client check-protocol check-server server db-up db-down db-reset db-psql clean install
 
 # wasm-bindgen-cli MUST match the wasm-bindgen crate version pulled by
 # Cargo.lock. Drift here = the JS bindings reference symbols the WASM blob
@@ -32,6 +32,20 @@ check-client: ## Type-check the wasm client crate
 
 check-server: ## Type-check the native server crate
 	@cargo check -p btc_orderflow_server
+
+# --- Database --------------------------------------------------------------
+
+db-up: ## Start the TimescaleDB container (background)
+	@docker compose up -d db
+
+db-down: ## Stop the TimescaleDB container (data preserved)
+	@docker compose stop db
+
+db-reset: ## Destroy the DB container AND wipe its data volume
+	@docker compose down -v
+
+db-psql: ## Open a psql shell in the running DB container
+	@docker exec -it btc_orderflow_db psql -U btc -d btc_orderflow
 
 # --- Run server ------------------------------------------------------------
 

@@ -1,0 +1,30 @@
+# Local-dev TimescaleDB. The server runs natively via `make server`; only
+# the DB lives in Docker. Persistent volume `btc_orderflow_pg` survives
+# `docker compose stop`/`start` and is wiped by `make db-reset`.
+#
+# Credentials are local-only — the port is bound to 127.0.0.1 by Docker
+# Desktop's default, and nothing here is reachable off-host. If you ever
+# want this exposed beyond localhost, change ports: "127.0.0.1:5432:5432"
+# explicitly and rotate the password through env vars.
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: btc_orderflow_db
+    environment:
+      POSTGRES_USER: btc
+      POSTGRES_PASSWORD: btc
+      POSTGRES_DB: btc_orderflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - btc_orderflow_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U btc -d btc_orderflow"]
+      interval: 2s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  btc_orderflow_pg:
