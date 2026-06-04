@@ -1,9 +1,12 @@
-.PHONY: help dev build build-wasm build-wasm-dev build-web check check-client check-protocol check-server server db-up db-down db-reset db-psql clean install
+.PHONY: help dev build build-wasm build-wasm-dev build-web check check-client check-protocol check-server server db-up db-down db-reset db-psql db-migration clean install
 
 # wasm-bindgen-cli MUST match the wasm-bindgen crate version pulled by
 # Cargo.lock. Drift here = the JS bindings reference symbols the WASM blob
 # doesn't export. The CI workflow pins the same value; bump together.
 WASM_BINDGEN_VERSION := 0.2.120
+
+# sqlx-cli pinned to match the sqlx crate version pulled by Cargo.lock.
+SQLX_CLI_VERSION := 0.8.6
 
 help: ## Show help information
 	@echo "btc-orderflow - Available commands:"
@@ -13,6 +16,8 @@ help: ## Show help information
 install: ## Install all dependencies
 	@echo "Installing wasm-bindgen-cli@$(WASM_BINDGEN_VERSION)..."
 	@cargo install --locked wasm-bindgen-cli --version $(WASM_BINDGEN_VERSION) || true
+	@echo "Installing sqlx-cli@$(SQLX_CLI_VERSION)..."
+	@cargo install --locked sqlx-cli --version $(SQLX_CLI_VERSION) --no-default-features --features postgres,native-tls || true
 	@echo "Installing frontend dependencies..."
 	@cd www && bun install
 
@@ -46,6 +51,10 @@ db-reset: ## Destroy the DB container AND wipe its data volume
 
 db-psql: ## Open a psql shell in the running DB container
 	@docker exec -it btc_orderflow_db psql -U btc -d btc_orderflow
+
+db-migration: ## Generate a reversible migration: `make db-migration NAME=add_thing`
+	@if [ -z "$(NAME)" ]; then echo "usage: make db-migration NAME=<snake_case_name>"; exit 1; fi
+	@sqlx migrate add -r --source crates/btc_orderflow_server/migrations $(NAME)
 
 # --- Run server ------------------------------------------------------------
 

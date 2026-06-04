@@ -29,7 +29,7 @@ btc-orderflow/
 ## Commands
 
 ```sh
-make install                          # one-time: wasm-bindgen-cli + bun deps
+make install                          # one-time: wasm-bindgen-cli + sqlx-cli + bun deps
 make db-up                            # start TimescaleDB (Docker)
 make server                           # cargo run -p btc_orderflow_server (gap-heals + ingests + serves WS)
 make dev                              # debug WASM + Vite at localhost:3001
@@ -39,7 +39,10 @@ make check-{protocol,client,server}   # individual checks
 
 make db-psql                          # psql shell against the running DB
 make db-reset                         # nuke the DB volume (drops all candles)
+make db-migration NAME=foo            # generate a reversible migration pair (.up.sql + .down.sql)
 ```
+
+Migrations are reversible (paired `<ts>_<name>.up.sql` + `<ts>_<name>.down.sql`). The server applies pending `.up.sql` files on boot via `sqlx::migrate!`. There's no `make db-migrate-revert` target — reverting is rare and deliberate; invoke `sqlx migrate revert --source crates/btc_orderflow_server/migrations` (with `DATABASE_URL` set) directly when you mean it.
 
 `.cargo/config.toml` no longer sets a default target — the workspace is mixed (wasm client + host server). Bare `cargo check` from root fails; use `make check` or the per-crate `cargo check -p ... [--target ...]` form. The wasm-bindgen-test-runner is preserved under `[target.wasm32-unknown-unknown]` so `cargo test -p btc_orderflow --target wasm32-unknown-unknown` works.
 
@@ -50,6 +53,8 @@ After WASM source changes during `make dev`, re-run `./scripts/build-wasm.sh` an
 `gpui` and `gpui_platform` are git deps with **no `rev` pin** — they unify with the (un-revved) `gpui` dep declared inside `gpui-component`. Adding a `rev` makes cargo treat them as two separate copies and nothing typechecks. `gpui-component` itself is pinned to `d3d6e56c96659fb7516e2c743b80331af62e546d`. Reproducibility comes from `Cargo.lock`, which is committed.
 
 `wasm-bindgen-cli` version (in `Makefile` and on your machine) must match the `wasm-bindgen` crate version pulled in by `Cargo.lock`. Currently `0.2.120`. Mismatch = JS bindings reference symbols the WASM doesn't export.
+
+`sqlx-cli` is pinned the same way (`SQLX_CLI_VERSION` in `Makefile`, currently `0.8.6`, matching the `sqlx` crate). Drift here is less catastrophic — the CLI is mostly forward-compatible — but keeps reversible-migration semantics in sync with the runtime applier.
 
 ## Architecture
 
