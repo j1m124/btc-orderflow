@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = ["crates/btc_orderflow"]
+# Exclude the vendored gpui-component fork — it has its own [workspace] and
+# cargo would otherwise pull its members into ours.
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2024"
+publish = false
+version = "0.1.0"
+
+# gpui-component pinned to a specific rev for reproducibility. gpui itself uses no rev so it
+# unifies with the (unrevved) gpui dep declared inside gpui-component — otherwise cargo treats
+# them as two separate copies and nothing lines up. Reproducibility comes from Cargo.lock.
+[workspace.dependencies]
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "d3d6e56c96659fb7516e2c743b80331af62e546d", default-features = false }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "d3d6e56c96659fb7516e2c743b80331af62e546d" }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+
+[profile.dev]
+codegen-units = 16
+debug = "limited"
+split-debuginfo = "unpacked"
+
+[profile.dev.package]
+gpui = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }
+gpui_macros = { opt-level = 3 }
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+smol = { opt-level = 3 }
+tree-sitter = { opt-level = 3 }
+sum_tree = { opt-level = 3 }
+ropey = { opt-level = 3 }
+markdown = { opt-level = 3 }
+xml5ever = { opt-level = 3 }
+
+# Mirrors gpui-component's WASM-compat patches.
+[patch.crates-io]
+psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
+tree-sitter-navi = { git = "https://github.com/navi-language/tree-sitter-navi" }
+
+# Vendored gpui-component fork (forked at d3d6e56) — adds whole-window-edge
+# docking. See vendor/gpui-component/. Keep aligned by re-cloning at the
+# upstream rev in workspace.dependencies and re-applying our patches.
+[patch."https://github.com/longbridge/gpui-component"]
+gpui-component = { path = "vendor/gpui-component/crates/ui" }
+gpui-component-assets = { path = "vendor/gpui-component/crates/assets" }

@@ -1,0 +1,618 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use gpui::{
+    AnyView, App, AppContext as _, Context, DismissEvent, Entity, FocusHandle,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    Styled as _, Task, Window, div,
+};
+use gpui_component::{
+    ActiveTheme as _, Root,
+    dock::{DockArea, DockAreaState, DockEvent, DockItem, DockPlacement, PanelView},
+};
+
+use crate::bottom_bar::BottomBar;
+use crate::floating_code_editor::{FloatingCodeEditor, ToggleFloatingCodeEditor};
+use crate::floating_window::FloatingWindow;
+use crate::indicator_picker::{
+    IndicatorPickerEvent, IndicatorPickerIntent, IndicatorPickerState, OpenIndicatorPicker,
+};
+use crate::indicator_settings::{IndicatorSettingsView, OpenIndicatorSettings};
+use crate::panels::{self, ContentPanel, Kind, LastFocusedChart, LastFocusedTabPanel};
+use crate::persistence::{self, Mode, ModeState};
+use crate::symbol_picker::{OpenSymbolPicker, PickerEvent, PickerIntent, SymbolPickerState};
+use crate::top_bar::{
+    AddPanel, AddWatchlistSymbol, ApplyLayout, DeleteLayout, FocusSymbol, ManageLayouts,
+    RemoveWatchlistSymbol, ResetLayout, SaveLayout, SetTheme, TopBar,
+};
+
+const LAYOUT_VERSION: usize = 2;
+const DOCK_AREA_ID: &str = "main-dock";
+
+pub struct TerminalWorkspace {
+    top_bar: Entity<TopBar>,
+    bottom_bar: Entity<BottomBar>,
+    dock_area: Entity<DockArea>,
+    mode: Mode,
+    last_saved: Option<DockAreaState>,
+    _save_task: Option<Task<()>>,
+    focus_handle: FocusHandle,
+    focused_once: bool,
+    symbol_picker: Entity<SymbolPickerState>,
+    indicator_picker: Entity<IndicatorPickerState>,
+    indicator_settings: Option<FloatingIndicatorSettingsSlot>,
+    floating_code_editor: Option<FloatingCodeEditorSlot>,
+}
+
+struct FloatingCodeEditorSlot {
+    window: Entity<FloatingWindow>,
+    editor: Entity<FloatingCodeEditor>,
+}
+
+struct FloatingIndicatorSettingsSlot {
+    window: Entity<FloatingWindow>,
+    view: Entity<IndicatorSettingsView>,
+}
+
+impl TerminalWorkspace {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let dock_area = cx.new(|cx| DockArea::new(DOCK_AREA_ID, Some(LAYOUT_VERSION), window, cx));
+        let weak_dock = dock_area.downgrade();
+        cx.set_global(panels::DockAreaHandle(weak_dock.clone()));
+        let weak_self = cx.entity().downgrade();
+        cx.set_global(TerminalWorkspaceHandle(weak_self));
+
+        let current = persistence::load_current_mode();
+        let mode = current.mode;
+        let mode_state = persistence::load_mode_state(mode);
+        let loaded = mode_state
+            .as_ref()
+            .and_then(|s| s.dock.clone())
+            .map(|dock_state| {
+                dock_area
+                    .update(cx, |dock, cx| dock.load(dock_state, window, cx))
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        if !loaded {
+            apply_default_layout(weak_dock.clone(), window, cx);
+        }
+
+        cx.subscribe_in(
+            &dock_area,
+            window,
+            |this, dock_area, ev: &DockEvent, window, cx| {
+                if matches!(ev, DockEvent::LayoutChanged) {
+                    this.schedule_save(dock_area.clone(), window, cx);
+                }
+            },
+        )
+        .detach();
+
+        let top_bar = cx.new(|cx| TopBar::new("btc_orderflow", mode, window, cx));
+        let bottom_bar = cx.new(|cx| BottomBar::new(window, cx));
+
+        let symbol_picker = cx.new(|cx| SymbolPickerState::new(window, cx));
+        cx.subscribe_in(
+            &symbol_picker,
+            window,
+            |this, _picker, ev: &PickerEvent, window, cx| match ev {
+                PickerEvent::Closed => this.reclaim_focus(window, cx),
+            },
+        )
+        .detach();
+        let indicator_picker = cx.new(|cx| IndicatorPickerState::new(window, cx));
+        cx.subscribe_in(
+            &indicator_picker,
+            window,
+            |this, _picker, ev: &IndicatorPickerEvent, window, cx| match ev {
+                IndicatorPickerEvent::Closed => this.reclaim_focus(window, cx),
+            },
+        )
+        .detach();
+
+        Self {
+            top_bar,
+            bottom_bar,
+            dock_area,
+            mode,
+            last_saved: None,
+            _save_task: None,
+            focus_handle: cx.focus_handle(),
+            focused_once: false,
+            symbol_picker,
+            indicator_picker,
+            indicator_settings: None,
+            floating_code_editor: None,
+        }
+    }
+
+    fn schedule_save(
+        &mut self,
+        dock_area: Entity<DockArea>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = self.mode;
+        self._save_task = Some(cx.spawn_in(window, async move |this, window| {
+            window
+                .background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            _ = this.update_in(window, |this, _, cx| {
+                let dock_state = dock_area.read(cx).dump(cx);
+                if Some(&dock_state) == this.last_saved.as_ref() {
+                    return;
+                }
+                let state = ModeState {
+                    dock: Some(dock_state.clone()),
+                };
+                if let Err(err) = persistence::save_mode_state(mode, &state) {
+                    log::warn!("save mode state failed: {err:?}");
+                } else {
+                    this.last_saved = Some(dock_state);
+                }
+            });
+        }));
+    }
+
+    fn reclaim_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+    }
+
+    fn on_add_panel(
+        &mut self,
+        action: &AddPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(kind) = Kind::from_id(action.0.as_ref()) else {
+            return;
+        };
+        let panel = panels::build_kind(kind, window, cx);
+        let dock_area = self.dock_area.clone();
+        dock_area.update(cx, |dock, cx| {
+            dock.add_panel(panel, DockPlacement::Center, None, window, cx);
+        });
+    }
+
+    fn on_reset_layout(
+        &mut self,
+        _: &ResetLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = self.dock_area.downgrade();
+        apply_default_layout(weak, window, cx);
+        if let Err(err) = persistence::clear_mode_state(self.mode) {
+            log::warn!("clear mode state failed: {err:?}");
+        }
+    }
+
+    fn on_set_theme(
+        &mut self,
+        action: &SetTheme,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::themes::apply_theme_by_name(action.0.as_ref(), None, cx);
+        if let Err(err) = persistence::save_theme_name(action.0.as_ref()) {
+            log::warn!("save theme name failed: {err:?}");
+        }
+    }
+
+    fn on_save_layout(
+        &mut self,
+        _: &SaveLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dock_state = self.dock_area.read(cx).dump(cx);
+        let name = format!(
+            "Layout {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M")
+        );
+        if let Err(err) = persistence::upsert_layout(&name, dock_state) {
+            log::warn!("upsert layout failed: {err:?}");
+        }
+        self.top_bar.update(cx, |bar, cx| bar.refresh_saved_layouts(cx));
+        notify_info(window, cx, "Layout saved", &name);
+    }
+
+    fn on_apply_layout(
+        &mut self,
+        action: &ApplyLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let layouts = persistence::load_layouts();
+        let Some(state) = layouts.get(action.0.as_ref()).cloned() else {
+            return;
+        };
+        let _ = self
+            .dock_area
+            .update(cx, |dock, cx| dock.load(state, window, cx));
+    }
+
+    fn on_delete_layout(
+        &mut self,
+        action: &DeleteLayout,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(err) = persistence::delete_layout(action.0.as_ref()) {
+            log::warn!("delete layout failed: {err:?}");
+        }
+        self.top_bar.update(cx, |bar, cx| bar.refresh_saved_layouts(cx));
+    }
+
+    fn on_manage_layouts(
+        &mut self,
+        _: &ManageLayouts,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // Stub: dedicated dialog comes later. Users can delete layouts via the
+        // dropdown for now.
+    }
+
+    fn on_focus_symbol(
+        &mut self,
+        action: &FocusSymbol,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = cx
+            .global::<LastFocusedChart>()
+            .0
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.upgrade());
+        let chart = match target {
+            Some(c) => c,
+            None => {
+                let dock = self.dock_area.read(cx);
+                let center = dock.center().clone();
+                let Some(c) = find_first_chart(&center, cx) else {
+                    return;
+                };
+                c
+            }
+        };
+        let symbol = action.0.to_string();
+        chart.update(cx, |panel, cx| {
+            panel.switch_chart_symbol(&symbol, cx);
+        });
+    }
+
+    fn on_add_watchlist_symbol(
+        &mut self,
+        action: &AddWatchlistSymbol,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let svc = cx
+            .global::<crate::services::watchlist::WatchlistServiceHandle>()
+            .0
+            .clone();
+        let ticker = SharedString::from(action.0.to_string());
+        let added = svc.update(cx, |s, cx| s.add(ticker.clone(), cx));
+        if added {
+            notify_info(window, cx, "Added to watchlist", ticker.as_ref());
+        }
+    }
+
+    fn on_remove_watchlist_symbol(
+        &mut self,
+        action: &RemoveWatchlistSymbol,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let svc = cx
+            .global::<crate::services::watchlist::WatchlistServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| {
+            s.remove(action.0.as_ref(), cx);
+        });
+    }
+
+    fn on_open_symbol_picker(
+        &mut self,
+        action: &OpenSymbolPicker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.symbol_picker.read(cx).is_open() {
+            self.symbol_picker.update(cx, |p, cx| p.close(cx));
+            return;
+        }
+        if self.indicator_picker.read(cx).is_open() {
+            return;
+        }
+        let intent = match action.kind.as_ref() {
+            "watchlist" => PickerIntent::AddToWatchlist,
+            _ => {
+                let chart = cx
+                    .global::<LastFocusedChart>()
+                    .0
+                    .borrow()
+                    .clone()
+                    .and_then(|w| w.upgrade())
+                    .filter(|e| e.read(cx).kind() == Kind::Chart);
+                let chart = chart.or_else(|| {
+                    find_first_chart(&self.dock_area.read(cx).center().clone(), cx)
+                });
+                let Some(chart) = chart else {
+                    return;
+                };
+                let weak = chart.downgrade();
+                *cx.global::<LastFocusedChart>().0.borrow_mut() = Some(weak.clone());
+                PickerIntent::SwitchChart { target: weak }
+            }
+        };
+        let picker = self.symbol_picker.clone();
+        picker.update(cx, |p, cx| p.open(intent, window, cx));
+    }
+
+    fn on_open_indicator_picker(
+        &mut self,
+        _: &OpenIndicatorPicker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.indicator_picker.read(cx).is_open() {
+            self.indicator_picker.update(cx, |p, cx| p.close(cx));
+            return;
+        }
+        if self.symbol_picker.read(cx).is_open() {
+            return;
+        }
+        let chart = cx
+            .global::<LastFocusedChart>()
+            .0
+            .borrow()
+            .clone()
+            .and_then(|w| w.upgrade())
+            .filter(|e| e.read(cx).kind() == Kind::Chart);
+        let chart = chart
+            .or_else(|| find_first_chart(&self.dock_area.read(cx).center().clone(), cx));
+        let Some(chart) = chart else {
+            return;
+        };
+        let weak = chart.downgrade();
+        *cx.global::<LastFocusedChart>().0.borrow_mut() = Some(weak.clone());
+        let intent = IndicatorPickerIntent { target: weak };
+        let picker = self.indicator_picker.clone();
+        picker.update(cx, |p, cx| p.open(intent, window, cx));
+    }
+
+    fn on_open_indicator_settings(
+        &mut self,
+        action: &OpenIndicatorSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let instance_id = action.0;
+        let chart = cx
+            .global::<LastFocusedChart>()
+            .0
+            .borrow()
+            .clone()
+            .and_then(|w| w.upgrade())
+            .filter(|e| e.read(cx).kind() == Kind::Chart);
+        let chart = chart
+            .or_else(|| find_first_chart(&self.dock_area.read(cx).center().clone(), cx));
+        let Some(chart) = chart else {
+            return;
+        };
+        let target = chart.downgrade();
+        if self.indicator_settings.is_some() {
+            return;
+        }
+        let view = cx.new(|cx| IndicatorSettingsView::new(target, instance_id, window, cx));
+        let content: AnyView = view.clone().into();
+        let win =
+            cx.new(|cx| FloatingWindow::new("Indicator Settings", content, window, cx));
+        cx.subscribe_in(&win, window, |this, _w, _ev: &DismissEvent, _window, cx| {
+            // Defer the drop: gpui_web's pointer dispatcher still holds
+            // `WebWindowCallbacks` when DismissEvent fires from a click on the
+            // close button, so dropping the FloatingWindow synchronously
+            // panics on the next pointer move (`RefCell already borrowed`).
+            let weak = cx.weak_entity();
+            cx.defer(move |cx| {
+                if let Some(ws) = weak.upgrade() {
+                    ws.update(cx, |ws, _cx| {
+                        ws.indicator_settings = None;
+                    });
+                }
+            });
+            let _ = this;
+        })
+        .detach();
+        self.indicator_settings = Some(FloatingIndicatorSettingsSlot { window: win, view });
+    }
+
+    fn on_toggle_floating_code_editor(
+        &mut self,
+        _: &ToggleFloatingCodeEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(slot) = self.floating_code_editor.take() {
+            drop(slot);
+            return;
+        }
+        let editor = cx.new(|cx| FloatingCodeEditor::new(window, cx));
+        let content: AnyView = editor.clone().into();
+        let win = cx.new(|cx| FloatingWindow::new("Code Editor", content, window, cx));
+        cx.subscribe_in(&win, window, |this, _w, _ev: &DismissEvent, _window, cx| {
+            // See `on_open_indicator_settings` for why the drop is deferred.
+            let weak = cx.weak_entity();
+            cx.defer(move |cx| {
+                if let Some(ws) = weak.upgrade() {
+                    ws.update(cx, |ws, _cx| {
+                        ws.floating_code_editor = None;
+                    });
+                }
+            });
+            let _ = this;
+        })
+        .detach();
+        self.floating_code_editor = Some(FloatingCodeEditorSlot { window: win, editor });
+    }
+}
+
+#[derive(Clone)]
+pub struct TerminalWorkspaceHandle(pub gpui::WeakEntity<TerminalWorkspace>);
+impl gpui::Global for TerminalWorkspaceHandle {}
+
+impl gpui::Focusable for TerminalWorkspace {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for TerminalWorkspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (bg, fg) = {
+            let theme = cx.theme();
+            (theme.background, theme.foreground)
+        };
+        let sheet_layer = Root::render_sheet_layer(window, cx);
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
+
+        // Initial focus is intentionally NOT claimed during render. Claiming
+        // it here queues platform work that re-enters the input dispatcher on
+        // the next pointer event, panicking with `RefCell already borrowed`.
+        // The workspace gains focus naturally on the user's first click.
+        let _ = &self.focused_once;
+
+        div()
+            .id("workspace")
+            .key_context("Workspace")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_add_panel))
+            .on_action(cx.listener(Self::on_reset_layout))
+            .on_action(cx.listener(Self::on_set_theme))
+            .on_action(cx.listener(Self::on_save_layout))
+            .on_action(cx.listener(Self::on_apply_layout))
+            .on_action(cx.listener(Self::on_delete_layout))
+            .on_action(cx.listener(Self::on_manage_layouts))
+            .on_action(cx.listener(Self::on_focus_symbol))
+            .on_action(cx.listener(Self::on_add_watchlist_symbol))
+            .on_action(cx.listener(Self::on_remove_watchlist_symbol))
+            .on_action(cx.listener(Self::on_open_symbol_picker))
+            .on_action(cx.listener(Self::on_open_indicator_picker))
+            .on_action(cx.listener(Self::on_open_indicator_settings))
+            .on_action(cx.listener(Self::on_toggle_floating_code_editor))
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(bg)
+            .text_color(fg)
+            .child(self.top_bar.clone())
+            .child(
+                // Relative wrapper so the dock's drag indicators + the
+                // floating overlays (Code Editor, Indicator Settings) can
+                // absolute-position themselves against the dock viewport.
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(self.dock_area.clone())
+                    .children(
+                        self.floating_code_editor
+                            .as_ref()
+                            .map(|slot| slot.window.clone()),
+                    )
+                    .children(
+                        self.indicator_settings
+                            .as_ref()
+                            .map(|slot| slot.window.clone()),
+                    ),
+            )
+            .child(self.bottom_bar.clone())
+            .child(self.symbol_picker.clone())
+            .child(self.indicator_picker.clone())
+            .children(sheet_layer)
+            .children(dialog_layer)
+            .children(notification_layer)
+    }
+}
+
+fn apply_default_layout(
+    weak_dock: gpui::WeakEntity<DockArea>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(dock_area) = weak_dock.upgrade() else {
+        return;
+    };
+    let item = build_default_layout(&weak_dock, window, cx);
+    dock_area.update(cx, |dock, cx| {
+        dock.set_center(item, window, cx);
+    });
+    let _ = window;
+}
+
+fn build_default_layout(
+    dock_area: &gpui::WeakEntity<DockArea>,
+    window: &mut Window,
+    cx: &mut App,
+) -> DockItem {
+    // Watchlist (left, ~240px) | Chart (right, fills).
+    //
+    // Two panels by default because gpui-component's TabPanel reports
+    // `draggable: false` when a dock has only one panel (`is_last_panel`
+    // check in tab_panel.rs). A single-panel default boots into an
+    // un-draggable state, so the user can't reach the whole-window-edge
+    // docking zones to add a second panel via drag. Bump LAYOUT_VERSION
+    // if you change the shape so persisted single-panel layouts get reset.
+    let watchlist = build(Kind::Watchlist, window, cx);
+    let chart = build(Kind::Chart, window, cx);
+    DockItem::split_with_sizes(
+        gpui::Axis::Horizontal,
+        vec![
+            DockItem::tabs(vec![watchlist], dock_area, window, cx),
+            DockItem::tabs(vec![chart], dock_area, window, cx),
+        ],
+        vec![Some(gpui::px(240.)), None],
+        dock_area,
+        window,
+        cx,
+    )
+}
+
+fn build(kind: Kind, window: &mut Window, cx: &mut App) -> Arc<dyn PanelView> {
+    panels::build_kind(kind, window, cx)
+}
+
+fn find_first_chart(item: &DockItem, cx: &App) -> Option<Entity<ContentPanel>> {
+    match item {
+        DockItem::Split { items, .. } => items.iter().find_map(|child| find_first_chart(child, cx)),
+        DockItem::Tabs { items, .. } => items.iter().find_map(|panel| chart_from(panel, cx)),
+        DockItem::Panel { view, .. } => chart_from(view, cx),
+        DockItem::Tiles { .. } => None,
+    }
+}
+
+fn chart_from(panel: &Arc<dyn PanelView>, cx: &App) -> Option<Entity<ContentPanel>> {
+    let entity = panel.view().downcast::<ContentPanel>().ok()?;
+    if entity.read(cx).kind() == Kind::Chart {
+        Some(entity)
+    } else {
+        None
+    }
+}
+
+fn notify_info(window: &mut Window, cx: &mut App, title: &str, body: &str) {
+    use gpui_component::{notification::Notification, WindowExt as _};
+    window.push_notification(
+        Notification::info(SharedString::from(body.to_string()))
+            .title(SharedString::from(title.to_string())),
+        cx,
+    );
+}

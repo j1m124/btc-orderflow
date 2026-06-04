@@ -1,0 +1,43 @@
+[package]
+name = "btc_orderflow"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+chrono = { version = "0.4", features = ["wasmbind"] }
+chrono-tz = "0.10"
+futures = "0.3"
+# `json` enables `Response::json::<T>()`. `stream` enables `Response::bytes_stream()`
+# for SSE in the AI chat path. On wasm, reqwest transparently routes through
+# the browser's fetch() — `rustls-tls` is a no-op there but we keep it for
+# consistency with the feature set.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# wasm-only deps. The crate only targets wasm32-unknown-unknown; the host
+# compile path was removed when we dropped the native binary.
+console_error_panic_hook = "0.1"
+console_log = "1.0"
+tracing-wasm = "0.2"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Storage", "Location"] }
+# Futures-style wrapper over `web_sys::WebSocket`; no executor question
+# because the browser drives the socket.
+ws_stream_wasm = "0.7"
+
+[dev-dependencies]
+# Tests compile to wasm; the runner config in `.cargo/config.toml` points
+# at `wasm-bindgen-test-runner` so plain `cargo test` works.
+wasm-bindgen-test = "0.3"
