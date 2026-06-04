@@ -26,7 +26,7 @@ use tokio::sync::RwLock;
 use crate::binance::{
     AGGTRADES_PAGE_LIMIT, BroadcastTxs, KLINES_PAGE_LIMIT,
     book::Book,
-    parse::{DepthDiff, KlineRow, Tick, TradeRow, TradeTick},
+    parse::{KlineRow, Tick, TradeRow, TradeTick},
     rest::RestClient,
     ws,
 };

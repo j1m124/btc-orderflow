@@ -6,7 +6,7 @@
 //! ergonomics outweighs the lost safety net (Q14a-3 review).
 
 use anyhow::Result;
-use protocol::Candle;
+use protocol::{BookLevel, BookSnapshotEntry, Candle, FootprintCell, Timeframe, Trade};
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::{PgPool, QueryBuilder, Row};
 use tracing::info;
@@ -162,6 +162,198 @@ pub async fn max_trade_ts(pool: &PgPool, symbol: &str) -> Result<Option<DateTime
     Ok(row.try_get("t")?)
 }
 
+/// Read the most recent `limit` trades for `symbol`, chronological (oldest
+/// first). Used by the trades-channel forwarder for the initial snapshot.
+pub async fn fetch_trades_snapshot(
+    pool: &PgPool,
+    symbol: &str,
+    limit: i64,
+) -> Result<Vec<Trade>> {
+    let rows = sqlx::query(
+        "SELECT ts, agg_id, price, qty, is_buyer_maker \
+         FROM trades \
+         WHERE symbol = $1 \
+         ORDER BY ts DESC, agg_id DESC \
+         LIMIT $2",
+    )
+    .bind(symbol)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut trades = build_trades(rows)?;
+    trades.reverse();
+    Ok(trades)
+}
+
+/// Read up to `count` trades strictly older than `before_ms`, chronological.
+pub async fn fetch_trades_history_page(
+    pool: &PgPool,
+    symbol: &str,
+    before_ms: i64,
+    count: i64,
+) -> Result<Vec<Trade>> {
+    let before = Utc.timestamp_millis_opt(before_ms).single().unwrap_or_else(|| {
+        Utc.timestamp_opt(0, 0).unwrap()
+    });
+
+    let rows = sqlx::query(
+        "SELECT ts, agg_id, price, qty, is_buyer_maker \
+         FROM trades \
+         WHERE symbol = $1 AND ts < $2 \
+         ORDER BY ts DESC, agg_id DESC \
+         LIMIT $3",
+    )
+    .bind(symbol)
+    .bind(before)
+    .bind(count)
+    .fetch_all(pool)
+    .await?;
+
+    let mut trades = build_trades(rows)?;
+    trades.reverse();
+    Ok(trades)
+}
+
+fn build_trades(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Trade>> {
+    rows.into_iter()
+        .map(|r| -> Result<Trade> {
+            let ts: DateTime<Utc> = r.try_get("ts")?;
+            Ok(Trade {
+                ts_ms: ts.timestamp_millis(),
+                agg_id: r.try_get("agg_id")?,
+                price: r.try_get("price")?,
+                qty: r.try_get("qty")?,
+                is_buyer_maker: r.try_get("is_buyer_maker")?,
+            })
+        })
+        .collect()
+}
+
+// --- footprint (computed on read from `trades`) ----------------------------
+
+/// Pick the time_bucket interval literal for any TF (sub-second OR native).
+/// Footprint subscriptions are valid for any TF that the client can chart —
+/// the cells aggregate the same `trades` table regardless of bar length.
+fn footprint_bucket_interval(tf: Timeframe) -> &'static str {
+    match tf {
+        Timeframe::S1 => "1 second",
+        Timeframe::S5 => "5 seconds",
+        Timeframe::M1 => "1 minute",
+        Timeframe::M5 => "5 minutes",
+        Timeframe::M15 => "15 minutes",
+        Timeframe::M30 => "30 minutes",
+        Timeframe::H1 => "1 hour",
+        Timeframe::H2 => "2 hours",
+        Timeframe::H4 => "4 hours",
+        Timeframe::H6 => "6 hours",
+        Timeframe::D1 => "1 day",
+    }
+}
+
+/// Footprint cells for the most recent `bars` bars at `(tf, price_bucket)`.
+/// Returned chronological (oldest bar first, within each bar buckets are
+/// ordered ascending by price).
+pub async fn fetch_footprint_snapshot(
+    pool: &PgPool,
+    symbol: &str,
+    tf: Timeframe,
+    price_bucket: f64,
+    bars: i64,
+) -> Result<Vec<FootprintCell>> {
+    let interval = footprint_bucket_interval(tf);
+    let sql = format!(
+        "WITH recent_bars AS ( \
+            SELECT DISTINCT time_bucket(INTERVAL '{interval}', ts) AS bar \
+            FROM trades WHERE symbol = $1 \
+            ORDER BY bar DESC LIMIT $2 \
+        ) \
+        SELECT \
+            rb.bar AS open_time, \
+            floor(t.price / $3) * $3 AS price_bucket_low, \
+            coalesce(sum(t.qty) FILTER (WHERE t.is_buyer_maker), 0.0) AS bid_vol, \
+            coalesce(sum(t.qty) FILTER (WHERE NOT t.is_buyer_maker), 0.0) AS ask_vol \
+        FROM trades t \
+        JOIN recent_bars rb \
+          ON time_bucket(INTERVAL '{interval}', t.ts) = rb.bar \
+        WHERE t.symbol = $1 \
+        GROUP BY rb.bar, price_bucket_low \
+        ORDER BY rb.bar ASC, price_bucket_low ASC",
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(bars)
+        .bind(price_bucket)
+        .fetch_all(pool)
+        .await?;
+
+    build_footprint(rows)
+}
+
+/// Footprint cells for `bars` bars strictly older than `before_open_time_ms`,
+/// chronological. Pagination cursor is the open_time of the oldest bar the
+/// client already has.
+pub async fn fetch_footprint_history_page(
+    pool: &PgPool,
+    symbol: &str,
+    tf: Timeframe,
+    price_bucket: f64,
+    before_open_time_ms: i64,
+    bars: i64,
+) -> Result<Vec<FootprintCell>> {
+    let interval = footprint_bucket_interval(tf);
+    let before = Utc
+        .timestamp_millis_opt(before_open_time_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
+    let sql = format!(
+        "WITH recent_bars AS ( \
+            SELECT DISTINCT time_bucket(INTERVAL '{interval}', ts) AS bar \
+            FROM trades \
+            WHERE symbol = $1 \
+              AND time_bucket(INTERVAL '{interval}', ts) < $2 \
+            ORDER BY bar DESC LIMIT $3 \
+        ) \
+        SELECT \
+            rb.bar AS open_time, \
+            floor(t.price / $4) * $4 AS price_bucket_low, \
+            coalesce(sum(t.qty) FILTER (WHERE t.is_buyer_maker), 0.0) AS bid_vol, \
+            coalesce(sum(t.qty) FILTER (WHERE NOT t.is_buyer_maker), 0.0) AS ask_vol \
+        FROM trades t \
+        JOIN recent_bars rb \
+          ON time_bucket(INTERVAL '{interval}', t.ts) = rb.bar \
+        WHERE t.symbol = $1 \
+        GROUP BY rb.bar, price_bucket_low \
+        ORDER BY rb.bar ASC, price_bucket_low ASC",
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(before)
+        .bind(bars)
+        .bind(price_bucket)
+        .fetch_all(pool)
+        .await?;
+
+    build_footprint(rows)
+}
+
+fn build_footprint(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<FootprintCell>> {
+    rows.into_iter()
+        .map(|r| -> Result<FootprintCell> {
+            let open_time: DateTime<Utc> = r.try_get("open_time")?;
+            Ok(FootprintCell {
+                open_time: open_time.timestamp_millis(),
+                price_bucket_low: r.try_get("price_bucket_low")?,
+                bid_vol: r.try_get("bid_vol")?,
+                ask_vol: r.try_get("ask_vol")?,
+            })
+        })
+        .collect()
+}
+
 // --- book_snapshots --------------------------------------------------------
 
 /// Insert one top-N book snapshot row. `bids` and `asks` are best-first;
@@ -195,6 +387,58 @@ pub async fn upsert_book_snapshot(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Read up to `count` historical book snapshots for `symbol` strictly older
+/// than `before_ms`, chronological. Feeds the heatmap's history-page scroll.
+pub async fn fetch_book_history_page(
+    pool: &PgPool,
+    symbol: &str,
+    before_ms: i64,
+    count: i64,
+) -> Result<Vec<BookSnapshotEntry>> {
+    let before = Utc.timestamp_millis_opt(before_ms).single().unwrap_or_else(|| {
+        Utc.timestamp_opt(0, 0).unwrap()
+    });
+
+    let rows = sqlx::query(
+        "SELECT ts, bid_prices, bid_sizes, ask_prices, ask_sizes \
+         FROM book_snapshots \
+         WHERE symbol = $1 AND ts < $2 \
+         ORDER BY ts DESC \
+         LIMIT $3",
+    )
+    .bind(symbol)
+    .bind(before)
+    .bind(count)
+    .fetch_all(pool)
+    .await?;
+
+    let mut entries: Vec<BookSnapshotEntry> = rows
+        .into_iter()
+        .map(|r| -> Result<BookSnapshotEntry> {
+            let ts: DateTime<Utc> = r.try_get("ts")?;
+            let bid_prices: Vec<f64> = r.try_get("bid_prices")?;
+            let bid_sizes: Vec<f64> = r.try_get("bid_sizes")?;
+            let ask_prices: Vec<f64> = r.try_get("ask_prices")?;
+            let ask_sizes: Vec<f64> = r.try_get("ask_sizes")?;
+            Ok(BookSnapshotEntry {
+                ts_ms: ts.timestamp_millis(),
+                bids: zip_levels(&bid_prices, &bid_sizes),
+                asks: zip_levels(&ask_prices, &ask_sizes),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.reverse();
+    Ok(entries)
+}
+
+fn zip_levels(prices: &[f64], sizes: &[f64]) -> Vec<BookLevel> {
+    prices
+        .iter()
+        .zip(sizes.iter())
+        .map(|(p, s)| BookLevel { price: *p, size: *s })
+        .collect()
 }
 
 /// UPSERT a batch of trades. ON CONFLICT DO NOTHING because aggTrades are

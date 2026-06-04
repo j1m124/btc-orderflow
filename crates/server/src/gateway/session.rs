@@ -2,13 +2,23 @@
 //!
 //! Each accepted connection runs one [`run`] task. That task:
 //!   - decodes inbound [`ClientFrame`]s from the read half
-//!   - on `Subscribe`, spawns a forwarder task that owns:
-//!       * a [`broadcast::Receiver<Tick>`] subscribed BEFORE the snapshot
-//!         query runs (Q5b ordering — no live tick can slip through the gap)
-//!       * a snapshot query
-//!       * a tick-forwarding loop with dedupe against the snapshot tail
+//!   - on `Subscribe`, dispatches per-[`Channel`] kind to a forwarder task:
+//!       * Candles: snapshot (native or sub-sec synthesized) + live kline
+//!         ticks from the kline broadcast (sub-sec aggregator emits there
+//!         too, so S1/S5 live ticks ride the same path).
+//!       * Trades: snapshot from `trades` + live `TradeTick` batches
+//!         (server-batched at 100ms) from the trade broadcast.
+//!       * Footprint: snapshot from `trades` via `time_bucket` aggregation +
+//!         per-subscription rolling cell state from the trade broadcast,
+//!         emitted as `FootprintUpdate` every 100ms.
+//!       * Book: snapshot of top-N from the shared in-memory book +
+//!         relayed `BookDelta` frames from the depth broadcast (server-
+//!         batched at 100ms).
+//!     Each forwarder subscribes to its broadcast BEFORE running its
+//!     snapshot query (Q5b ordering — no live event can slip the gap).
 //!   - on `Unsubscribe`, aborts the forwarder
-//!   - on `HistoryPage`, spawns a one-shot DB query
+//!   - on `HistoryPage`, spawns a one-shot DB query dispatched by the
+//!     stored channel kind
 //!   - on `Ping`, replies with `Pong`
 //!
 //! All outbound frames travel through one `mpsc::Sender<Message>` that a
@@ -17,11 +27,11 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use protocol::{
-    Candle, Channel, ClientFrame, ServerFrame, SubId, Timeframe,
+    BookLevel, Candle, Channel, ClientFrame, FootprintCell, ServerFrame, SubId, Timeframe, Trade,
 };
 use futures::{SinkExt, StreamExt};
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 use tokio::{
     sync::{broadcast, mpsc},
     task::AbortHandle,
@@ -29,18 +39,37 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::GatewayState;
-use crate::binance::parse::{KlineRow, Tick};
+use crate::binance::parse::{DepthDiff, KlineRow, Tick, TradeTick};
+use crate::ingest::BookState;
 use crate::db;
 
 const SUPPORTED_SYMBOL: &str = "BTCUSDT";
 const SNAPSHOT_LIMIT: i64 = 500;
 
+/// Number of recent trades sent in a trade-channel snapshot.
+const TRADE_SNAPSHOT_LIMIT: i64 = 500;
+
+/// Number of recent bars (×all their price buckets) in a footprint snapshot.
+const FOOTPRINT_SNAPSHOT_BARS: i64 = 100;
+
+/// Server-side batching window for live trade / book / footprint frames.
+const LIVE_BATCH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Per-subscription bookkeeping held by the session for routing
-/// `Unsubscribe` and `HistoryPage` ops.
+/// `Unsubscribe` and `HistoryPage` ops. `channel` carries the per-kind
+/// parameters the HistoryPage handler needs to issue the right query.
 struct SubMeta {
     symbol: String,
-    tf: Timeframe,
+    channel: SubChannel,
     abort: AbortHandle,
+}
+
+#[derive(Clone, Copy)]
+enum SubChannel {
+    Candles { tf: Timeframe },
+    Trades,
+    Footprint { tf: Timeframe, price_bucket: f64 },
+    Book { depth: u16 },
 }
 
 impl Drop for SubMeta {
@@ -126,54 +155,106 @@ async fn handle_text(
                 .await;
                 return;
             }
-            let tf = match channel {
-                Channel::Candles { tf, .. } => tf,
-                // Trades / Footprint / Book land their own per-channel
-                // forwarders in a follow-up commit; reject here so the
-                // wire is honest about what's wired today.
-                Channel::Trades | Channel::Footprint { .. } | Channel::Book { .. } => {
-                    send_error(
-                        write_tx,
-                        Some(id),
-                        "unsupported_channel",
-                        "channel not yet wired on the server",
-                    )
-                    .await;
-                    return;
-                }
-            };
 
             // Drop any existing sub with the same id; reuse is allowed and
             // matches the client's reconnect path (Q12c).
             subs.remove(&id);
 
-            let rx = state.broadcast_tx.subscribe();
-            let pool = state.pool.clone();
-            let write_tx_clone = write_tx.clone();
-            let symbol_clone = symbol.clone();
-            let handle = tokio::spawn(async move {
-                if let Err(e) =
-                    run_subscription(id, symbol_clone, tf, rx, pool, write_tx_clone.clone()).await
-                {
-                    warn!(?id, error = ?e, "subscription forwarder exited with error");
-                    let frame = ServerFrame::Error {
-                        id: Some(id),
-                        code: "subscription_error".into(),
-                        msg: format!("{e:#}"),
-                    };
-                    send_frame(&write_tx_clone, &frame).await;
+            // Each branch:
+            //   1. Subscribes to the relevant broadcast FIRST (Q5b ordering).
+            //   2. Spawns the forwarder task.
+            //   3. Records the channel-typed cursor info on the SubMeta so
+            //      HistoryPage can route to the right query.
+            let (sub_channel, abort) = match channel {
+                Channel::Candles { tf } => {
+                    let rx = state.broadcast_tx.subscribe();
+                    let h = spawn_forwarder(
+                        id,
+                        write_tx.clone(),
+                        "candles forwarder",
+                        run_candles_subscription(
+                            id,
+                            symbol.clone(),
+                            tf,
+                            rx,
+                            state.pool.clone(),
+                            write_tx.clone(),
+                        ),
+                    );
+                    (SubChannel::Candles { tf }, h)
                 }
-            });
+                Channel::Trades => {
+                    let rx = state.trade_tx.subscribe();
+                    let h = spawn_forwarder(
+                        id,
+                        write_tx.clone(),
+                        "trades forwarder",
+                        run_trades_subscription(
+                            id,
+                            symbol.clone(),
+                            rx,
+                            state.pool.clone(),
+                            write_tx.clone(),
+                        ),
+                    );
+                    (SubChannel::Trades, h)
+                }
+                Channel::Footprint { tf, price_bucket } => {
+                    if !(price_bucket.is_finite() && price_bucket > 0.0) {
+                        send_error(
+                            write_tx,
+                            Some(id),
+                            "invalid_bucket",
+                            "price_bucket must be > 0 and finite",
+                        )
+                        .await;
+                        return;
+                    }
+                    let rx = state.trade_tx.subscribe();
+                    let h = spawn_forwarder(
+                        id,
+                        write_tx.clone(),
+                        "footprint forwarder",
+                        run_footprint_subscription(
+                            id,
+                            symbol.clone(),
+                            tf,
+                            price_bucket,
+                            rx,
+                            state.pool.clone(),
+                            write_tx.clone(),
+                        ),
+                    );
+                    (SubChannel::Footprint { tf, price_bucket }, h)
+                }
+                Channel::Book { depth } => {
+                    let rx = state.depth_tx.subscribe();
+                    let h = spawn_forwarder(
+                        id,
+                        write_tx.clone(),
+                        "book forwarder",
+                        run_book_subscription(
+                            id,
+                            symbol.clone(),
+                            depth,
+                            rx,
+                            state.book_state.clone(),
+                            write_tx.clone(),
+                        ),
+                    );
+                    (SubChannel::Book { depth }, h)
+                }
+            };
 
             subs.insert(
                 id,
                 SubMeta {
                     symbol,
-                    tf,
-                    abort: handle.abort_handle(),
+                    channel: sub_channel,
+                    abort,
                 },
             );
-            debug!(?id, tf = tf.as_str(), "subscription registered");
+            debug!(?id, "subscription registered");
         }
 
         ClientFrame::Unsubscribe { id } => {
@@ -198,27 +279,17 @@ async fn handle_text(
                 return;
             };
             let symbol = meta.symbol.clone();
-            let tf = meta.tf;
+            let channel = meta.channel;
             let pool = state.pool.clone();
             let write_tx = write_tx.clone();
             tokio::spawn(async move {
-                match db::fetch_history_page(&pool, &symbol, tf.as_str(), before_ms, count as i64)
-                    .await
+                if let Err(e) =
+                    history_page(id, symbol, channel, before_ms, count as i64, pool, &write_tx)
+                        .await
                 {
-                    Ok(candles) => {
-                        let frame = ServerFrame::HistoryPage { id, candles };
-                        send_frame(&write_tx, &frame).await;
-                    }
-                    Err(e) => {
-                        warn!(?id, error = ?e, "history_page query failed");
-                        send_error(
-                            &write_tx,
-                            Some(id),
-                            "history_page_error",
-                            &format!("{e:#}"),
-                        )
+                    warn!(?id, error = ?e, "history_page query failed");
+                    send_error(&write_tx, Some(id), "history_page_error", &format!("{e:#}"))
                         .await;
-                    }
                 }
             });
         }
@@ -229,9 +300,85 @@ async fn handle_text(
     }
 }
 
-/// Snapshot + live-tick forwarder for one subscription. Lives until the
-/// session aborts the handle or the broadcast channel closes.
-async fn run_subscription(
+/// Spawn a forwarder future, wrap errors into an `Error` frame to the client.
+fn spawn_forwarder<F>(
+    id: SubId,
+    write_tx: mpsc::Sender<Message>,
+    name: &'static str,
+    fut: F,
+) -> AbortHandle
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let handle = tokio::spawn(async move {
+        if let Err(e) = fut.await {
+            warn!(?id, %name, error = ?e, "forwarder exited with error");
+            send_frame(
+                &write_tx,
+                &ServerFrame::Error {
+                    id: Some(id),
+                    code: "subscription_error".into(),
+                    msg: format!("{e:#}"),
+                },
+            )
+            .await;
+        }
+    });
+    handle.abort_handle()
+}
+
+// --- HistoryPage dispatch --------------------------------------------------
+
+async fn history_page(
+    id: SubId,
+    symbol: String,
+    channel: SubChannel,
+    before_ms: i64,
+    count: i64,
+    pool: PgPool,
+    write_tx: &mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    match channel {
+        SubChannel::Candles { tf } => {
+            let candles = if tf.is_native_kline() {
+                db::fetch_history_page(&pool, &symbol, tf.as_str(), before_ms, count).await?
+            } else {
+                db::fetch_subsec_history_page(&pool, &symbol, tf, before_ms, count).await?
+            };
+            send_frame(write_tx, &ServerFrame::HistoryPage { id, candles }).await;
+        }
+        SubChannel::Trades => {
+            let trades = db::fetch_trades_history_page(&pool, &symbol, before_ms, count).await?;
+            send_frame(write_tx, &ServerFrame::TradeHistoryPage { id, trades }).await;
+        }
+        SubChannel::Footprint { tf, price_bucket } => {
+            let cells = db::fetch_footprint_history_page(
+                &pool,
+                &symbol,
+                tf,
+                price_bucket,
+                before_ms,
+                count,
+            )
+            .await?;
+            send_frame(write_tx, &ServerFrame::FootprintHistoryPage { id, cells }).await;
+        }
+        SubChannel::Book { .. } => {
+            let snapshots = db::fetch_book_history_page(&pool, &symbol, before_ms, count).await?;
+            send_frame(write_tx, &ServerFrame::BookHistoryPage { id, snapshots }).await;
+        }
+    }
+    Ok(())
+}
+
+// --- Candles forwarder -----------------------------------------------------
+
+/// Snapshot + live-tick forwarder for one candles subscription. Lives until
+/// the session aborts the handle or the broadcast channel closes. Handles
+/// both native TFs (snapshot from `candles` table) and S1/S5 (snapshot
+/// synthesized from `trades`); live ticks ride the same kline broadcast in
+/// both cases — the sub-sec aggregator emits there alongside Binance klines.
+async fn run_candles_subscription(
     id: SubId,
     symbol: String,
     tf: Timeframe,
@@ -239,18 +386,18 @@ async fn run_subscription(
     pool: PgPool,
     write_tx: mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
-    // Q5b: we already subscribed to the broadcast (by the time this fn runs,
-    // `rx` exists); now we run the snapshot query. Any live tick that
-    // arrives between here and the start of the forwarding loop is buffered
-    // in `rx`.
-    let snapshot = db::fetch_snapshot(&pool, &symbol, tf.as_str(), SNAPSHOT_LIMIT).await?;
+    let snapshot = if tf.is_native_kline() {
+        db::fetch_snapshot(&pool, &symbol, tf.as_str(), SNAPSHOT_LIMIT).await?
+    } else {
+        db::fetch_subsec_snapshot(&pool, &symbol, tf, SNAPSHOT_LIMIT).await?
+    };
     let dedupe_threshold = snapshot.last().map(|c| c.open_time);
 
     debug!(
         ?id,
         tf = tf.as_str(),
         bars = snapshot.len(),
-        "sending snapshot"
+        "sending candles snapshot"
     );
     let mut server_v: u64 = 0;
     send_frame(
@@ -287,28 +434,380 @@ async fn run_subscription(
                     v: server_v,
                 };
                 if write_tx.send(message_from_frame(&frame)).await.is_err() {
-                    // Session writer dropped — session is shutting down.
                     return Ok(());
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!(
-                    ?id,
-                    skipped = n,
-                    "subscription lagged broadcast; sending resnap"
-                );
+                warn!(?id, skipped = n, "candles sub lagged; sending resnap");
                 send_frame(&write_tx, &ServerFrame::Resnap { id }).await;
-                // For v1 we don't auto-resnap here — the client is expected
-                // to send a fresh Subscribe with the same id (Q12c/Q12e).
                 return Ok(());
             }
             Err(broadcast::error::RecvError::Closed) => {
-                info!(?id, "broadcast closed; subscription exiting");
+                info!(?id, "broadcast closed; candles sub exiting");
                 return Ok(());
             }
         }
     }
 }
+
+// --- Trades forwarder ------------------------------------------------------
+
+/// Trade-channel forwarder. Snapshot is the most recent 500 trades; live
+/// trades are batched into 100ms windows on the wire to keep the WS frame
+/// rate to ~10 Hz/subscription regardless of underlying trade arrival rate.
+async fn run_trades_subscription(
+    id: SubId,
+    symbol: String,
+    mut rx: broadcast::Receiver<TradeTick>,
+    pool: PgPool,
+    write_tx: mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    let snapshot = db::fetch_trades_snapshot(&pool, &symbol, TRADE_SNAPSHOT_LIMIT).await?;
+    let dedupe_threshold = snapshot.last().map(|t| t.agg_id);
+
+    debug!(
+        ?id,
+        trades = snapshot.len(),
+        "sending trades snapshot"
+    );
+    let mut server_v: u64 = 0;
+    send_frame(
+        &write_tx,
+        &ServerFrame::TradeSnapshot {
+            id,
+            trades: snapshot,
+            server_v,
+        },
+    )
+    .await;
+
+    let mut buffer: Vec<Trade> = Vec::with_capacity(256);
+    let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
+    batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    batch_timer.tick().await; // burn immediate tick
+
+    loop {
+        tokio::select! {
+            biased;
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        if tick.symbol != symbol {
+                            continue;
+                        }
+                        // Dedupe against snapshot tail. The snapshot is the
+                        // most-recent N trades; any live agg_id < snapshot.last
+                        // is already covered.
+                        if let Some(thr) = dedupe_threshold {
+                            if tick.trade.agg_id <= thr {
+                                continue;
+                            }
+                        }
+                        buffer.push(Trade {
+                            ts_ms: tick.trade.ts.timestamp_millis(),
+                            agg_id: tick.trade.agg_id,
+                            price: tick.trade.price,
+                            qty: tick.trade.qty,
+                            is_buyer_maker: tick.trade.is_buyer_maker,
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(?id, skipped = n, "trades sub lagged; sending resnap");
+                        send_frame(&write_tx, &ServerFrame::Resnap { id }).await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!(?id, "trade broadcast closed; trades sub exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            _ = batch_timer.tick() => {
+                if buffer.is_empty() {
+                    continue;
+                }
+                server_v += 1;
+                let trades = std::mem::take(&mut buffer);
+                let frame = ServerFrame::TradeTick {
+                    id,
+                    trades,
+                    v: server_v,
+                };
+                if write_tx.send(message_from_frame(&frame)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+// --- Book forwarder --------------------------------------------------------
+
+/// Book-channel forwarder. Snapshot reads top-N from the shared in-memory
+/// book; live diffs from Binance are relayed (filtered to the subscription's
+/// depth) as `BookDelta` frames, batched at 100ms.
+///
+/// Diff levels outside top-N are filtered out before emission. The set of
+/// "top-N prices" is recomputed from the shared book each batch — the live
+/// book moves around enough that pre-computing once would drift.
+async fn run_book_subscription(
+    id: SubId,
+    symbol: String,
+    depth: u16,
+    mut rx: broadcast::Receiver<DepthDiff>,
+    book_state: BookState,
+    write_tx: mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    // Wait briefly for the maintainer to install a snapshot. On a fresh
+    // boot the book is empty; sending an empty BookSnapshot is legal but
+    // visually unhelpful, so a short bounded wait lets the client see a
+    // non-empty book the moment the maintainer finishes bootstrap.
+    let depth = depth as usize;
+    let mut wait_attempts = 0;
+    let (bids, asks) = loop {
+        {
+            let book = book_state.inner.read().await;
+            if book.is_initialized() {
+                break book.top_n(depth);
+            }
+        }
+        if wait_attempts >= 20 {
+            // ~2s budget; send empty if maintainer is still bootstrapping.
+            break (Vec::new(), Vec::new());
+        }
+        wait_attempts += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let mut server_v: u64 = 0;
+    send_frame(
+        &write_tx,
+        &ServerFrame::BookSnapshot {
+            id,
+            bids: bids.into_iter().map(level_from_pair).collect(),
+            asks: asks.into_iter().map(level_from_pair).collect(),
+            server_v,
+        },
+    )
+    .await;
+
+    let mut bid_buffer: Vec<BookLevel> = Vec::new();
+    let mut ask_buffer: Vec<BookLevel> = Vec::new();
+    let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
+    batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    batch_timer.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            msg = rx.recv() => {
+                match msg {
+                    Ok(diff) => {
+                        if diff.symbol != symbol {
+                            continue;
+                        }
+                        for (price, size) in diff.bids {
+                            bid_buffer.push(BookLevel { price, size });
+                        }
+                        for (price, size) in diff.asks {
+                            ask_buffer.push(BookLevel { price, size });
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(?id, skipped = n, "book sub lagged; sending resnap");
+                        send_frame(&write_tx, &ServerFrame::Resnap { id }).await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!(?id, "depth broadcast closed; book sub exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            _ = batch_timer.tick() => {
+                if bid_buffer.is_empty() && ask_buffer.is_empty() {
+                    continue;
+                }
+                // Filter to current top-N prices each side.
+                let (top_bid_price, top_ask_price) = {
+                    let book = book_state.inner.read().await;
+                    let (bids, asks) = book.top_n(depth);
+                    let bottom_bid = bids.last().map(|(p, _)| *p);
+                    let top_ask = asks.last().map(|(p, _)| *p);
+                    (bottom_bid, top_ask)
+                };
+                if let Some(min_bid) = top_bid_price {
+                    bid_buffer.retain(|l| l.price >= min_bid);
+                }
+                if let Some(max_ask) = top_ask_price {
+                    ask_buffer.retain(|l| l.price <= max_ask);
+                }
+                if bid_buffer.is_empty() && ask_buffer.is_empty() {
+                    continue;
+                }
+                server_v += 1;
+                let bids = std::mem::take(&mut bid_buffer);
+                let asks = std::mem::take(&mut ask_buffer);
+                let frame = ServerFrame::BookDelta {
+                    id,
+                    bids,
+                    asks,
+                    v: server_v,
+                };
+                if write_tx.send(message_from_frame(&frame)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn level_from_pair(p: (f64, f64)) -> BookLevel {
+    BookLevel { price: p.0, size: p.1 }
+}
+
+// --- Footprint forwarder ---------------------------------------------------
+
+/// Footprint-channel forwarder. Snapshot bucketed via `time_bucket` over
+/// the trades table. Live updates: server holds per-bar rolling cell state,
+/// folds incoming aggTrades into it, and emits a `FootprintUpdate` frame
+/// every 100ms containing only cells touched in that window — the client
+/// overwrites by `(open_time, price_bucket_low)` so partial updates compose.
+///
+/// On bar rollover we emit a final FootprintUpdate for the closing bar
+/// before resetting state.
+async fn run_footprint_subscription(
+    id: SubId,
+    symbol: String,
+    tf: Timeframe,
+    price_bucket: f64,
+    mut rx: broadcast::Receiver<TradeTick>,
+    pool: PgPool,
+    write_tx: mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    let snapshot =
+        db::fetch_footprint_snapshot(&pool, &symbol, tf, price_bucket, FOOTPRINT_SNAPSHOT_BARS)
+            .await?;
+    let snapshot_tail_open_time = snapshot.iter().map(|c| c.open_time).max();
+
+    debug!(
+        ?id,
+        tf = tf.as_str(),
+        bucket = price_bucket,
+        cells = snapshot.len(),
+        "sending footprint snapshot"
+    );
+    let mut server_v: u64 = 0;
+    send_frame(
+        &write_tx,
+        &ServerFrame::FootprintSnapshot {
+            id,
+            cells: snapshot,
+            server_v,
+        },
+    )
+    .await;
+
+    // Per-subscription rolling state: cells touched since the last emit,
+    // keyed by (open_time, bucket_low). Emitted as a batch every 100ms.
+    let mut dirty: HashMap<(i64, i64), (f64, f64)> = HashMap::new();
+    let mut current_bar_open: Option<i64> = snapshot_tail_open_time;
+    let bar_ms = tf.duration_ms();
+    let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
+    batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    batch_timer.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        if tick.symbol != symbol {
+                            continue;
+                        }
+                        let ts_ms = tick.trade.ts.timestamp_millis();
+                        let bar_open = (ts_ms / bar_ms) * bar_ms;
+                        // Skip events already covered by the snapshot —
+                        // anything in a strictly older bar than the tail.
+                        if let Some(tail) = snapshot_tail_open_time {
+                            if bar_open < tail {
+                                continue;
+                            }
+                        }
+                        // On bar rollover, flush the closing bar's dirty
+                        // cells before starting fresh.
+                        match current_bar_open {
+                            Some(prev) if prev != bar_open => {
+                                emit_dirty(
+                                    &write_tx,
+                                    id,
+                                    price_bucket,
+                                    &mut dirty,
+                                    &mut server_v,
+                                ).await;
+                                current_bar_open = Some(bar_open);
+                            }
+                            None => current_bar_open = Some(bar_open),
+                            _ => {}
+                        }
+                        let bucket_idx = (tick.trade.price / price_bucket).floor() as i64;
+                        let entry = dirty
+                            .entry((bar_open, bucket_idx))
+                            .or_insert((0.0, 0.0));
+                        if tick.trade.is_buyer_maker {
+                            entry.0 += tick.trade.qty;
+                        } else {
+                            entry.1 += tick.trade.qty;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(?id, skipped = n, "footprint sub lagged; sending resnap");
+                        send_frame(&write_tx, &ServerFrame::Resnap { id }).await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!(?id, "trade broadcast closed; footprint sub exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            _ = batch_timer.tick() => {
+                emit_dirty(&write_tx, id, price_bucket, &mut dirty, &mut server_v).await;
+            }
+        }
+    }
+}
+
+async fn emit_dirty(
+    write_tx: &mpsc::Sender<Message>,
+    id: SubId,
+    price_bucket: f64,
+    dirty: &mut HashMap<(i64, i64), (f64, f64)>,
+    server_v: &mut u64,
+) {
+    if dirty.is_empty() {
+        return;
+    }
+    let cells: Vec<FootprintCell> = dirty
+        .drain()
+        .map(|((open_time, bucket_idx), (bid_vol, ask_vol))| FootprintCell {
+            open_time,
+            price_bucket_low: bucket_idx as f64 * price_bucket,
+            bid_vol,
+            ask_vol,
+        })
+        .collect();
+    *server_v += 1;
+    let frame = ServerFrame::FootprintUpdate {
+        id,
+        cells,
+        v: *server_v,
+    };
+    let _ = write_tx.send(message_from_frame(&frame)).await;
+}
+
+// --- Wire converters / IO helpers ------------------------------------------
 
 fn kline_to_wire(k: &KlineRow) -> Candle {
     Candle {
