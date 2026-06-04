@@ -1,24 +1,24 @@
 //! btc_orderflow_server — entry point.
 //!
-//! Boot sequence (Q10, this commit completes the ingest side):
+//! Boot sequence (Q5/Q10):
 //!   1. env → init tracing
 //!   2. connect TimescaleDB → run migrations
 //!   3. spawn DB writer task (subscribes to broadcast)
 //!   4. spawn Binance ingest task (gap-heal REST → connect WS → broadcast →
 //!      reconnect-with-gap-heal on every drop)
-//!   5. block on Ctrl-C
-//!
-//! The WS gateway listener (axum router on 127.0.0.1:8787) lands in the
-//! next commit.
+//!   5. spawn WS gateway (axum router serving GET /healthz + WS /ws)
+//!   6. block on Ctrl-C
 
 use anyhow::{Context, Result};
 use chrono::Duration as ChronoDuration;
 use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 mod binance;
 mod db;
+mod gateway;
 mod ingest;
 
 /// Hardcoded for v1 (Q14b: BTCUSDT whitelist).
@@ -26,6 +26,9 @@ const SYMBOL: &str = "BTCUSDT";
 
 /// Cold-start backfill window. Matches the DB retention policy (Q9/Q10).
 const COLD_START_DAYS: i64 = 7;
+
+/// Default listen address for the gateway (Q13c).
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8787";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -81,12 +84,28 @@ async fn main() -> Result<()> {
         })
     };
 
-    info!("ingest stack up; waiting for Ctrl-C");
+    let listen_addr: SocketAddr = std::env::var("LISTEN_ADDR")
+        .unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.into())
+        .parse()
+        .context("parse LISTEN_ADDR")?;
+
+    let gateway_state = gateway::GatewayState {
+        pool: pool.clone(),
+        broadcast_tx: tx.clone(),
+    };
+    let gateway_handle = tokio::spawn(async move {
+        if let Err(e) = gateway::serve(listen_addr, gateway_state).await {
+            warn!(error = ?e, "gateway task exited with error");
+        }
+    });
+
+    info!("stack up; waiting for Ctrl-C");
     tokio::signal::ctrl_c()
         .await
         .context("install Ctrl-C handler")?;
 
     info!("shutdown requested");
+    gateway_handle.abort();
     ingest_handle.abort();
     writer.abort();
     Ok(())
