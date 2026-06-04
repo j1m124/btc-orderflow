@@ -20,13 +20,40 @@ use std::{collections::HashMap, time::Duration as StdDuration};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 use crate::binance::{
     AGGTRADES_PAGE_LIMIT, BroadcastTxs, KLINES_PAGE_LIMIT,
-    parse::{KlineRow, Tick, TradeRow, TradeTick},
+    book::Book,
+    parse::{DepthDiff, KlineRow, Tick, TradeRow, TradeTick},
     rest::RestClient,
     ws,
 };
 use crate::db;
+
+/// Shared in-memory orderbook handle. The maintainer owns the write side;
+/// the gateway forwarders read it briefly to populate the initial
+/// `BookSnapshot` frame for new subscribers. Wrapped in an `Arc<RwLock<_>>`
+/// so cloning the handle hands out new readers cheaply.
+#[derive(Clone)]
+pub struct BookState {
+    pub inner: Arc<RwLock<Book>>,
+}
+
+impl BookState {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Book::empty())),
+        }
+    }
+}
+
+impl Default for BookState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Capacity of the Binance-kline broadcast channel. Slow consumers exceeding
 /// this fall behind and recover by either skipping or resubscribing; the
@@ -39,6 +66,12 @@ pub const BROADCAST_CAPACITY: usize = 4096;
 /// consumer needs to either drain or accept a `Lagged` resync. Larger than
 /// the kline channel because tick rate is two orders of magnitude higher.
 pub const TRADE_BROADCAST_CAPACITY: usize = 32_768;
+
+/// Capacity of the depth-diff broadcast channel. ~10 events/sec @ 100ms
+/// cadence; the maintainer is the primary consumer + gateway forwarders.
+/// Sized large enough that maintenance-pause spikes don't push consumers
+/// to `Lagged`.
+pub const DEPTH_BROADCAST_CAPACITY: usize = 4096;
 
 /// Min/max wait between Binance WS reconnect attempts.
 const RECONNECT_MIN: StdDuration = StdDuration::from_secs(1);
@@ -63,6 +96,20 @@ const AGGTRADE_PAGE_DELAY: StdDuration = StdDuration::from_millis(600);
 /// rate; batching 100ms cuts upsert count ~10x without adding noticeable
 /// latency to the snapshot/footprint query path.
 const TRADE_WRITER_FLUSH: StdDuration = StdDuration::from_millis(100);
+
+/// Cadence of `book_snapshots` rows persisted by the book maintainer. 1s
+/// matches the heatmap pixel granularity at typical zooms; smaller would
+/// be over-resolution, larger would lose heatmap detail.
+const BOOK_SNAPSHOT_INTERVAL: StdDuration = StdDuration::from_secs(1);
+
+/// How many levels each side go into the persisted snapshot row. Matches
+/// the `book_snapshots` schema invariant (top 50). The live wire BookDelta
+/// stream is independent and may filter to any client-requested depth.
+const BOOK_SNAPSHOT_DEPTH: usize = 50;
+
+/// Depth-snapshot REST limit. Always request 1000 — gives the maintainer a
+/// robust resync point even if diffs lag at boot.
+const DEPTH_SNAPSHOT_LIMIT: u32 = 1000;
 
 /// Backfill one (symbol, tf) up to "now", picking up where the DB left off
 /// or starting `cold_start` ago for a fresh table. Returns the number of
@@ -496,6 +543,152 @@ fn emit_tick(
         kline,
         is_closed,
     });
+}
+
+// --- Book maintainer --------------------------------------------------------
+
+/// Maintain the live orderbook from the `@depth@100ms` diff stream.
+///
+/// Lifecycle per bootstrap attempt:
+///   1. Subscribe to the depth broadcast and buffer events.
+///   2. REST snapshot from `/fapi/v1/depth?limit=1000`, populate the book.
+///   3. Drain buffered diffs; drop any with `final_update_id <= snapshot.last_update_id`
+///      (already covered by the snapshot).
+///   4. Apply the first diff that overlaps `snapshot.last_update_id + 1`.
+///   5. Apply subsequent diffs in order; on a `pu` mismatch or any other
+///      sync error, mark the book uninitialized and restart from step 2.
+///
+/// A separate 1s timer reads the current top-50 each side and persists it
+/// to `book_snapshots`. No persistence is possible during the (re-)bootstrap
+/// window — the book is empty/transitioning, so the snapshot is meaningless
+/// for replay until initialized.
+pub async fn run_book_maintainer(
+    pool: PgPool,
+    symbol: String,
+    rest: RestClient,
+    txs: BroadcastTxs,
+    book_state: BookState,
+) -> Result<()> {
+    info!(symbol = %symbol, "book maintainer task started");
+
+    loop {
+        // Each iteration is one bootstrap attempt. On hard failure (REST
+        // error, sync gap, etc.) we mark the book uninitialized and loop
+        // to re-bootstrap.
+        if let Err(e) = maintain_one_session(
+            &pool,
+            &symbol,
+            &rest,
+            &txs,
+            &book_state,
+        )
+        .await
+        {
+            warn!(error = ?e, "book maintainer session failed; rebooting");
+            // Mark uninitialized so any reader can see we have nothing.
+            *book_state.inner.write().await = Book::empty();
+            tokio::time::sleep(StdDuration::from_secs(2)).await;
+        }
+    }
+}
+
+async fn maintain_one_session(
+    pool: &PgPool,
+    symbol: &str,
+    rest: &RestClient,
+    txs: &BroadcastTxs,
+    book_state: &BookState,
+) -> Result<()> {
+    // Step 1: open the broadcast subscription FIRST so any diffs that fly
+    // by while we wait on REST land in our buffer.
+    let mut depth_rx = txs.depth.subscribe();
+
+    // Step 2: REST bootstrap.
+    let snapshot = rest
+        .depth_snapshot(symbol, DEPTH_SNAPSHOT_LIMIT)
+        .await
+        .context("REST depth_snapshot")?;
+    info!(
+        symbol,
+        last_update_id = snapshot.last_update_id,
+        bids = snapshot.bids.len(),
+        asks = snapshot.asks.len(),
+        "depth snapshot fetched"
+    );
+
+    {
+        // Install the snapshot. We drop any diffs already covered below.
+        let mut book = book_state.inner.write().await;
+        *book = Book::from_snapshot(snapshot.bids, snapshot.asks, snapshot.last_update_id);
+    }
+    let bootstrap_id = snapshot.last_update_id;
+
+    // Step 3+4: drain buffered diffs, find the first one to apply, then
+    // ride the live stream. Snapshot timer fires in parallel.
+    let mut snapshot_timer = tokio::time::interval(BOOK_SNAPSHOT_INTERVAL);
+    snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // First tick fires immediately; skip it — book may still be settling.
+    snapshot_timer.tick().await;
+
+    let mut found_first = false;
+    loop {
+        tokio::select! {
+            biased;
+            msg = depth_rx.recv() => {
+                match msg {
+                    Ok(diff) => {
+                        if diff.symbol != symbol {
+                            continue;
+                        }
+                        if !found_first {
+                            // Skip events already covered by the snapshot.
+                            if diff.final_update_id <= bootstrap_id {
+                                continue;
+                            }
+                            // The first diff to apply must straddle
+                            // bootstrap_id+1. apply_diff enforces this.
+                            found_first = true;
+                        }
+                        let mut book = book_state.inner.write().await;
+                        if let Err(e) = book.apply_diff(&diff) {
+                            // Drop the lock before returning the Err so the
+                            // outer loop can reset cleanly.
+                            drop(book);
+                            return Err(anyhow::anyhow!("book sync error: {e}"));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "book maintainer lagged depth broadcast; rebooting");
+                        return Err(anyhow::anyhow!("depth broadcast lagged ({n} events)"));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("depth broadcast closed; book maintainer exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            _ = snapshot_timer.tick() => {
+                persist_snapshot(pool, symbol, book_state).await;
+            }
+        }
+    }
+}
+
+/// Read the current top-50 each side and write one `book_snapshots` row.
+async fn persist_snapshot(pool: &PgPool, symbol: &str, book_state: &BookState) {
+    let (bids, asks) = {
+        let book = book_state.inner.read().await;
+        if !book.is_initialized() {
+            return;
+        }
+        book.top_n(BOOK_SNAPSHOT_DEPTH)
+    };
+    if bids.is_empty() && asks.is_empty() {
+        return;
+    }
+    if let Err(e) = db::upsert_book_snapshot(pool, symbol, Utc::now(), &bids, &asks).await {
+        warn!(symbol, error = ?e, "book snapshot upsert failed");
+    }
 }
 
 /// Drain the broadcast channel forever, UPSERTing every **closed** kline

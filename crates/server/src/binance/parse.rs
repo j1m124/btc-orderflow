@@ -94,6 +94,55 @@ pub struct TradeTick {
 pub enum InboundEvent {
     Kline(Tick),
     AggTrade(TradeTick),
+    Depth(DepthDiff),
+}
+
+// --- Depth diff event -------------------------------------------------------
+
+/// One depth-diff event off `<symbol>@depth@100ms`. Carries the Binance
+/// sequence-validation fields (`U`/`u`/`pu`) along with per-side level
+/// changes. `(price, size)` pairs follow Binance convention: `size = 0`
+/// means the level was removed.
+#[derive(Clone, Debug)]
+pub struct DepthDiff {
+    pub symbol: String,
+    pub event_time_ms: i64,
+    pub first_update_id: i64,
+    pub final_update_id: i64,
+    pub prev_final_update_id: i64,
+    pub bids: Vec<(f64, f64)>,
+    pub asks: Vec<(f64, f64)>,
+}
+
+/// Wire shape of the `@depth@100ms` event payload.
+#[derive(Debug, Deserialize)]
+struct DepthDiffEventRaw {
+    #[serde(rename = "e")]
+    event: String,
+    #[serde(rename = "E")]
+    event_time_ms: i64,
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "U")]
+    first_update_id: i64,
+    #[serde(rename = "u")]
+    final_update_id: i64,
+    #[serde(rename = "pu")]
+    prev_final_update_id: i64,
+    #[serde(rename = "b")]
+    bids: Vec<[String; 2]>,
+    #[serde(rename = "a")]
+    asks: Vec<[String; 2]>,
+}
+
+fn decode_level_array(arr: &[String; 2], field: &str) -> Result<(f64, f64)> {
+    let price = arr[0]
+        .parse::<f64>()
+        .with_context(|| format!("{field}.price decode"))?;
+    let size = arr[1]
+        .parse::<f64>()
+        .with_context(|| format!("{field}.size decode"))?;
+    Ok((price, size))
 }
 
 /// One kline as it lands in the `candles` table. All fields are committed
@@ -269,8 +318,34 @@ impl CombinedStreamMsg {
         match event {
             "kline" => Ok(self.parse_kline_event()?.map(InboundEvent::Kline)),
             "aggTrade" => Ok(self.parse_agg_trade_event()?.map(InboundEvent::AggTrade)),
+            "depthUpdate" => Ok(self.parse_depth_event()?.map(InboundEvent::Depth)),
             _ => Ok(None),
         }
+    }
+
+    fn parse_depth_event(&self) -> Result<Option<DepthDiff>> {
+        let raw: DepthDiffEventRaw =
+            serde_json::from_value(self.data.clone()).context("decode depth payload")?;
+        if raw.event != "depthUpdate" {
+            return Ok(None);
+        }
+        let mut bids = Vec::with_capacity(raw.bids.len());
+        for (i, lvl) in raw.bids.iter().enumerate() {
+            bids.push(decode_level_array(lvl, &format!("bids[{i}]"))?);
+        }
+        let mut asks = Vec::with_capacity(raw.asks.len());
+        for (i, lvl) in raw.asks.iter().enumerate() {
+            asks.push(decode_level_array(lvl, &format!("asks[{i}]"))?);
+        }
+        Ok(Some(DepthDiff {
+            symbol: raw.symbol,
+            event_time_ms: raw.event_time_ms,
+            first_update_id: raw.first_update_id,
+            final_update_id: raw.final_update_id,
+            prev_final_update_id: raw.prev_final_update_id,
+            bids,
+            asks,
+        }))
     }
 
     /// Try to parse `self.data` as an aggTrade event.
@@ -452,6 +527,39 @@ mod tests {
         assert_eq!(row.agg_id, 26129);
         assert!((row.price - 16550.50).abs() < 1e-9);
         assert!(!row.is_buyer_maker);
+    }
+
+    #[test]
+    fn parses_a_combined_stream_depth_update() {
+        let raw = serde_json::json!({
+            "stream": "btcusdt@depth@100ms",
+            "data": {
+                "e": "depthUpdate",
+                "E": 1672531200500_i64,
+                "T": 1672531200490_i64,
+                "s": "BTCUSDT",
+                "U": 100,
+                "u": 105,
+                "pu": 99,
+                "b": [["16500.0", "1.5"], ["16499.0", "0.0"]],
+                "a": [["16510.0", "2.5"]]
+            }
+        });
+        let env: CombinedStreamMsg = serde_json::from_value(raw).unwrap();
+        let evt = env.parse_event().unwrap().expect("depth diff decoded");
+        match evt {
+            InboundEvent::Depth(diff) => {
+                assert_eq!(diff.symbol, "BTCUSDT");
+                assert_eq!(diff.first_update_id, 100);
+                assert_eq!(diff.final_update_id, 105);
+                assert_eq!(diff.prev_final_update_id, 99);
+                assert_eq!(diff.bids.len(), 2);
+                assert_eq!(diff.bids[0], (16500.0, 1.5));
+                assert_eq!(diff.bids[1], (16499.0, 0.0));
+                assert_eq!(diff.asks[0], (16510.0, 2.5));
+            }
+            _ => panic!("expected Depth variant"),
+        }
     }
 
     #[test]

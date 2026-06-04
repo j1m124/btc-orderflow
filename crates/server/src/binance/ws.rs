@@ -17,13 +17,13 @@ use super::{
     parse::{CombinedStreamMsg, InboundEvent},
 };
 
-/// Build the combined-stream URL for `(symbol × native-kline TFs) ∪ aggTrade`.
-/// S1/S5 are excluded — Binance USD-M futures doesn't publish `kline_1s` /
-/// `kline_5s`, so those bars are synthesized from the aggTrade stream by the
-/// sub-second aggregator.
+/// Build the combined-stream URL for
+/// `(symbol × native-kline TFs) ∪ aggTrade ∪ depth@100ms`. S1/S5 are excluded
+/// — Binance USD-M futures doesn't publish `kline_1s` / `kline_5s`, so those
+/// bars are synthesized from the aggTrade stream by the sub-second aggregator.
 ///
 /// Output looks like
-/// `wss://fstream.binance.com/stream?streams=btcusdt@kline_1m/.../btcusdt@aggTrade`.
+/// `wss://fstream.binance.com/stream?streams=btcusdt@kline_1m/.../btcusdt@aggTrade/btcusdt@depth@100ms`.
 fn combined_url(symbol: &str) -> String {
     let s = symbol.to_lowercase();
     let mut streams: Vec<String> = Timeframe::ALL
@@ -32,6 +32,7 @@ fn combined_url(symbol: &str) -> String {
         .map(|tf| format!("{s}@kline_{}", tf.as_str()))
         .collect();
     streams.push(format!("{s}@aggTrade"));
+    streams.push(format!("{s}@depth@100ms"));
     format!("{}/stream?streams={}", WS_BASE, streams.join("/"))
 }
 
@@ -116,6 +117,15 @@ fn handle_text(txt: &str, txs: &BroadcastTxs) -> Result<()> {
                 "agg trade"
             );
             let _ = txs.trade.send(tick);
+        }
+        InboundEvent::Depth(diff) => {
+            debug!(
+                symbol = %diff.symbol,
+                u_first = diff.first_update_id,
+                u_final = diff.final_update_id,
+                "depth diff"
+            );
+            let _ = txs.depth.send(diff);
         }
     }
     Ok(())

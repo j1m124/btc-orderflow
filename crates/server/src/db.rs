@@ -162,6 +162,41 @@ pub async fn max_trade_ts(pool: &PgPool, symbol: &str) -> Result<Option<DateTime
     Ok(row.try_get("t")?)
 }
 
+// --- book_snapshots --------------------------------------------------------
+
+/// Insert one top-N book snapshot row. `bids` and `asks` are best-first;
+/// parallel arrays (prices + sizes) are stored as columnar `double precision[]`.
+/// ON CONFLICT (symbol, ts) DO NOTHING — the 1s snapshot timer is monotonic
+/// in wall time so duplicates would only arise from clock skew on restart.
+pub async fn upsert_book_snapshot(
+    pool: &PgPool,
+    symbol: &str,
+    ts: DateTime<Utc>,
+    bids: &[(f64, f64)],
+    asks: &[(f64, f64)],
+) -> Result<()> {
+    let bid_prices: Vec<f64> = bids.iter().map(|(p, _)| *p).collect();
+    let bid_sizes: Vec<f64> = bids.iter().map(|(_, s)| *s).collect();
+    let ask_prices: Vec<f64> = asks.iter().map(|(p, _)| *p).collect();
+    let ask_sizes: Vec<f64> = asks.iter().map(|(_, s)| *s).collect();
+
+    sqlx::query(
+        "INSERT INTO book_snapshots \
+            (symbol, ts, bid_prices, bid_sizes, ask_prices, ask_sizes) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (symbol, ts) DO NOTHING",
+    )
+    .bind(symbol)
+    .bind(ts)
+    .bind(&bid_prices)
+    .bind(&bid_sizes)
+    .bind(&ask_prices)
+    .bind(&ask_sizes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// UPSERT a batch of trades. ON CONFLICT DO NOTHING because aggTrades are
 /// immutable once Binance issues them — re-ingest (gap-heal overlapping a
 /// live WS event) is idempotent and the existing row is canonical.

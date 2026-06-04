@@ -4,6 +4,7 @@
 //! WebSocket stream and the kline REST endpoint share a small set of types,
 //! collected here for ease of import.
 
+pub mod book;
 pub mod parse;
 pub mod rest;
 pub mod ws;
@@ -22,11 +23,12 @@ pub const KLINES_PAGE_LIMIT: u32 = 1500;
 pub const AGGTRADES_PAGE_LIMIT: u32 = 1000;
 
 /// Bundle of typed broadcast senders threaded into the ingest path. The
-/// connection loop fans inbound events (kline, aggTrade, depth, …) into the
+/// connection loop fans inbound events (kline, aggTrade, depth) into the
 /// right channel so each consumer task — DB writers, sub-second aggregator,
-/// gateway forwarders — subscribes only to what it needs.
+/// book maintainer, gateway forwarders — subscribes only to what it needs.
 #[derive(Clone)]
 pub struct BroadcastTxs {
     pub kline: tokio::sync::broadcast::Sender<parse::Tick>,
     pub trade: tokio::sync::broadcast::Sender<parse::TradeTick>,
+    pub depth: tokio::sync::broadcast::Sender<parse::DepthDiff>,
 }

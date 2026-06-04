@@ -16,6 +16,14 @@ use super::{
     parse::{KlineRow, TradeRow},
 };
 
+/// Bootstrap response from `GET /fapi/v1/depth`.
+#[derive(Debug)]
+pub struct DepthSnapshot {
+    pub last_update_id: i64,
+    pub bids: Vec<(f64, f64)>,
+    pub asks: Vec<(f64, f64)>,
+}
+
 pub struct RestClient {
     http: Client,
     base: String,
@@ -133,4 +141,68 @@ impl RestClient {
         }
         Ok(rows)
     }
+
+    /// Fetch the current orderbook snapshot for `symbol` (top `limit` levels
+    /// each side). Used to bootstrap the in-memory book for the diff-stream
+    /// maintainer; the returned `last_update_id` is the sequence cursor
+    /// against which subsequent diffs are validated.
+    ///
+    /// Weight depends on `limit`: 2 for ≤100, 5 for ≤500, 10 for ≤1000.
+    /// We always request 1000 — full depth gives the maintainer a robust
+    /// resync point even if the diff stream momentarily lags during boot.
+    pub async fn depth_snapshot(&self, symbol: &str, limit: u32) -> Result<DepthSnapshot> {
+        let url = format!("{}/fapi/v1/depth", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("symbol", symbol),
+                ("limit", &limit.to_string()),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("binance returned non-2xx for depth {symbol}"))?;
+
+        let json: Value = resp.json().await.context("decode depth JSON")?;
+        let last_update_id = json
+            .get("lastUpdateId")
+            .and_then(|v| v.as_i64())
+            .context("depth.lastUpdateId missing")?;
+        let bids = parse_depth_levels(&json, "bids")?;
+        let asks = parse_depth_levels(&json, "asks")?;
+
+        Ok(DepthSnapshot {
+            last_update_id,
+            bids,
+            asks,
+        })
+    }
+}
+
+fn parse_depth_levels(json: &Value, field: &str) -> Result<Vec<(f64, f64)>> {
+    let arr = json
+        .get(field)
+        .and_then(|v| v.as_array())
+        .with_context(|| format!("depth.{field} missing or not array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let lvl = v.as_array().with_context(|| format!("{field}[{i}] not array"))?;
+        if lvl.len() != 2 {
+            return Err(anyhow::anyhow!("{field}[{i}] not a 2-element array"));
+        }
+        let price = lvl[0]
+            .as_str()
+            .context("depth level price not string")?
+            .parse::<f64>()
+            .with_context(|| format!("{field}[{i}].price decode"))?;
+        let size = lvl[1]
+            .as_str()
+            .context("depth level size not string")?
+            .parse::<f64>()
+            .with_context(|| format!("{field}[{i}].size decode"))?;
+        out.push((price, size));
+    }
+    Ok(out)
 }

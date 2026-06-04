@@ -54,6 +54,12 @@ async fn main() -> Result<()> {
         broadcast::channel::<binance::parse::Tick>(ingest::BROADCAST_CAPACITY);
     let (trade_tx, _trade_bootstrap_rx) =
         broadcast::channel::<binance::parse::TradeTick>(ingest::TRADE_BROADCAST_CAPACITY);
+    let (depth_tx, _depth_bootstrap_rx) =
+        broadcast::channel::<binance::parse::DepthDiff>(ingest::DEPTH_BROADCAST_CAPACITY);
+
+    // Shared live book state. Maintainer writes; gateway readers borrow
+    // briefly to populate initial BookSnapshot frames.
+    let book_state = ingest::BookState::new();
 
     // Writer tasks hold permanent Receivers so the broadcasts never run out
     // of consumers (which would otherwise drop every send during the gap
@@ -97,9 +103,37 @@ async fn main() -> Result<()> {
         })
     };
 
-    // Drop bootstrap receivers — the writers' / aggregator's receivers are canonical.
+    // Book maintainer: bootstraps via REST, applies depth diffs, exposes
+    // shared state for the gateway, and runs the 1s book_snapshots writer.
+    let book_maintainer = {
+        let pool = pool.clone();
+        let rest = binance::rest::RestClient::default();
+        let txs = BroadcastTxs {
+            kline: kline_tx.clone(),
+            trade: trade_tx.clone(),
+            depth: depth_tx.clone(),
+        };
+        let book_state = book_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ingest::run_book_maintainer(
+                pool,
+                SYMBOL.to_string(),
+                rest,
+                txs,
+                book_state,
+            )
+            .await
+            {
+                warn!(error = ?e, "book maintainer task exited with error");
+            }
+        })
+    };
+
+    // Drop bootstrap receivers — the writers' / aggregator's / maintainer's
+    // receivers are canonical.
     drop(_kline_bootstrap_rx);
     drop(_trade_bootstrap_rx);
+    drop(_depth_bootstrap_rx);
 
     let ingest_handle = {
         let pool = pool.clone();
@@ -107,6 +141,7 @@ async fn main() -> Result<()> {
         let txs = BroadcastTxs {
             kline: kline_tx.clone(),
             trade: trade_tx.clone(),
+            depth: depth_tx.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = ingest::run_binance_ingest(
@@ -131,6 +166,9 @@ async fn main() -> Result<()> {
     let gateway_state = gateway::GatewayState {
         pool: pool.clone(),
         broadcast_tx: kline_tx.clone(),
+        trade_tx: trade_tx.clone(),
+        depth_tx: depth_tx.clone(),
+        book_state: book_state.clone(),
     };
     let gateway_handle = tokio::spawn(async move {
         if let Err(e) = gateway::serve(listen_addr, gateway_state).await {
@@ -146,6 +184,7 @@ async fn main() -> Result<()> {
     info!("shutdown requested");
     gateway_handle.abort();
     ingest_handle.abort();
+    book_maintainer.abort();
     subsec_aggregator.abort();
     trade_writer.abort();
     kline_writer.abort();
