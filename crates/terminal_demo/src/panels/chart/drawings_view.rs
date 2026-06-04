@@ -1,0 +1,262 @@
+//! Bridge between the chart's view-coord drawing logic (fractional candle
+//! index + price) and the workspace-wide [`DrawingService`] (absolute ms +
+//! price).
+//!
+//! Charts paint/hit-test in `(fractional_index, price)` because that's the
+//! coordinate system the existing paint pipeline + hit-test were built in. The
+//! service stores anchors as `i64` epoch ms so drawings stay attached across
+//! timeframes, symbols, and backfills. The conversion happens at the chart
+//! boundary: snapshot service shapes into view-coords at render start; convert
+//! view-coords back to ms when the chart commits a create or edit.
+
+use crate::drawings::shapes::{Drawing as ServiceDrawing, DrawingShape};
+use crate::services::market_data::Candle;
+
+use super::Drawing as ViewDrawing;
+
+/// Spacing in ms between bar `i` and bar `i+1`, falling back to
+/// `bar_duration_ms` at the edges of the loaded range. We use the actual
+/// neighbour gap rather than the TF's nominal duration so the round-trip
+/// `idx ↔ ms` stays exact even when the data's bar interval doesn't match
+/// the chart's TF (which happens for the embedded chart_data — always
+/// 1h-spaced — when viewed at any TF other than H1).
+fn span_ms_at(i: usize, candles: &[Candle], bar_duration_ms: i64) -> i64 {
+    if i + 1 < candles.len() {
+        let s = candles[i + 1].open_time - candles[i].open_time;
+        if s > 0 {
+            return s;
+        }
+    }
+    bar_duration_ms.max(1)
+}
+
+/// Map an absolute wall-clock ms `t` onto the chart's fractional candle index.
+///
+/// Gaps are NOT collapsed here in the traditional sense — the chart already
+/// paints bars at integer slots regardless of wall-clock spacing, so the
+/// natural representation of "halfway between bar i and bar i+1" is
+/// `i + 0.5`, and we treat the time as proportional to the actual gap. Times
+/// past the loaded range extrapolate linearly using the spacing of the edge
+/// bar (so an off-screen drawing has a coherent x for pan-to-find).
+pub fn time_to_idx(t: i64, candles: &[Candle], bar_duration_ms: i64) -> f32 {
+    if candles.is_empty() {
+        return 0.0;
+    }
+    let first = candles.first().unwrap().open_time;
+    let last = candles.last().unwrap().open_time;
+    if t <= first {
+        // Pre-history: extrapolate using the leading edge's spacing.
+        let span = span_ms_at(0, candles, bar_duration_ms);
+        return (t - first) as f32 / span as f32;
+    }
+    if t >= last {
+        // Past the loaded tail: extrapolate using the trailing edge's
+        // spacing. (For a one-bar buffer the only span available is the
+        // nominal TF duration; `span_ms_at` falls back to it.)
+        let last_i = candles.len() - 1;
+        let tail_span = if last_i > 0 {
+            span_ms_at(last_i - 1, candles, bar_duration_ms)
+        } else {
+            bar_duration_ms.max(1)
+        };
+        return last_i as f32 + (t - last) as f32 / tail_span as f32;
+    }
+    // Binary search for the bar containing `t`. `partition_point` returns the
+    // first index where `open_time > t`; subtract one for the bar at/before
+    // `t`. The guards above ensure `pp >= 1`.
+    let pp = candles.partition_point(|c| c.open_time <= t);
+    let i = pp.saturating_sub(1);
+    let bar_open = candles[i].open_time;
+    let span = span_ms_at(i, candles, bar_duration_ms);
+    let frac = (t - bar_open) as f32 / span as f32;
+    // Clamp to [0, 1) so floating-point at the boundary doesn't spill into
+    // the next bar's slot — the next-bar case is already handled above by
+    // the `t >= last` branch when relevant.
+    i as f32 + frac.clamp(0.0, 0.999_999)
+}
+
+/// Inverse of [`time_to_idx`]. Used when the chart commits a create or
+/// edit-drag: the in-progress drawing lives in fractional index coords, but
+/// the service needs absolute ms.
+pub fn idx_to_time(idx: f32, candles: &[Candle], bar_duration_ms: i64) -> i64 {
+    if candles.is_empty() {
+        return 0;
+    }
+    let len = candles.len() as i32;
+    let floor_i = idx.floor() as i32;
+    let frac = idx - floor_i as f32;
+    if floor_i < 0 {
+        // Extrapolate backwards from the first bar using its leading spacing.
+        let first = candles[0].open_time;
+        let span = span_ms_at(0, candles, bar_duration_ms);
+        first + (idx * span as f32) as i64
+    } else if floor_i >= len {
+        // Extrapolate forwards from the last bar using its trailing spacing.
+        let last_i = (len - 1) as usize;
+        let last = candles[last_i].open_time;
+        let span = if last_i > 0 {
+            span_ms_at(last_i - 1, candles, bar_duration_ms)
+        } else {
+            bar_duration_ms.max(1)
+        };
+        last + ((idx - last_i as f32) * span as f32) as i64
+    } else {
+        let i = floor_i as usize;
+        let bar_open = candles[i].open_time;
+        if frac.abs() < f32::EPSILON {
+            return bar_open;
+        }
+        let span = span_ms_at(i, candles, bar_duration_ms);
+        bar_open + (frac as f64 * span as f64).round() as i64
+    }
+}
+
+/// Project a service drawing into the chart's view-coord representation. Times
+/// run through [`time_to_idx`] so the result is renderable by the existing
+/// paint pipeline without further translation.
+pub fn shape_to_view(
+    service: &ServiceDrawing,
+    candles: &[Candle],
+    bar_duration_ms: i64,
+) -> ViewDrawing {
+    let t2i = |t: i64| time_to_idx(t, candles, bar_duration_ms);
+    match &service.shape {
+        DrawingShape::Line(s) => ViewDrawing::Line {
+            id: service.id,
+            a: (t2i(s.a_time), s.a_price),
+            b: (t2i(s.b_time), s.b_price),
+        },
+        DrawingShape::Arrow(s) => ViewDrawing::Arrow {
+            id: service.id,
+            a: (t2i(s.a_time), s.a_price),
+            b: (t2i(s.b_time), s.b_price),
+        },
+        DrawingShape::Fibonacci(s) => ViewDrawing::Fibonacci {
+            id: service.id,
+            a: (t2i(s.a_time), s.a_price),
+            b: (t2i(s.b_time), s.b_price),
+        },
+        DrawingShape::Rect(s) => ViewDrawing::Rect {
+            id: service.id,
+            a: (t2i(s.a_time), s.a_price),
+            b: (t2i(s.b_time), s.b_price),
+        },
+        DrawingShape::HorizontalRay(r) => ViewDrawing::HorizontalRay {
+            id: service.id,
+            anchor: (t2i(r.anchor_time), r.anchor_price),
+            text: r.text.clone(),
+        },
+        DrawingShape::Text(s) => ViewDrawing::Text {
+            id: service.id,
+            anchor: (t2i(s.anchor_time), s.anchor_price),
+            width: s.width,
+            text: s.text.clone(),
+        },
+        DrawingShape::Long(p) => ViewDrawing::Long {
+            id: service.id,
+            t0: t2i(p.t0),
+            t1: t2i(p.t1),
+            entry: p.entry,
+            take_profit: p.take_profit,
+            stop_loss: p.stop_loss,
+        },
+        DrawingShape::Short(p) => ViewDrawing::Short {
+            id: service.id,
+            t0: t2i(p.t0),
+            t1: t2i(p.t1),
+            entry: p.entry,
+            take_profit: p.take_profit,
+            stop_loss: p.stop_loss,
+        },
+        DrawingShape::AnchoredVwap(a) => ViewDrawing::AnchoredVwap {
+            id: service.id,
+            // Price component is unused at render — the line is computed from
+            // candle data. Pass 0.0 as a deterministic placeholder.
+            anchor: (t2i(a.anchor_time), 0.0),
+        },
+    }
+}
+
+/// Convert a view-coord drawing back to a service shape. Called at commit
+/// points (mouse-up after create or edit) so the service stores absolute ms.
+pub fn view_to_shape(view: &ViewDrawing, candles: &[Candle], bar_duration_ms: i64) -> DrawingShape {
+    let i2t = |i: f32| idx_to_time(i, candles, bar_duration_ms);
+    use crate::drawings::shapes::{
+        AnchoredVwapShape, HorizontalRayShape, LineRectShape, PositionShape, TextShape,
+    };
+    match view {
+        ViewDrawing::Line { a, b, .. } => DrawingShape::Line(LineRectShape {
+            a_time: i2t(a.0),
+            a_price: a.1,
+            b_time: i2t(b.0),
+            b_price: b.1,
+        }),
+        ViewDrawing::Arrow { a, b, .. } => DrawingShape::Arrow(LineRectShape {
+            a_time: i2t(a.0),
+            a_price: a.1,
+            b_time: i2t(b.0),
+            b_price: b.1,
+        }),
+        ViewDrawing::Fibonacci { a, b, .. } => DrawingShape::Fibonacci(LineRectShape {
+            a_time: i2t(a.0),
+            a_price: a.1,
+            b_time: i2t(b.0),
+            b_price: b.1,
+        }),
+        ViewDrawing::Rect { a, b, .. } => DrawingShape::Rect(LineRectShape {
+            a_time: i2t(a.0),
+            a_price: a.1,
+            b_time: i2t(b.0),
+            b_price: b.1,
+        }),
+        ViewDrawing::HorizontalRay { anchor, text, .. } => {
+            DrawingShape::HorizontalRay(HorizontalRayShape {
+                anchor_time: i2t(anchor.0),
+                anchor_price: anchor.1,
+                text: text.clone(),
+            })
+        }
+        ViewDrawing::Text {
+            anchor,
+            width,
+            text,
+            ..
+        } => DrawingShape::Text(TextShape {
+            anchor_time: i2t(anchor.0),
+            anchor_price: anchor.1,
+            width: *width,
+            text: text.clone(),
+        }),
+        ViewDrawing::Long {
+            t0,
+            t1,
+            entry,
+            take_profit,
+            stop_loss,
+            ..
+        } => DrawingShape::Long(PositionShape {
+            t0: i2t(*t0),
+            t1: i2t(*t1),
+            entry: *entry,
+            take_profit: *take_profit,
+            stop_loss: *stop_loss,
+        }),
+        ViewDrawing::Short {
+            t0,
+            t1,
+            entry,
+            take_profit,
+            stop_loss,
+            ..
+        } => DrawingShape::Short(PositionShape {
+            t0: i2t(*t0),
+            t1: i2t(*t1),
+            entry: *entry,
+            take_profit: *take_profit,
+            stop_loss: *stop_loss,
+        }),
+        ViewDrawing::AnchoredVwap { anchor, .. } => DrawingShape::AnchoredVwap(AnchoredVwapShape {
+            anchor_time: i2t(anchor.0),
+        }),
+    }
+}

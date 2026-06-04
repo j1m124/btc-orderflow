@@ -1,0 +1,14 @@
+# Default cargo target for this workspace is wasm. The crate dropped its
+# native binary; without this line, plain `cargo check`/`cargo build` would
+# try the host target and fail because the code only compiles for wasm.
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = []
+# `cargo test` compiles the test crate to wasm; this runner executes the
+# resulting .wasm in Node via wasm-bindgen's test harness. Shipped by the
+# `wasm-bindgen-cli` install — make sure its version matches the
+# wasm-bindgen crate in Cargo.lock (currently 0.2.120; same pin as the
+# Makefile and CI).
+runner = "wasm-bindgen-test-runner"

@@ -1,0 +1,22 @@
+# Railway config for the WEB client (separate service from the Go server).
+# Deploys the pre-built image published by `.github/workflows/web-image.yml`
+# to GitHub Container Registry — Railway just pulls and runs it, the heavy
+# Rust+wasm+vite build happens on GitHub's runners (cached, ~2-3 min).
+#
+# Image visibility: the workflow pushes with $GITHUB_TOKEN, which produces a
+# *private* package by default. For Railway to pull, set the GHCR package
+# `web` to public in GitHub → Package settings (the WASM bundle is already
+# shipped to user browsers, so there's nothing sensitive in the image).
+[build]
+builder = "image"
+image = "ghcr.io/jimmyjai-lab/centoflow-terminal/web:latest"
+
+[deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 30
+restartPolicyType = "always"
+
+# Build-time env (CENTOFLOW_BASE_URL, VITE_SUPABASE_*) lives in the GitHub
+# Actions repo/Variables now, NOT here — those values are baked into the
+# WASM/JS bundle at compile time. Railway only needs the auto-injected
+# $PORT, which the Caddyfile binds to.

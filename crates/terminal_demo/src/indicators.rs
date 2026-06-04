@@ -1,0 +1,159 @@
+//! Chart indicators. v1 design (locked in via /grill-me):
+//!
+//! - Per-chart `Vec<IndicatorInstance>` on `ChartState`; stateless trait with
+//!   per-instance output cache; recompute on each `apply_tick` / `tick_clock`
+//!   / params edit.
+//! - Six built-ins: SMA, EMA, Bollinger Bands, Volume, MACD, RSI.
+//! - Overlay indicators paint inside the main candle pane; pane indicators
+//!   live in their own sub-canvas below it.
+//! - Settings UI is hand-written per kind and hosted in a singleton floating
+//!   window. Picker is a `SymbolPicker`-style modal.
+//! - Persistence keyed by chart-id under `terminal_demo.indicators.v1`.
+
+pub mod bb;
+pub mod instance;
+pub mod kind;
+pub mod ma_suite;
+pub mod macd;
+pub mod math;
+pub mod output;
+pub mod rsi;
+pub mod session_vwap;
+pub mod trades;
+pub mod volume;
+
+pub use bb::BbParams;
+pub use instance::{
+    COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, default_pane_height, new_instance_id,
+    palette_color_for,
+};
+pub use kind::{IndicatorKind, PaneKind, Placement, Source};
+pub use ma_suite::{MaEntry, MaFlavor, MaSuiteParams};
+pub use macd::MacdParams;
+pub use output::{IndicatorOutput, Series, ValueReadout};
+pub use rsi::RsiParams;
+pub use session_vwap::SessionVwapParams;
+pub use trades::TradesParams;
+pub use volume::VolumeParams;
+
+use gpui::SharedString;
+
+/// Category buckets surfaced as section headers in the picker modal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Category {
+    Overlay,
+    Volume,
+    Oscillator,
+    // `Custom` — added when scripting lands.
+}
+
+impl Category {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Category::Overlay => "Overlays",
+            Category::Volume => "Volume",
+            Category::Oscillator => "Oscillators",
+        }
+    }
+}
+
+/// One entry in the picker modal. Spawning is via the boxed factory so the
+/// caller doesn't need to know per-kind types — Enter on the highlighted
+/// row produces a fresh defaulted instance.
+pub struct KindEntry {
+    pub kind_id: &'static str,
+    pub name: SharedString,
+    pub description: SharedString,
+    pub category: Category,
+    pub spawn: fn() -> Box<dyn IndicatorKind>,
+}
+
+/// Available kinds in the v1 picker, in display order:
+/// MA Suite → Bollinger Bands → Session VWAP → Volume → Trades → MACD → RSI.
+pub fn kind_entries() -> Vec<KindEntry> {
+    vec![
+        KindEntry {
+            kind_id: "ma_suite",
+            name: "Moving Averages".into(),
+            description: "SMA/EMA suite — add as many lines as you want".into(),
+            category: Category::Overlay,
+            spawn: || Box::new(MaSuiteParams::default()),
+        },
+        KindEntry {
+            kind_id: "bb",
+            name: "Bollinger Bands".into(),
+            description: "Mean ± N⋅σ envelope".into(),
+            category: Category::Overlay,
+            spawn: || Box::new(BbParams::default()),
+        },
+        KindEntry {
+            kind_id: "session_vwap",
+            name: "Session VWAP".into(),
+            description: "Volume-weighted average price, anchored at the 09:30 ET open".into(),
+            category: Category::Overlay,
+            spawn: || Box::new(SessionVwapParams::default()),
+        },
+        KindEntry {
+            kind_id: "volume",
+            name: "Volume".into(),
+            description: "Per-bar volume histogram".into(),
+            category: Category::Volume,
+            spawn: || Box::new(VolumeParams::default()),
+        },
+        KindEntry {
+            kind_id: "trades",
+            name: "Trades".into(),
+            description: "Per-bar trade count histogram".into(),
+            category: Category::Volume,
+            spawn: || Box::new(TradesParams::default()),
+        },
+        KindEntry {
+            kind_id: "macd",
+            name: "MACD".into(),
+            description: "12, 26, 9 — moving average convergence/divergence".into(),
+            category: Category::Oscillator,
+            spawn: || Box::new(MacdParams::default()),
+        },
+        KindEntry {
+            kind_id: "rsi",
+            name: "RSI".into(),
+            description: "14 — relative strength index".into(),
+            category: Category::Oscillator,
+            spawn: || Box::new(RsiParams::default()),
+        },
+    ]
+}
+
+/// Rebuild a boxed `dyn IndicatorKind` from a `kind_id` + serialized params.
+/// Used by the persistence loader to reconstruct instances from
+/// `local_storage`. Returns `None` for unknown kind_ids (typically when a
+/// future version's persisted state is read by an older build).
+pub fn build_kind(
+    kind_id: &str,
+    params: &serde_json::Value,
+) -> Option<Box<dyn IndicatorKind>> {
+    match kind_id {
+        "ma_suite" => serde_json::from_value::<MaSuiteParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "bb" => serde_json::from_value::<BbParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "session_vwap" => serde_json::from_value::<SessionVwapParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "volume" => serde_json::from_value::<VolumeParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "trades" => serde_json::from_value::<TradesParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "macd" => serde_json::from_value::<MacdParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "rsi" => serde_json::from_value::<RsiParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        _ => None,
+    }
+}

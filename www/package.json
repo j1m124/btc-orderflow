@@ -1,0 +1,15 @@
+{
+  "name": "terminal_demo-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --bun vite",
+    "build": "bun --bun vite build",
+    "preview": "bun --bun vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8",
+    "vite-plugin-wasm": "^3.3.0"
+  }
+}

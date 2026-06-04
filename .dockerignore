@@ -1,0 +1,10 @@
+# Keep the build context lean + reproducible. vendor/ is intentionally kept
+# (gpui-component is vendored and required by the build).
+target
+www/node_modules
+.git
+.env
+www/.env
+**/*.rs.bk
+# Note: www/dist is intentionally NOT ignored — web-static.Dockerfile copies the
+# CI-built dist. (web.Dockerfile rebuilds it anyway, so its presence is moot.)
