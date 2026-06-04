@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/btc_orderflow"]
+members = [
+    "crates/btc_orderflow",            # wasm client (gpui + gpui-component)
+    "crates/btc_orderflow_protocol",   # shared wire types
+    "crates/btc_orderflow_server",     # native server (tokio + axum + sqlx)
+]
 # Exclude the vendored gpui-component fork — it has its own [workspace] and
 # cargo would otherwise pull its members into ours.
 exclude = ["vendor"]

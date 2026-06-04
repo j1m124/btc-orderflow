@@ -1,0 +1,12 @@
+[package]
+name = "btc_orderflow_server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "btc_orderflow_server"
+path = "src/main.rs"
+
+[dependencies]
+btc_orderflow_protocol = { path = "../btc_orderflow_protocol" }

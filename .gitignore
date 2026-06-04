@@ -1,2 +1,19 @@
+# Rust build artifacts
+/target
+
+# WASM build outputs
+/www/node_modules/
+/www/dist/
+/www/bun.lock*
+/www/src/wasm/*.js
+/www/src/wasm/*.wasm
+
+# Secrets
+.env
+
+# Editor / OS
 **/.DS_Store
+.vscode/
+.idea/
 .claude/
+*.swp
