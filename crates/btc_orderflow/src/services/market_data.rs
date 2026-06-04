@@ -191,11 +191,10 @@ impl Candle {
     }
 }
 
-/// Whether a display symbol has a live feed. The stub answers `false` for
-/// everything, which lets the chart's fallback paths render without ever
-/// expecting WS data.
-pub fn is_live(_display_symbol: &str) -> bool {
-    false
+/// Whether a display symbol has a live feed. The v1 server only ingests
+/// BTCUSDT (see `SUPPORTED_SYMBOL` in `btc_orderflow_server::gateway::session`).
+pub fn is_live(display_symbol: &str) -> bool {
+    display_symbol == "BTCUSDT"
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -663,29 +662,20 @@ async fn run_connection(
         } else {
             LiveStatus::Reconnecting { attempts }
         };
-        if this
-            .update(cx, |s, cx| s.set_conn_status(status, cx))
-            .is_err()
-        {
-            return;
-        }
+        // Defer to a fresh tick — see the deeper comment in `pump`.
+        defer_update(&this, cx, move |s, cx| s.set_conn_status(status, cx));
 
         match WsMeta::connect(SERVER_WS_URL, None).await {
             Ok((_meta, stream)) => {
                 attempts = 0;
                 log::info!("ws connected to {SERVER_WS_URL}");
                 // Drop any stale Subscribes that piled up during the outage;
-                // resubscribe_all (just below) re-issues the canonical set.
+                // resubscribe_all re-issues the canonical set.
                 drain_pending(&mut outbound_rx);
-                if this
-                    .update(cx, |s, cx| {
-                        s.set_conn_status(LiveStatus::Connected, cx);
-                        s.resubscribe_all();
-                    })
-                    .is_err()
-                {
-                    return;
-                }
+                defer_update(&this, cx, |s, cx| {
+                    s.set_conn_status(LiveStatus::Connected, cx);
+                    s.resubscribe_all();
+                });
 
                 pump(stream, &mut outbound_rx, &this, cx).await;
                 log::info!("ws disconnected; will reconnect");
@@ -699,6 +689,22 @@ async fn run_connection(
         let backoff = backoff_for(attempts);
         cx.background_executor().timer(backoff).await;
     }
+}
+
+/// Spawn a fresh tick that applies `f` to the service entity. Used by the
+/// connection driver and pump to avoid running entity.update synchronously
+/// inside the same executor task that just resumed from a WS poll —
+/// synchronous emit/notify chains during gpui_web's animation-frame borrow
+/// is the panic shape we're avoiding (see `pump` comment).
+fn defer_update<F>(this: &WeakEntity<MarketDataService>, cx: &mut gpui::AsyncApp, f: F)
+where
+    F: FnOnce(&mut MarketDataService, &mut Context<MarketDataService>) + 'static,
+{
+    let this = this.clone();
+    cx.spawn(async move |cx| {
+        let _ = this.update(cx, f);
+    })
+    .detach();
 }
 
 // `try_next` on `UnboundedReceiver` is deprecation-flagged in some futures
@@ -732,9 +738,20 @@ async fn pump(
                     Some(WsMessage::Text(txt)) => {
                         match serde_json::from_str::<proto::ServerFrame>(&txt) {
                             Ok(frame) => {
-                                if this.update(cx, |s, cx| s.handle_server_frame(frame, cx)).is_err() {
-                                    return;
-                                }
+                                // Defer entity.update to a fresh executor
+                                // tick. If we apply the frame synchronously
+                                // here, the emit() → subscriber callbacks
+                                // chain (chart panel cx.notify(), bottom-bar
+                                // status repaint) runs while gpui_web's
+                                // request_frame may still hold callbacks
+                                // borrowed from the current animation frame.
+                                // A pointerleave that fires under that
+                                // borrow panics ("RefCell already borrowed"
+                                // at gpui_web/src/events.rs:512). Yielding
+                                // here lets the in-flight RAF release first.
+                                defer_update(this, cx, move |s, cx| {
+                                    s.handle_server_frame(frame, cx)
+                                });
                             }
                             Err(e) => {
                                 log::warn!("decode server frame: {e:?}");
