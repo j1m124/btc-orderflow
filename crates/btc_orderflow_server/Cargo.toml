@@ -10,3 +10,39 @@ path = "src/main.rs"
 
 [dependencies]
 btc_orderflow_protocol = { path = "../btc_orderflow_protocol" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP/WS server + middleware
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# WS client (Binance combined-stream)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# HTTP client (Binance REST)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Postgres + migrations + TIMESTAMPTZ ↔ chrono mapping
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "chrono",
+] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serde
+serde.workspace = true
+serde_json.workspace = true
+
+# Errors
+anyhow.workspace = true
+thiserror = "1"
