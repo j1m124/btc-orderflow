@@ -20,7 +20,9 @@ use futures::{
     SinkExt, StreamExt,
     channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
 };
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString};
+use gpui::{
+    App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString, Task, WeakEntity,
+};
 use ws_stream_wasm::{WsMessage, WsMeta};
 
 /// WS endpoint of the local server. Hardcoded for v1 (Q13d). Promote to a
@@ -272,25 +274,49 @@ pub struct MarketDataService {
     to_ws: UnboundedSender<proto::ClientFrame>,
 
     /// Receiver for `SubscriptionHandle::Drop` notifications. The release
-    /// task in `init` drains this and calls `release_one` per key.
+    /// task drains this and calls `release_one` per key.
     release_tx: UnboundedSender<SubKey>,
-
-    /// Taken by `init()` before spawning the driver/release tasks; `None`
-    /// thereafter. Stored on the struct so `new()` can return both the
-    /// service and the corresponding receivers without a side channel.
-    pending_outbound_rx: Option<UnboundedReceiver<proto::ClientFrame>>,
-    pending_release_rx: Option<UnboundedReceiver<SubKey>>,
 
     conn_status: LiveStatus,
     last_message_ms: Option<i64>,
+
+    /// Owned Tasks for the connection driver + release pump. Stored on the
+    /// struct so `Drop` on the entity tears them down. Spawned via
+    /// `Context<Self>::spawn` (WeakEntity-based) so update closures never
+    /// fight a strong-Entity borrow inside another `update` — that's the
+    /// re-entry shape that causes "RefCell already borrowed" panics in
+    /// gpui internals.
+    _ws_task: Task<()>,
+    _release_task: Task<()>,
 }
 
 impl EventEmitter<KlineEvent> for MarketDataService {}
 
 impl MarketDataService {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
-        let (release_tx, release_rx) = unbounded::<SubKey>();
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let (release_tx, mut release_rx) = unbounded::<SubKey>();
         let (to_ws, outbound_rx) = unbounded::<proto::ClientFrame>();
+
+        // Release pump: drains SubscriptionHandle::Drop notifications and
+        // calls release_one one tick later. `this.update(...)` here returns
+        // `Result` (WeakEntity); break on entity drop.
+        let release_task = cx.spawn(async move |this, cx| {
+            while let Some(key) = release_rx.next().await {
+                if this
+                    .update(cx, |s, cx| s.release_one(key, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        // Connection driver: opens WS, drains outbound, dispatches inbound,
+        // exp-backoff reconnect forever.
+        let ws_task = cx.spawn(async move |this, cx| {
+            run_connection(this, outbound_rx, cx).await;
+        });
+
         Self {
             candles: HashMap::new(),
             statuses: HashMap::new(),
@@ -300,10 +326,10 @@ impl MarketDataService {
             next_sub_id: 0,
             to_ws,
             release_tx,
-            pending_outbound_rx: Some(outbound_rx),
-            pending_release_rx: Some(release_rx),
             conn_status: LiveStatus::Connecting,
             last_message_ms: None,
+            _ws_task: ws_task,
+            _release_task: release_task,
         }
     }
 
@@ -606,40 +632,7 @@ impl Global for MarketDataServiceHandle {}
 
 pub fn init(cx: &mut App) {
     let entity = cx.new(MarketDataService::new);
-    cx.set_global(MarketDataServiceHandle(entity.clone()));
-
-    let (outbound_rx, release_rx) = entity.update(cx, |s, _| {
-        let o = s
-            .pending_outbound_rx
-            .take()
-            .expect("init runs once before any other access");
-        let r = s
-            .pending_release_rx
-            .take()
-            .expect("init runs once before any other access");
-        (o, r)
-    });
-
-    // Release task: drains SubscriptionHandle::Drop → release_one.
-    {
-        let entity = entity.clone();
-        let mut release_rx = release_rx;
-        cx.spawn(async move |cx| {
-            while let Some(key) = release_rx.next().await {
-                entity.update(cx, |s, cx| s.release_one(key, cx));
-            }
-        })
-        .detach();
-    }
-
-    // Connection driver: forever reconnect loop.
-    {
-        let entity = entity.clone();
-        cx.spawn(async move |cx| {
-            run_connection(entity, outbound_rx, cx).await;
-        })
-        .detach();
-    }
+    cx.set_global(MarketDataServiceHandle(entity));
 }
 
 /// Handle to a live subscription. The keyed slot stays registered as long
@@ -659,7 +652,7 @@ impl Drop for SubscriptionHandle {
 // --- Connection driver ------------------------------------------------------
 
 async fn run_connection(
-    entity: Entity<MarketDataService>,
+    this: WeakEntity<MarketDataService>,
     mut outbound_rx: UnboundedReceiver<proto::ClientFrame>,
     cx: &mut gpui::AsyncApp,
 ) {
@@ -670,7 +663,12 @@ async fn run_connection(
         } else {
             LiveStatus::Reconnecting { attempts }
         };
-        entity.update(cx, |s, cx| s.set_conn_status(status, cx));
+        if this
+            .update(cx, |s, cx| s.set_conn_status(status, cx))
+            .is_err()
+        {
+            return;
+        }
 
         match WsMeta::connect(SERVER_WS_URL, None).await {
             Ok((_meta, stream)) => {
@@ -679,12 +677,17 @@ async fn run_connection(
                 // Drop any stale Subscribes that piled up during the outage;
                 // resubscribe_all (just below) re-issues the canonical set.
                 drain_pending(&mut outbound_rx);
-                entity.update(cx, |s, cx| {
-                    s.set_conn_status(LiveStatus::Connected, cx);
-                    s.resubscribe_all();
-                });
+                if this
+                    .update(cx, |s, cx| {
+                        s.set_conn_status(LiveStatus::Connected, cx);
+                        s.resubscribe_all();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
 
-                pump(stream, &mut outbound_rx, &entity, cx).await;
+                pump(stream, &mut outbound_rx, &this, cx).await;
                 log::info!("ws disconnected; will reconnect");
             }
             Err(e) => {
@@ -717,7 +720,7 @@ fn backoff_for(attempts: u32) -> Duration {
 async fn pump(
     stream: ws_stream_wasm::WsStream,
     outbound_rx: &mut UnboundedReceiver<proto::ClientFrame>,
-    entity: &Entity<MarketDataService>,
+    this: &WeakEntity<MarketDataService>,
     cx: &mut gpui::AsyncApp,
 ) {
     use futures::future::FutureExt;
@@ -729,7 +732,9 @@ async fn pump(
                     Some(WsMessage::Text(txt)) => {
                         match serde_json::from_str::<proto::ServerFrame>(&txt) {
                             Ok(frame) => {
-                                entity.update(cx, |s, cx| s.handle_server_frame(frame, cx));
+                                if this.update(cx, |s, cx| s.handle_server_frame(frame, cx)).is_err() {
+                                    return;
+                                }
                             }
                             Err(e) => {
                                 log::warn!("decode server frame: {e:?}");
