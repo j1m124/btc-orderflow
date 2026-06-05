@@ -487,8 +487,12 @@ async fn run_trades_subscription(
     batch_timer.tick().await; // burn immediate tick
 
     loop {
+        // No `biased;` — `rx.recv()` is essentially always Ready on the
+        // BTCUSDT-perp aggTrade firehose (~10–100 trades/sec). Under biased
+        // polling, the timer branch would be starved and the buffer would
+        // accumulate without ever flushing, so the client only ever sees the
+        // initial TradeSnapshot. Random select gives both branches a turn.
         tokio::select! {
-            biased;
             msg = rx.recv() => {
                 match msg {
                     Ok(tick) => {
@@ -598,8 +602,11 @@ async fn run_book_subscription(
     batch_timer.tick().await;
 
     loop {
+        // See `run_trades_subscription` for why `biased;` is omitted: the
+        // depth-diff broadcast fires at ~10 Hz minimum, often higher, so
+        // biased polling starves the batch timer and BookDelta frames never
+        // emit.
         tokio::select! {
-            biased;
             msg = rx.recv() => {
                 match msg {
                     Ok(diff) => {
@@ -718,8 +725,10 @@ async fn run_footprint_subscription(
     batch_timer.tick().await;
 
     loop {
+        // See `run_trades_subscription` for why `biased;` is omitted: the
+        // trade broadcast is too hot to let the timer branch get fair
+        // scheduling without random select.
         tokio::select! {
-            biased;
             msg = rx.recv() => {
                 match msg {
                     Ok(tick) => {

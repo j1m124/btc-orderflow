@@ -15,6 +15,7 @@ pub mod math;
 pub mod output;
 pub mod trades;
 pub mod volume;
+pub mod volume_delta;
 
 pub use bb::BbParams;
 pub use instance::{
@@ -25,6 +26,7 @@ pub use kind::{IndicatorKind, PaneKind, Placement, Source};
 pub use output::{IndicatorOutput, Series, ValueReadout};
 pub use trades::TradesParams;
 pub use volume::VolumeParams;
+pub use volume_delta::{VolumeDeltaMode, VolumeDeltaParams};
 
 use gpui::SharedString;
 
@@ -77,6 +79,13 @@ pub fn kind_entries() -> Vec<KindEntry> {
             category: Category::Volume,
             spawn: || Box::new(TradesParams::default()),
         },
+        KindEntry {
+            kind_id: "volume_delta",
+            name: "Volume Delta".into(),
+            description: "Per-bar buy vs sell taker volume (histogram, CVD, or both)".into(),
+            category: Category::Volume,
+            spawn: || Box::new(VolumeDeltaParams::default()),
+        },
     ]
 }
 
@@ -93,6 +102,9 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "trades" => serde_json::from_value::<TradesParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "volume_delta" => serde_json::from_value::<VolumeDeltaParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy

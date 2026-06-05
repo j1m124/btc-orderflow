@@ -1,10 +1,10 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable, Global,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div,
     prelude::FluentBuilder as _,
@@ -15,13 +15,18 @@ use gpui_component::{
         DockArea, DockEvent, Panel, PanelControl, PanelEvent, PanelInfo, PanelState, PanelView,
         TabPanel, register_panel,
     },
+    input::{InputEvent, InputState},
 };
 use serde::{Deserialize, Serialize};
 
 pub mod chart;
+pub mod orderbook;
+pub mod trades;
 pub mod watchlist;
 
 pub use chart::{ChangeChartTimeframe, GoToLatest, ResetChartScale};
+pub use orderbook::ChangeOrderbookSizeMode;
+pub use trades::ChangeTradesSizeMode;
 
 /// Minimum interval between chart re-paints driven by tick events. 50ms = 20Hz.
 const CHART_TICK_INTERVAL_MS: i64 = 50;
@@ -33,15 +38,24 @@ pub const PANEL_KINDS: &[Kind] = Kind::ALL;
 pub enum Kind {
     Watchlist,
     Chart,
+    Trades,
+    Orderbook,
 }
 
 impl Kind {
-    pub const ALL: &'static [Kind] = &[Kind::Watchlist, Kind::Chart];
+    pub const ALL: &'static [Kind] = &[
+        Kind::Watchlist,
+        Kind::Chart,
+        Kind::Trades,
+        Kind::Orderbook,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
             Kind::Watchlist => "Watchlist",
             Kind::Chart => "Chart",
+            Kind::Trades => "Trades",
+            Kind::Orderbook => "Orderbook",
         }
     }
 
@@ -143,6 +157,108 @@ fn chart_prefs_from_info(
     Some((SharedString::from(prefs.symbol), tf))
 }
 
+#[derive(Serialize, Deserialize)]
+struct TradesPrefs {
+    symbol: String,
+    /// Min USD notional. `None` (or missing) → no filter. Stored as a raw
+    /// number rather than a preset id so user-typed thresholds persist as
+    /// typed. Older persisted state predates this field and loads cleanly
+    /// (`#[serde(default)]` → `None`).
+    #[serde(default)]
+    min_usd: Option<f64>,
+    /// Size column display mode (`"coin" / "usd"`). Optional for backward
+    /// compatibility — missing → `Coin`.
+    #[serde(default)]
+    size_mode: Option<String>,
+}
+
+fn trades_prefs_from_info(
+    info: &PanelInfo,
+) -> Option<(SharedString, Option<f64>, trades::TradesSizeMode)> {
+    let PanelInfo::Panel(value) = info else {
+        return None;
+    };
+    let prefs: TradesPrefs = serde_json::from_value(value.clone()).ok()?;
+    let size_mode = prefs
+        .size_mode
+        .as_deref()
+        .and_then(trades::TradesSizeMode::from_id)
+        .unwrap_or_default();
+    Some((SharedString::from(prefs.symbol), prefs.min_usd, size_mode))
+}
+
+#[derive(Serialize, Deserialize)]
+struct OrderbookPrefs {
+    symbol: String,
+    /// Bucket id ("tick", "1", "5", "10", "25"). String rather than f64 so
+    /// "tick" (raw, no bucketing) is representable distinctly from "$0.10".
+    bucket: String,
+    /// Size column display mode (`"coin" / "usd"`). Optional for backward
+    /// compatibility — missing → `Coin`.
+    #[serde(default)]
+    size_mode: Option<String>,
+}
+
+fn orderbook_prefs_from_info(
+    info: &PanelInfo,
+) -> Option<(
+    SharedString,
+    orderbook::OrderbookBucket,
+    orderbook::OrderbookSizeMode,
+)> {
+    let PanelInfo::Panel(value) = info else {
+        return None;
+    };
+    let prefs: OrderbookPrefs = serde_json::from_value(value.clone()).ok()?;
+    let bucket = orderbook::OrderbookBucket::from_id(&prefs.bucket)?;
+    let size_mode = prefs
+        .size_mode
+        .as_deref()
+        .and_then(orderbook::OrderbookSizeMode::from_id)
+        .unwrap_or_default();
+    Some((SharedString::from(prefs.symbol), bucket, size_mode))
+}
+
+/// Per-panel state for an Orderbook ContentPanel.
+///
+/// `sticky_center` is a TOGGLE: while true, every render snaps the spread
+/// row to the middle of the viewport, so as the inside market moves the
+/// ladder follows it. The flag is turned ON at mount, on bucket change,
+/// on symbol change, and by the Center button. It's turned OFF
+/// automatically when the user scrolls — render detects scroll by
+/// comparing the live `scroll.offset().y` against the value we wrote
+/// last (`last_set_offset_y`); a mismatch means the wheel / drag moved
+/// the offset out from under us.
+///
+/// `_trades_sub_handle` is held only to power the repurposed spread row's
+/// last-trade-price marker — render reads the latest trade from the
+/// service's per-symbol trades buffer via the panel's own `TradeEvent`
+/// subscription.
+pub struct OrderbookState {
+    pub symbol: SharedString,
+    pub bucket: orderbook::OrderbookBucket,
+    pub size_mode: orderbook::OrderbookSizeMode,
+    pub scroll: gpui_component::VirtualListScrollHandle,
+    pub sticky_center: bool,
+    pub last_set_offset_y: Option<gpui::Pixels>,
+    _sub_handle: crate::services::market_data::SubscriptionHandle,
+    _trades_sub_handle: crate::services::market_data::SubscriptionHandle,
+}
+
+/// Sanity ceiling on the trades panel's persist buffer. The panel isn't
+/// scrollable so anything beyond the viewport is invisible; this cap only
+/// guards against runaway growth on a `min_usd = 0` (no filter) tape over
+/// a long session. ~5000 × ~50B/Trade ≈ 250 KB per panel.
+const TRADES_PERSIST_CAP: usize = 5_000;
+
+fn default_symbol(cx: &App) -> SharedString {
+    cx.global::<crate::services::symbols::SymbolsServiceHandle>()
+        .0
+        .read(cx)
+        .default_symbol()
+        .unwrap_or_else(|| SharedString::from(chart::ChartState::default_symbol()))
+}
+
 #[derive(Clone)]
 pub struct DockAreaHandle(pub WeakEntity<DockArea>);
 impl Global for DockAreaHandle {}
@@ -166,11 +282,26 @@ pub struct ContentPanel {
     _tz_subscription: Option<gpui::Subscription>,
     chart_sub_handles: Vec<crate::services::market_data::SubscriptionHandle>,
     watchlist_sub_handles: HashMap<SharedString, crate::services::market_data::SubscriptionHandle>,
+    pub(crate) trades_symbol: Option<SharedString>,
+    pub(crate) trades_min_usd: Option<Option<f64>>,
+    pub(crate) trades_size_mode: Option<trades::TradesSizeMode>,
+    pub(crate) trades_filter_input: Option<Entity<InputState>>,
+    pub(crate) trades_persist: Option<VecDeque<crate::services::market_data::Trade>>,
+    _trades_sub_handle: Option<crate::services::market_data::SubscriptionHandle>,
+    _trades_input_subscription: Option<gpui::Subscription>,
+    pub(crate) orderbook_state: Option<OrderbookState>,
+    /// Monotonic counter bumped by the trades + book event handlers.
+    /// Subscribing only via `cx.notify()` empirically wasn't enough to mark
+    /// the panel entity dirty under gpui_web — the working `chart` path
+    /// also writes to `chart_state` on every tick, and that mutation is
+    /// what actually queues a re-render. We mirror that by mutating this
+    /// field on every relevant event so the dirty flag is always set.
+    tick_seq: u64,
 }
 
 impl ContentPanel {
     pub fn new(kind: Kind, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_inner(kind, None, window, cx)
+        Self::new_inner(kind, None, None, None, window, cx)
     }
 
     pub fn new_restored(
@@ -179,12 +310,25 @@ impl ContentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_inner(kind, chart_prefs_from_info(info), window, cx)
+        Self::new_inner(
+            kind,
+            chart_prefs_from_info(info),
+            trades_prefs_from_info(info),
+            orderbook_prefs_from_info(info),
+            window,
+            cx,
+        )
     }
 
     fn new_inner(
         kind: Kind,
         chart_prefs: Option<(SharedString, crate::services::market_data::Timeframe)>,
+        trades_prefs: Option<(SharedString, Option<f64>, trades::TradesSizeMode)>,
+        orderbook_prefs: Option<(
+            SharedString,
+            orderbook::OrderbookBucket,
+            orderbook::OrderbookSizeMode,
+        )>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -365,7 +509,174 @@ impl ContentPanel {
                 cx.notify();
             }));
         }
-        Self {
+        let orderbook_state = if matches!(kind, Kind::Orderbook) {
+            let (sym, bucket, size_mode) = orderbook_prefs.unwrap_or_else(|| {
+                (
+                    default_symbol(cx),
+                    orderbook::OrderbookBucket::default(),
+                    orderbook::OrderbookSizeMode::default(),
+                )
+            });
+            let book_handle = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone()
+                .update(cx, |svc, cx| {
+                    svc.ensure_book(sym.as_ref(), orderbook::WS_DEPTH, cx)
+                });
+            // Trades subscription powers the repurposed spread row's
+            // ▲/▼ last-trade strip. Refcounted on `SubKey` in the service, so
+            // having the Trades panel open at the same time costs one WS sub
+            // total, not two.
+            let trades_handle = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone()
+                .update(cx, |svc, cx| svc.ensure_trades(sym.as_ref(), cx));
+            let market = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone();
+            cx.subscribe_in(
+                &market,
+                window,
+                |this, _svc, ev: &crate::services::market_data::BookEvent, _window, cx| {
+                    use crate::services::market_data::BookEvent::*;
+                    match ev {
+                        Snapshot { .. }
+                        | Delta { .. }
+                        | HistoryPrepended { .. }
+                        | HistoryCapped { .. }
+                        | Resnap { .. } => {
+                            this.tick_seq = this.tick_seq.wrapping_add(1);
+                            cx.notify();
+                        }
+                    }
+                },
+            )
+            .detach();
+            cx.subscribe_in(
+                &market,
+                window,
+                |this, _svc, ev: &crate::services::market_data::TradeEvent, _window, cx| {
+                    use crate::services::market_data::TradeEvent::*;
+                    // Render reads `trades_snapshot(symbol).last()` for the
+                    // strip — any buffer mutation potentially changes that
+                    // tail, so repaint on every variant.
+                    match ev {
+                        Snapshot { .. }
+                        | Tick { .. }
+                        | Prepended { .. }
+                        | HistoryCapped { .. }
+                        | Resnap { .. } => {
+                            this.tick_seq = this.tick_seq.wrapping_add(1);
+                            cx.notify();
+                        }
+                    }
+                },
+            )
+            .detach();
+            Some(OrderbookState {
+                symbol: sym,
+                bucket,
+                size_mode,
+                scroll: gpui_component::VirtualListScrollHandle::new(),
+                // Mount with sticky center engaged so the spread row is
+                // pinned to the viewport middle from the very first paint.
+                sticky_center: true,
+                last_set_offset_y: None,
+                _sub_handle: book_handle,
+                _trades_sub_handle: trades_handle,
+            })
+        } else {
+            None
+        };
+        let (
+            trades_symbol,
+            trades_min_usd,
+            trades_size_mode,
+            trades_filter_input,
+            trades_persist,
+            _trades_sub_handle,
+            _trades_input_subscription,
+        ) = if matches!(kind, Kind::Trades) {
+            let (sym, min_usd, size_mode) = trades_prefs
+                .unwrap_or_else(|| (default_symbol(cx), None, trades::TradesSizeMode::default()));
+            let handle = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone()
+                .update(cx, |svc, cx| svc.ensure_trades(sym.as_ref(), cx));
+            let market = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone();
+            cx.subscribe_in(
+                &market,
+                window,
+                |this, _svc, ev: &crate::services::market_data::TradeEvent, _window, cx| {
+                    use crate::services::market_data::TradeEvent::*;
+                    match ev {
+                        Snapshot { symbol, .. } | Resnap { symbol } => {
+                            if this.trades_symbol.as_deref().map_or(true, |s| s != symbol.as_ref()) {
+                                return;
+                            }
+                            this.reseed_trades_persist(cx);
+                            this.tick_seq = this.tick_seq.wrapping_add(1);
+                            cx.notify();
+                        }
+                        Tick { symbol, trades } => {
+                            if this.trades_symbol.as_deref().map_or(true, |s| s != symbol.as_ref()) {
+                                return;
+                            }
+                            this.append_trades_persist(trades.iter().cloned(), cx);
+                            this.tick_seq = this.tick_seq.wrapping_add(1);
+                            cx.notify();
+                        }
+                        Prepended { .. } | HistoryCapped { .. } => {
+                            this.tick_seq = this.tick_seq.wrapping_add(1);
+                            cx.notify();
+                        }
+                    }
+                },
+            )
+            .detach();
+            // Header input: free-form min-USD threshold. We seed it from
+            // persisted prefs (if any) and subscribe to InputEvent::Change
+            // so each keystroke updates the panel threshold and reseeds
+            // `persist` from whatever's currently in the service ring.
+            let initial_text: SharedString = match min_usd {
+                Some(v) if v > 0.0 => SharedString::from(format!("{:.0}", v)),
+                _ => SharedString::default(),
+            };
+            let input_state =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Min USD"));
+            if !initial_text.is_empty() {
+                input_state.update(cx, |s, cx| s.set_value(initial_text, window, cx));
+            }
+            let input_sub = cx.subscribe_in(
+                &input_state,
+                window,
+                |this, input, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let text = input.read(cx).value();
+                        this.apply_trades_min_usd_from_text(text.as_ref(), window, cx);
+                    }
+                },
+            );
+            (
+                Some(sym),
+                Some(min_usd),
+                Some(size_mode),
+                Some(input_state),
+                Some(VecDeque::new()),
+                Some(handle),
+                Some(input_sub),
+            )
+        } else {
+            (None, None, None, None, None, None, None)
+        };
+        let mut new_self = Self {
             kind,
             focus_handle,
             parent_tab_panel: None,
@@ -375,7 +686,165 @@ impl ContentPanel {
             _tz_subscription: tz_subscription,
             chart_sub_handles: chart_handles,
             watchlist_sub_handles: watchlist_handles,
+            trades_symbol,
+            trades_min_usd,
+            trades_size_mode,
+            trades_filter_input,
+            trades_persist,
+            _trades_sub_handle,
+            _trades_input_subscription,
+            orderbook_state,
+            tick_seq: 0,
+        };
+        // Seed the trades persist with whatever passing prints are already
+        // in the service ring at mount — otherwise the panel reads as empty
+        // until the next live tick.
+        if matches!(kind, Kind::Trades) {
+            new_self.reseed_trades_persist(cx);
         }
+        new_self
+    }
+
+    /// Parse the free-form filter input value and apply it as the panel's
+    /// `min_usd` threshold. Triggers re-render + persistence save.
+    pub fn apply_trades_min_usd_from_text(
+        &mut self,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let parsed = trades::parse_min_usd(text);
+        let Some(current) = self.trades_min_usd.as_mut() else {
+            return;
+        };
+        if *current == parsed {
+            return;
+        }
+        *current = parsed;
+        self.reseed_trades_persist(cx);
+        cx.notify();
+        request_layout_save(cx);
+    }
+
+    /// Rebuild the panel-local persist buffer from the service's per-symbol
+    /// trade ring at the current threshold. Called on mount, on threshold
+    /// change, and on service Snapshot / Resnap. Cheap — the service ring
+    /// is bounded at `TRADES_BUFFER_CAP`.
+    pub fn reseed_trades_persist(&mut self, cx: &mut Context<Self>) {
+        let Some(symbol) = self.trades_symbol.clone() else {
+            return;
+        };
+        let Some(persist) = self.trades_persist.as_mut() else {
+            return;
+        };
+        let min_usd = self.trades_min_usd.unwrap_or(None);
+        persist.clear();
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        if let Some(snap) = market.read(cx).trades_snapshot(symbol.as_ref()) {
+            for t in snap.iter() {
+                if trades::passes_min_usd(t, min_usd) {
+                    persist.push_back(t.clone());
+                }
+            }
+            while persist.len() > TRADES_PERSIST_CAP {
+                persist.pop_front();
+            }
+        }
+    }
+
+    /// Append new live trades to the persist buffer, dropping ones below
+    /// the current threshold. Called from the `TradeEvent::Tick` handler.
+    pub fn append_trades_persist<I>(&mut self, trades: I, _cx: &mut Context<Self>)
+    where
+        I: IntoIterator<Item = crate::services::market_data::Trade>,
+    {
+        let min_usd = self.trades_min_usd.unwrap_or(None);
+        let Some(persist) = self.trades_persist.as_mut() else {
+            return;
+        };
+        for t in trades {
+            if trades::passes_min_usd(&t, min_usd) {
+                persist.push_back(t);
+            }
+        }
+        while persist.len() > TRADES_PERSIST_CAP {
+            persist.pop_front();
+        }
+    }
+
+    /// Update the trades panel's Size column display mode (COIN / USD).
+    /// Triggers re-render + persistence save.
+    pub fn set_trades_size_mode(
+        &mut self,
+        mode: trades::TradesSizeMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.trades_size_mode.as_mut() else {
+            return;
+        };
+        if *current == mode {
+            return;
+        }
+        *current = mode;
+        cx.notify();
+        request_layout_save(cx);
+    }
+
+    /// Update the orderbook panel's bucket choice. Triggers re-render +
+    /// persistence save. Bucket changes collapse / expand row counts and
+    /// shift the spread row's index, so the previous scroll offset is
+    /// meaningless — re-engage sticky centering so the new mid snaps back
+    /// into the middle of the viewport.
+    pub fn set_orderbook_bucket(
+        &mut self,
+        bucket: orderbook::OrderbookBucket,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.orderbook_state.as_mut() else {
+            return;
+        };
+        if state.bucket == bucket {
+            return;
+        }
+        state.bucket = bucket;
+        state.sticky_center = true;
+        state.last_set_offset_y = None;
+        cx.notify();
+        request_layout_save(cx);
+    }
+
+    /// Update the orderbook panel's Size column display mode (COIN / USD).
+    /// Triggers re-render + persistence save.
+    pub fn set_orderbook_size_mode(
+        &mut self,
+        mode: orderbook::OrderbookSizeMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.orderbook_state.as_mut() else {
+            return;
+        };
+        if state.size_mode == mode {
+            return;
+        }
+        state.size_mode = mode;
+        cx.notify();
+        request_layout_save(cx);
+    }
+
+    /// Engage sticky centering. The "Center" button in the panel header
+    /// drives this; while sticky is on, every render snaps the spread row
+    /// to the viewport middle. Sticky turns OFF automatically when the
+    /// user scrolls (detected in render).
+    pub fn request_orderbook_recenter(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.orderbook_state.as_mut() else {
+            return;
+        };
+        state.sticky_center = true;
+        state.last_set_offset_y = None;
+        cx.notify();
     }
 
     pub fn add_indicator_from_picker(
@@ -452,6 +921,30 @@ impl ContentPanel {
             return;
         };
         self.switch_chart_timeframe(tf, cx);
+    }
+
+    fn on_change_trades_size_mode(
+        &mut self,
+        action: &ChangeTradesSizeMode,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mode) = trades::TradesSizeMode::from_id(action.0.as_ref()) else {
+            return;
+        };
+        self.set_trades_size_mode(mode, cx);
+    }
+
+    fn on_change_orderbook_size_mode(
+        &mut self,
+        action: &ChangeOrderbookSizeMode,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mode) = orderbook::OrderbookSizeMode::from_id(action.0.as_ref()) else {
+            return;
+        };
+        self.set_orderbook_size_mode(mode, cx);
     }
 
     fn on_delete_selected_drawing(
@@ -611,6 +1104,8 @@ impl Panel for ContentPanel {
     fn tab_name(&self, _cx: &App) -> Option<SharedString> {
         match self.kind {
             Kind::Chart => self.chart_state.as_ref().map(|s| s.symbol().clone()),
+            Kind::Trades => self.trades_symbol.clone(),
+            Kind::Orderbook => self.orderbook_state.as_ref().map(|s| s.symbol.clone()),
             _ => None,
         }
     }
@@ -629,6 +1124,28 @@ impl Panel for ContentPanel {
             if let Ok(value) = serde_json::to_value(ChartPrefs {
                 symbol: chart.symbol().to_string(),
                 tf: chart.timeframe().as_str().to_string(),
+            }) {
+                state.info = PanelInfo::panel(value);
+            }
+        }
+        if matches!(self.kind, Kind::Trades) {
+            if let Some(sym) = &self.trades_symbol {
+                let min_usd = self.trades_min_usd.unwrap_or(None);
+                let size_mode = self.trades_size_mode.unwrap_or_default();
+                if let Ok(value) = serde_json::to_value(TradesPrefs {
+                    symbol: sym.to_string(),
+                    min_usd,
+                    size_mode: Some(size_mode.id().to_string()),
+                }) {
+                    state.info = PanelInfo::panel(value);
+                }
+            }
+        }
+        if let Some(ob) = &self.orderbook_state {
+            if let Ok(value) = serde_json::to_value(OrderbookPrefs {
+                symbol: ob.symbol.to_string(),
+                bucket: ob.bucket.id().to_string(),
+                size_mode: Some(ob.size_mode.id().to_string()),
             }) {
                 state.info = PanelInfo::panel(value);
             }
@@ -674,8 +1191,51 @@ impl Render for ContentPanel {
                 cx,
             )
             .into_any_element(),
+            Kind::Trades => {
+                let symbol = self
+                    .trades_symbol
+                    .clone()
+                    .expect("trades_symbol set for Trades");
+                let size_mode = self
+                    .trades_size_mode
+                    .expect("trades_size_mode set for Trades");
+                let input = self
+                    .trades_filter_input
+                    .clone()
+                    .expect("trades_filter_input set for Trades");
+                // SAFETY: render() borrows &self only; we copy/clone the slice
+                // out for the call so the panel's persist buffer isn't held
+                // across the render closure.
+                let persist_vec: Vec<crate::services::market_data::Trade> = self
+                    .trades_persist
+                    .as_ref()
+                    .map(|p| p.iter().cloned().collect())
+                    .unwrap_or_default();
+                trades::render(
+                    symbol,
+                    &persist_vec,
+                    size_mode,
+                    &input,
+                    self.focus_handle.clone(),
+                    window,
+                    cx,
+                )
+                .into_any_element()
+            }
+            Kind::Orderbook => orderbook::render(
+                self.orderbook_state
+                    .as_mut()
+                    .expect("orderbook_state set for Orderbook"),
+                self.focus_handle.clone(),
+                window,
+                cx,
+            )
+            .into_any_element(),
         };
-        let body = if matches!(self.kind, Kind::Chart) {
+        let body = if matches!(
+            self.kind,
+            Kind::Chart | Kind::Trades | Kind::Orderbook
+        ) {
             raw_body
         } else {
             div()
@@ -715,6 +1275,16 @@ impl Render for ContentPanel {
                     .on_action(cx.listener(Self::on_clear_drawings))
                     .on_action(cx.listener(Self::on_reset_chart_scale))
                     .on_action(cx.listener(Self::on_go_to_latest))
+            })
+            .when(matches!(self.kind, Kind::Trades), |this| {
+                this.track_focus(&self.focus_handle)
+                    .key_context("Trades")
+                    .on_action(cx.listener(Self::on_change_trades_size_mode))
+            })
+            .when(matches!(self.kind, Kind::Orderbook), |this| {
+                this.track_focus(&self.focus_handle)
+                    .key_context("Orderbook")
+                    .on_action(cx.listener(Self::on_change_orderbook_size_mode))
             })
             .size_full()
             .border_2()

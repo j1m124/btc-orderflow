@@ -32,6 +32,15 @@ const SERVER_WS_URL: &str = "ws://127.0.0.1:8787/ws";
 /// Page size for `HistoryPage` requests (Q9c).
 const HISTORY_PAGE_SIZE: u32 = 500;
 
+/// Cap on the live trades buffer kept per subscription. The trades panel
+/// keeps its own filter-aware persist buffer, so this ring only needs to
+/// be deep enough to feed the orderbook's last-trade strip and to seed a
+/// freshly-mounted or threshold-changed panel — a short window (~30s–2min
+/// of BTC perp tape) is plenty. Drops oldest first.
+/// `load_older_trades` deliberately bypasses this cap (user-initiated
+/// growth).
+const TRADES_BUFFER_CAP: usize = 200;
+
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
@@ -121,6 +130,10 @@ pub struct Candle {
     pub volume: f64,
     pub vwap: Option<f64>,
     pub trades: Option<i32>,
+    /// Base-asset volume traded with the *taker on the buy side* (aggressive
+    /// buys hitting asks). Drives volume-delta / CVD indicators without
+    /// needing the trade tape: `delta = 2 * taker_buy_vol - volume`.
+    pub taker_buy_vol: Option<f64>,
 }
 
 impl Candle {
@@ -133,7 +146,9 @@ impl Candle {
         close: f64,
         volume: f64,
     ) -> Self {
-        Self::new_full(open_time, close_time, open, high, low, close, volume, None, None)
+        Self::new_full(
+            open_time, close_time, open, high, low, close, volume, None, None, None,
+        )
     }
 
     pub fn new_full(
@@ -146,6 +161,7 @@ impl Candle {
         volume: f64,
         vwap: Option<f64>,
         trades: Option<i32>,
+        taker_buy_vol: Option<f64>,
     ) -> Self {
         let date = Local
             .timestamp_millis_opt(open_time)
@@ -163,6 +179,7 @@ impl Candle {
             volume,
             vwap,
             trades,
+            taker_buy_vol,
         }
     }
 }
@@ -1049,7 +1066,14 @@ impl MarketDataService {
         let Some(AnySubKey::Trades(key)) = self.by_id.get(&id).cloned() else {
             return;
         };
-        let domain: Vec<Trade> = trades.into_iter().map(trade_from_proto).collect();
+        let mut domain: Vec<Trade> = trades.into_iter().map(trade_from_proto).collect();
+        // Defensive: cap the snapshot too. The server's snapshot size is
+        // bounded but staying under TRADES_BUFFER_CAP keeps invariants
+        // consistent across snapshot + tick code paths.
+        if domain.len() > TRADES_BUFFER_CAP {
+            let drop_n = domain.len() - TRADES_BUFFER_CAP;
+            domain.drain(0..drop_n);
+        }
         self.trades.insert(key.clone(), domain.clone());
         self.trade_history_in_flight.remove(&key);
         cx.emit(TradeEvent::Snapshot {
@@ -1071,6 +1095,12 @@ impl MarketDataService {
         let buf = self.trades.entry(key.clone()).or_default();
         for t in &domain {
             buf.push(t.clone());
+        }
+        // Drop oldest to keep the live tape from growing unbounded over
+        // long sessions. `load_older_trades` skips this path on purpose.
+        if buf.len() > TRADES_BUFFER_CAP {
+            let drop_n = buf.len() - TRADES_BUFFER_CAP;
+            buf.drain(0..drop_n);
         }
         cx.emit(TradeEvent::Tick {
             symbol: key.symbol.clone().into(),
@@ -1641,6 +1671,7 @@ fn candle_from_proto(c: proto::Candle) -> Candle {
         c.volume,
         vwap,
         c.trades,
+        c.taker_buy_vol,
     )
 }
 

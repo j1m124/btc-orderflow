@@ -144,6 +144,7 @@ pub fn default_pane_height(kind_id: &str) -> f32 {
     match kind_id {
         "volume" => 90.0,
         "trades" => 90.0,
+        "volume_delta" => 120.0,
         _ => 140.0,
     }
 }

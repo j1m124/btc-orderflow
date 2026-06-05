@@ -325,8 +325,11 @@ pub async fn run_trade_writer(
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        // No `biased;`: the aggTrade broadcast is hot enough that biased
+        // polling order would keep `rx.recv()` Ready every iteration and
+        // starve `flush_timer.tick()`, so the writer would buffer
+        // indefinitely and never write to the DB. Random select fixes that.
         tokio::select! {
-            biased;
             msg = rx.recv() => {
                 match msg {
                     Ok(tick) => {
@@ -632,8 +635,10 @@ async fn maintain_one_session(
 
     let mut found_first = false;
     loop {
+        // No `biased;`: the depth firehose keeps `depth_rx.recv()` Ready
+        // every iteration; biased polling would starve `snapshot_timer.tick()`
+        // and historical book snapshots would never persist.
         tokio::select! {
-            biased;
             msg = depth_rx.recv() => {
                 match msg {
                     Ok(diff) => {

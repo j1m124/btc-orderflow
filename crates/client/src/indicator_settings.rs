@@ -28,7 +28,8 @@ use gpui_component::{
 use serde::Deserialize;
 
 use crate::indicators::{
-    BbParams, COLOR_PALETTE_SIZE, InstanceId, Placement, Source, palette_color_for,
+    BbParams, COLOR_PALETTE_SIZE, InstanceId, Placement, Source, VolumeDeltaMode,
+    VolumeDeltaParams, palette_color_for,
 };
 use crate::panels::ContentPanel;
 
@@ -170,6 +171,7 @@ impl Render for IndicatorSettingsView {
         let kind_body = match snapshot.kind_id {
             "bb" => render_bb(&snapshot, target.clone(), id, cx),
             "volume" => render_volume(&snapshot, target.clone(), id, cx),
+            "volume_delta" => render_volume_delta(&snapshot, target.clone(), id, cx),
             _ => div()
                 .text_color(muted)
                 .child("Unknown indicator kind")
@@ -313,6 +315,65 @@ fn render_volume(
                 )),
         )
         .into_any_element()
+}
+
+/// Volume Delta form: a single Mode selector (Histogram / CVD / Both). No
+/// placement toggle — kind is PaneOnly. Mode change routes through
+/// `update_indicator`, which re-runs `compute` AND `sync_colors` so the
+/// CVD color slot appears/disappears with the mode.
+fn render_volume_delta(
+    snap: &InstanceSnapshot,
+    target: WeakEntity<ContentPanel>,
+    id: InstanceId,
+    cx: &mut Context<IndicatorSettingsView>,
+) -> gpui::AnyElement {
+    let current = read_volume_delta_mode(&snap.params).unwrap_or_default();
+    let muted = cx.theme().muted_foreground;
+    let mut buttons = h_flex().gap_2();
+    for m in VolumeDeltaMode::ALL {
+        let target = target.clone();
+        let mode = *m;
+        let is_active = mode == current;
+        let btn_id = SharedString::from(format!("vd-mode-{}-{}", id, mode.label()));
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(mode.label()))
+            .small();
+        btn = if is_active { btn.primary() } else { btn.ghost() };
+        btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target.upgrade() else {
+                return;
+            };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<VolumeDeltaParams>(kind, |x| x.mode = mode);
+                    });
+                    cx.notify();
+                }
+            });
+        }));
+        buttons = buttons.child(btn);
+    }
+    v_flex()
+        .gap_2()
+        .child(label_row("Mode"))
+        .child(buttons)
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("Delta = 2 \u{00d7} taker_buy_vol \u{2212} volume"),
+        )
+        .into_any_element()
+}
+
+fn read_volume_delta_mode(params: &serde_json::Value) -> Option<VolumeDeltaMode> {
+    let s = params.pointer("/mode")?.as_str()?;
+    Some(match s {
+        "Histogram" => VolumeDeltaMode::Histogram,
+        "Cvd" => VolumeDeltaMode::Cvd,
+        _ => return None,
+    })
 }
 
 // ────────────────────────────── form widgets ──────────────────────────────
