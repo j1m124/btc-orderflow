@@ -248,6 +248,7 @@ pub(super) fn paint_main_chart(
     y_axis_gap: f32,
     colors: MainChartColors,
     render_kind: RenderKind,
+    render_visible: bool,
     footprint_params: Option<&FootprintParams>,
     footprint_cells: &[FootprintCell],
     window: &mut Window,
@@ -373,11 +374,17 @@ pub(super) fn paint_main_chart(
     // classic wick+body pipeline; the footprint kinds fall back to candles
     // until per-bucket cells are loaded, then paint a wireframe (Behind /
     // SideOhlc / None per `params.wireframe`) plus cluster or profile cells.
+    //
+    // `render_visible` gates this whole layer — false suppresses the
+    // candle / cell / wireframe paint while the grid + axes + overlays
+    // keep painting (driven by the synthetic render chip's eye toggle).
     let render_cells_available =
         matches!(render_kind, RenderKind::Cluster | RenderKind::Profile)
             && !footprint_cells.is_empty()
             && footprint_params.is_some();
-    if !render_cells_available {
+    if !render_visible {
+        // Skip the main render layer entirely; everything else still paints.
+    } else if !render_cells_available {
         paint_candle_bodies(
             origin, candles, start_idx, view_start, view_size, canvas_w, canvas_h, chart_w,
             y_lo, y_hi, y_axis_gap, colors.bullish, colors.bearish, window,

@@ -24,7 +24,10 @@ pub mod orderbook;
 pub mod trades;
 pub mod watchlist;
 
-pub use chart::{ChangeChartTimeframe, GoToLatest, ResetChartScale};
+pub use chart::{
+    ChangeChartRender, ChangeChartTimeframe, GoToLatest, ResetChartScale,
+    ToggleChartRenderVisible,
+};
 pub use orderbook::{ChangeOrderbookBucket, ChangeOrderbookSizeMode};
 pub use trades::ChangeTradesSizeMode;
 
@@ -281,6 +284,15 @@ pub struct ContentPanel {
     _chart_clock_tick: Option<Task<()>>,
     _tz_subscription: Option<gpui::Subscription>,
     chart_sub_handles: Vec<crate::services::market_data::SubscriptionHandle>,
+    /// Footprint subscription for the chart's active render kind. Allocated
+    /// lazily when render kind enters Cluster / Profile; dropped on the way
+    /// out. The key is tracked separately so the lifecycle helper can detect
+    /// (symbol, tf, bucket) drift and drop+reopen exactly once.
+    chart_footprint_sub: Option<crate::services::market_data::SubscriptionHandle>,
+    /// `(symbol, tf, bucket_bits)` — bucket bits are `f64::to_bits` so the
+    /// key supports `Eq`. Any drift triggers drop+reopen of the sub.
+    chart_footprint_key:
+        Option<(SharedString, crate::services::market_data::Timeframe, u64)>,
     watchlist_sub_handles: HashMap<SharedString, crate::services::market_data::SubscriptionHandle>,
     pub(crate) trades_symbol: Option<SharedString>,
     pub(crate) trades_min_usd: Option<Option<f64>>,
@@ -454,6 +466,64 @@ impl ContentPanel {
                             }
                         }
                         HistoryCapped { .. } | StatusChanged { .. } => {
+                            cx.notify();
+                        }
+                    }
+                },
+            )
+            .detach();
+            // FootprintEvent → write into ChartState's footprint_cells buffer.
+            // Matched on the chart's currently-pinned `chart_footprint_key`
+            // (set by `refresh_chart_footprint_sub`); events for stale subs
+            // are ignored. Service's footprint snapshot is the authoritative
+            // buffer — we copy it wholesale on every relevant event rather
+            // than maintaining a parallel diff path here.
+            cx.subscribe_in(
+                &service,
+                window,
+                |this,
+                 _service,
+                 event: &crate::services::market_data::FootprintEvent,
+                 _window,
+                 cx| {
+                    use crate::services::market_data::FootprintEvent::*;
+                    let Some((key_symbol, key_tf, key_bucket_bits)) =
+                        this.chart_footprint_key.clone()
+                    else {
+                        return;
+                    };
+                    let key_bucket = f64::from_bits(key_bucket_bits);
+                    let matches = match event {
+                        Snapshot { symbol, tf, .. }
+                        | Update { symbol, tf, .. }
+                        | Prepended { symbol, tf, .. }
+                        | HistoryCapped { symbol, tf }
+                        | Resnap { symbol, tf } => {
+                            symbol.as_ref() == key_symbol.as_ref() && *tf == key_tf
+                        }
+                    };
+                    if !matches {
+                        return;
+                    }
+                    match event {
+                        Snapshot { .. } | Update { .. } | Prepended { .. } | Resnap { .. } => {
+                            let market = cx
+                                .global::<
+                                    crate::services::market_data::MarketDataServiceHandle,
+                                >()
+                                .0
+                                .clone();
+                            let cells = market.read(cx).footprint_cells(
+                                key_symbol.as_ref(),
+                                key_tf,
+                                key_bucket,
+                            );
+                            if let Some(state) = this.chart_state.as_mut() {
+                                state.set_footprint_cells(cells);
+                            }
+                            cx.notify();
+                        }
+                        HistoryCapped { .. } => {
                             cx.notify();
                         }
                     }
@@ -685,6 +755,8 @@ impl ContentPanel {
             _chart_clock_tick: chart_clock_tick,
             _tz_subscription: tz_subscription,
             chart_sub_handles: chart_handles,
+            chart_footprint_sub: None,
+            chart_footprint_key: None,
             watchlist_sub_handles: watchlist_handles,
             trades_symbol,
             trades_min_usd,
@@ -868,6 +940,7 @@ impl ContentPanel {
         self.chart_sub_handles = new_handles;
         let live = live_snapshot(target, tf, cx);
         if state.switch_symbol(target, live) {
+            self.refresh_chart_footprint_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -886,8 +959,75 @@ impl ContentPanel {
         self.chart_sub_handles = new_handles;
         let live = live_snapshot(symbol.as_ref(), tf, cx);
         if state.switch_timeframe(tf, live) {
+            self.refresh_chart_footprint_sub(cx);
             cx.notify();
             request_layout_save(cx);
+        }
+    }
+
+    /// Switch the chart's render kind. If the kind actually changed, the
+    /// footprint sub is re-evaluated atomically (allocated, dropped, or
+    /// re-keyed) and the chart re-renders.
+    pub fn switch_chart_render(&mut self, kind: chart::RenderKind, cx: &mut Context<Self>) {
+        let Some(state) = self.chart_state.as_mut() else {
+            return;
+        };
+        if state.switch_render(kind) {
+            // Cells from the old mode (if any) are stale relative to the
+            // new render kind; clear immediately so the fallback path
+            // (candle bodies) shows while the new sub's snapshot arrives.
+            state.clear_footprint_cells();
+            self.refresh_chart_footprint_sub(cx);
+            cx.notify();
+            request_layout_save(cx);
+        }
+    }
+
+    /// Reconcile `chart_footprint_sub` with the chart's current render kind
+    /// + params. Idempotent — bails fast when the desired key matches the
+    /// pinned one, drops the old handle and clears stale cells when the
+    /// key shifts, allocates a new sub when entering a footprint mode.
+    fn refresh_chart_footprint_sub(&mut self, cx: &mut Context<Self>) {
+        let desired: Option<(
+            SharedString,
+            crate::services::market_data::Timeframe,
+            f64,
+        )> = self.chart_state.as_ref().and_then(|state| {
+            if !state.render_kind().needs_footprint_sub() {
+                return None;
+            }
+            let params = state.active_footprint_params()?;
+            if !chart::FootprintParams::bucket_is_valid(params.bucket) {
+                return None;
+            }
+            Some((state.symbol().clone(), state.timeframe(), params.bucket))
+        });
+        let desired_key = desired
+            .as_ref()
+            .map(|(s, tf, b)| (s.clone(), *tf, b.to_bits()));
+        if desired_key == self.chart_footprint_key {
+            return;
+        }
+        // Drop the old handle BEFORE allocating the new one so the service
+        // refcount can settle to zero (and the WS Unsubscribe fire) before
+        // the new Subscribe — keeps the per-(symbol, tf, bucket) sub from
+        // racing itself when only the bucket changed.
+        self.chart_footprint_sub = None;
+        if let Some(state) = self.chart_state.as_mut() {
+            state.clear_footprint_cells();
+        }
+        if let Some((sym, tf, bucket)) = desired {
+            let handle = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone()
+                .update(cx, |svc, cx| {
+                    svc.ensure_footprint(sym.as_ref(), tf, bucket, cx)
+                });
+            self.chart_footprint_sub = Some(handle);
+            self.chart_footprint_key = Some((sym, tf, bucket.to_bits()));
+        } else {
+            self.chart_footprint_key = None;
         }
     }
 
@@ -921,6 +1061,32 @@ impl ContentPanel {
             return;
         };
         self.switch_chart_timeframe(tf, cx);
+    }
+
+    fn on_change_chart_render(
+        &mut self,
+        action: &ChangeChartRender,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(kind) = chart::RenderKind::from_id(action.0.as_ref()) else {
+            return;
+        };
+        self.switch_chart_render(kind, cx);
+    }
+
+    fn on_toggle_chart_render_visible(
+        &mut self,
+        _: &ToggleChartRenderVisible,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.chart_state.as_mut() else {
+            return;
+        };
+        let v = state.render_visible();
+        state.set_render_visible(!v);
+        cx.notify();
     }
 
     fn on_change_trades_size_mode(
@@ -1291,6 +1457,8 @@ impl Render for ContentPanel {
                 this.track_focus(&self.focus_handle)
                     .key_context("Chart")
                     .on_action(cx.listener(Self::on_change_chart_timeframe))
+                    .on_action(cx.listener(Self::on_change_chart_render))
+                    .on_action(cx.listener(Self::on_toggle_chart_render_visible))
                     .on_action(cx.listener(Self::on_move_indicator_pane_up))
                     .on_action(cx.listener(Self::on_move_indicator_pane_down))
                     .on_action(cx.listener(Self::on_toggle_indicator_hidden))

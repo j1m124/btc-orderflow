@@ -21,7 +21,7 @@ use gpui::{
     px,
 };
 use gpui_component::{
-    ActiveTheme as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
@@ -70,6 +70,26 @@ use crate::symbol_picker::OpenSymbolPicker;
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = client, no_json)]
 pub struct ChangeChartTimeframe(pub SharedString);
+
+/// Switch the chart's render kind (`candlestick`/`cluster`/`profile`).
+/// Dispatched from the header render-kind dropdown next to the TF
+/// selector. Carries the [`RenderKind::as_id`] string; the handler
+/// parses it back via [`RenderKind::from_id`] and routes through
+/// `ContentPanel::switch_chart_render` so the footprint subscription
+/// lifecycle is re-evaluated atomically with the state change.
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct ChangeChartRender(pub SharedString);
+
+/// Toggle the eye on the synthetic render chip — suppresses the main
+/// render layer (candles / cells / wireframes) without dropping any
+/// subscription. Overlays and drawings keep painting. The chip is
+/// special-cased (not an `IndicatorInstance`) so it carries no id;
+/// the handler reads the chart's current `render_visible` flag and
+/// flips it.
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct ToggleChartRenderVisible;
 
 // Drawing-delete + clear actions now live in `crate::drawings::actions` so
 // they're shared with workspace-wide key bindings and the Objects popover.
@@ -614,6 +634,13 @@ pub struct ChartState {
     cluster_params: FootprintParams,
     /// Persisted per-mode params for the Profile render.
     profile_params: FootprintParams,
+    /// Live footprint cells for the active (symbol, tf, bucket) sub.
+    /// Replaced wholesale on FootprintEvent {Snapshot, Update, Prepended};
+    /// cleared when the sub is released (render switch to Candlestick,
+    /// symbol/timeframe/bucket change). Empty triggers paint_main_chart's
+    /// fallback to candle bodies so the chart never goes blank during the
+    /// snapshot round-trip.
+    footprint_cells: Vec<crate::services::market_data::FootprintCell>,
 }
 
 /// Baseline captured at splitter mouse-down. The outer mouse-move handler
@@ -800,6 +827,28 @@ impl ChartState {
 
     pub fn timeframe(&self) -> Timeframe {
         self.timeframe
+    }
+
+    /// Read-only view of the live footprint cells for the active sub.
+    /// Empty when render kind is Candlestick, when no sub is currently
+    /// open, or while the initial snapshot is in flight.
+    pub fn footprint_cells(&self) -> &[crate::services::market_data::FootprintCell] {
+        &self.footprint_cells
+    }
+
+    /// Replace the footprint buffer wholesale. Called by `ContentPanel`'s
+    /// FootprintEvent handler on Snapshot / Update / Prepended. Cleared
+    /// (`Vec::new`) when the sub is released — leaves the chart's render
+    /// branch free to fall back to candle bodies automatically.
+    pub fn set_footprint_cells(
+        &mut self,
+        cells: Vec<crate::services::market_data::FootprintCell>,
+    ) {
+        self.footprint_cells = cells;
+    }
+
+    pub fn clear_footprint_cells(&mut self) {
+        self.footprint_cells.clear();
     }
 
     /// Reset both axes to their defaults: trailing-window viewport on x,
@@ -1239,6 +1288,7 @@ impl ChartState {
             render_visible: true,
             cluster_params: FootprintParams::cluster_default(),
             profile_params: FootprintParams::profile_default(),
+            footprint_cells: Vec::new(),
         };
         // Every fresh chart is born with a Volume overlay. `switch_*`
         // callers preserve the user's indicator list, so this seeding only
@@ -1592,9 +1642,111 @@ fn render_indicator_chips_filtered(
         .collect()
 }
 
+/// Render the synthetic chip representing the chart's active render kind.
+/// Pinned at the top of the indicator list, shares chip UX (label + eye +
+/// gear + trash) but isn't an `IndicatorInstance` — there's no `InstanceId`
+/// to carry, and the trash glyph is rendered as a non-interactive placeholder
+/// (per the locked design: the only way out of a render is the header
+/// dropdown). The gear opens the per-mode settings popover; for Candlestick
+/// the gear is also disabled (`has_settings() == false`). The settings
+/// popover wiring lands in Commit 4 — for now the gear logs the intent.
+fn render_synthetic_render_chip(
+    state: &ChartState,
+    cx: &mut Context<super::ContentPanel>,
+) -> gpui::AnyElement {
+    let kind = state.render_kind();
+    let visible = state.render_visible();
+    let has_settings = kind.has_settings();
+    let label = SharedString::from(kind.display_name());
+
+    let (text_color, border_color, disabled_color) = {
+        let theme = cx.theme();
+        if !visible {
+            (
+                theme.muted_foreground,
+                Hsla { a: 0.45, ..theme.border },
+                Hsla { a: 0.35, ..theme.muted_foreground },
+            )
+        } else {
+            (
+                theme.foreground,
+                theme.border,
+                Hsla { a: 0.35, ..theme.muted_foreground },
+            )
+        }
+    };
+    let eye_label: SharedString = if visible {
+        SharedString::from("\u{25CF}") // ●
+    } else {
+        SharedString::from("\u{25CB}") // ○
+    };
+    let hover_bg = {
+        let muted = cx.theme().muted;
+        Hsla { a: 0.30, ..muted }
+    };
+
+    let mut chip = h_flex()
+        .id(SharedString::from("chip-render-synthetic"))
+        .gap_1()
+        .px_2()
+        .py(px(2.))
+        .items_center()
+        .rounded(px(4.))
+        .border_1()
+        .border_color(border_color)
+        .text_xs()
+        .text_color(text_color)
+        // Match the indicator chip's occlude + hover bg — keeps the
+        // chip behaving like its siblings in the same vertical stack.
+        .occlude()
+        .hover(move |this| this.bg(hover_bg))
+        .child(div().child(label))
+        // Eye toggles `render_visible` — flipping it suppresses the main
+        // render layer (paint_main_chart honours `render_visible`) without
+        // touching subscriptions. Dispatches an action so chart-scoped
+        // key bindings could trigger the same toggle later.
+        .child(
+            Button::new("chip-render-eye")
+                .label(eye_label)
+                .xsmall()
+                .ghost()
+                .on_click(|_ev, window, cx| {
+                    window.dispatch_action(Box::new(ToggleChartRenderVisible), cx);
+                }),
+        );
+
+    // Gear: enabled only for footprint kinds (Candlestick has no params).
+    // Click target wired up in Commit 4 (settings popover); for now it's a
+    // bare button so the layout is final.
+    let gear_btn = Button::new("chip-render-gear")
+        .label(SharedString::from("\u{2699}")) // ⚙
+        .xsmall()
+        .ghost();
+    chip = if has_settings {
+        chip.child(gear_btn)
+    } else {
+        chip.child(gear_btn.disabled(true))
+    };
+
+    // Trash: visually present but disabled — per locked design the render
+    // is always required; only the header dropdown switches kinds. Rendered
+    // dimmer than the active glyphs so it reads as "informational only".
+    let trash = div()
+        .px_1()
+        .text_color(disabled_color)
+        .child(SharedString::from("\u{00d7}")); // ×
+    chip = chip.child(trash);
+
+    chip.into_any_element()
+}
+
 /// Render the main-pane vertical indicator list — a header chip
 /// `Indicators (N) ▼/▶` that toggles `state.indicators_collapsed`, plus a
-/// stack of overlay-indicator chips below it when expanded.
+/// stack of overlay-indicator chips below it when expanded. The synthetic
+/// render chip (Candlestick / Cluster / Profile) is pinned at the top of
+/// the chip stack — always visible regardless of `indicators_collapsed`,
+/// since the render kind is the chart's primary mode rather than an
+/// optional overlay.
 ///
 /// Pane-placed indicators are NOT included here; they each get their own
 /// chip rendered at the top-left of their sub-pane (`render_sub_pane_chip`).
@@ -1650,15 +1802,20 @@ fn render_main_indicator_list(
     } else {
         render_indicator_chips_filtered(state, cx, |i| i.placement == Placement::Overlay)
     };
+    let render_chip = render_synthetic_render_chip(state, cx);
     // Absolute-anchored at the main canvas's top-left (mirrors the
     // pre-move OHLC pill's `top(8) left(8)`). `items_start` so each chip
     // auto-sizes to its content rather than stretching to fill the longest.
+    // Render chip pinned above the header so it stays visible when the
+    // user collapses the indicator list — render kind is the chart's
+    // primary mode, not an optional overlay.
     v_flex()
         .absolute()
         .top(px(8.0))
         .left(px(8.0))
         .gap_1()
         .items_start()
+        .child(render_chip)
         .child(header)
         .children(chips)
         .into_any_element()
@@ -2267,6 +2424,26 @@ pub fn render(
             menu
         });
 
+    // Render-kind dropdown (Candlestick / Footprint Cluster / Footprint
+    // Profile). Sits next to the TF selector; switching swaps the chart's
+    // main render layer and triggers the footprint sub lifecycle in
+    // `ContentPanel::on_change_chart_render`.
+    let render_focus = focus.clone();
+    let render_btn = Button::new("chart-render-select")
+        .label(SharedString::from(state.render_kind().display_name()))
+        .small()
+        .ghost()
+        .dropdown_menu(move |menu, _, _| {
+            let mut menu = menu.action_context(render_focus.clone());
+            for kind in [RenderKind::Candlestick, RenderKind::Cluster, RenderKind::Profile] {
+                menu = menu.menu(
+                    SharedString::from(kind.display_name()),
+                    Box::new(ChangeChartRender(SharedString::from(kind.as_id()))),
+                );
+            }
+            menu
+        });
+
     // Snapshot the candle slice the paint pass needs. Cloning is fine — at
     // default `view_size = 60` we copy ~60 `Candle`s once per render, the
     // same cost the deleted `visible_for_chart_with_y` had. The closure
@@ -2281,14 +2458,17 @@ pub fn render(
     let paint_view_size = state.view_size;
     let paint_candle_interval_ms = state.candle_interval_ms();
     let paint_y_axis_gap = state.y_axis_gap_px.get();
-    // Render-mode dispatch params. The data path (footprint cells via the
-    // market_data service) is wired up in Commit 3 — for now we pass the
-    // active params + an empty cell slice so `paint_main_chart`'s footprint
-    // branch falls back to candles automatically.
+    // Render-mode dispatch params. Footprint cells are kept in
+    // `ChartState::footprint_cells`, populated by `ContentPanel`'s
+    // FootprintEvent handler; when the active render is Candlestick or
+    // the sub is closed, this is empty and the paint pipeline falls back
+    // to candle bodies automatically.
     let paint_render_kind = state.render_kind();
+    let paint_render_visible = state.render_visible();
     let paint_footprint_params: Option<FootprintParams> =
         state.active_footprint_params().copied();
-    let paint_footprint_cells: Vec<market_data::FootprintCell> = Vec::new();
+    let paint_footprint_cells: Vec<market_data::FootprintCell> =
+        state.footprint_cells().to_vec();
     // Pre-filter overlay indicators for the paint closure: skip hidden /
     // pane-placed instances, snapshot color + output so the closure stays
     // 'static. Per-render clone — `Series` is a `Vec<Option<f64>>`, so the
@@ -3903,6 +4083,7 @@ pub fn render(
                             paint_y_axis_gap,
                             main_chart_colors,
                             paint_render_kind,
+                            paint_render_visible,
                             paint_footprint_params.as_ref(),
                             &paint_footprint_cells,
                             window,
@@ -4365,6 +4546,7 @@ pub fn render(
                 .items_center()
                 .child(symbol_button)
                 .child(timeframe_btn)
+                .child(render_btn)
                 // `+ Indicator` button — dispatches `OpenIndicatorPicker`
                 // which the workspace resolves to this chart via the
                 // `LastFocusedChart` global (already kept fresh by the
