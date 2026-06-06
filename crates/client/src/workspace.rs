@@ -45,12 +45,10 @@ pub struct TerminalWorkspace {
 
 struct FloatingCodeEditorSlot {
     window: Entity<FloatingWindow>,
-    editor: Entity<FloatingCodeEditor>,
 }
 
 struct FloatingIndicatorSettingsSlot {
     window: Entity<FloatingWindow>,
-    view: Entity<IndicatorSettingsView>,
 }
 
 impl TerminalWorkspace {
@@ -425,7 +423,7 @@ impl TerminalWorkspace {
             let _ = this;
         })
         .detach();
-        self.indicator_settings = Some(FloatingIndicatorSettingsSlot { window: win, view });
+        self.indicator_settings = Some(FloatingIndicatorSettingsSlot { window: win });
     }
 
     fn on_toggle_floating_code_editor(
@@ -454,7 +452,7 @@ impl TerminalWorkspace {
             let _ = this;
         })
         .detach();
-        self.floating_code_editor = Some(FloatingCodeEditorSlot { window: win, editor });
+        self.floating_code_editor = Some(FloatingCodeEditorSlot { window: win });
     }
 
     fn on_set_active_tool(

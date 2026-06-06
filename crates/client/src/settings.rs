@@ -632,21 +632,6 @@ fn adjust_chart(cx: &mut gpui::App, mutate: impl FnOnce(&mut ChartPrefs)) {
     prefs::set_chart_prefs(cx, prefs);
 }
 
-fn layout_reset_row(_cx: &mut Context<SettingsView>) -> impl IntoElement {
-    setting_row(
-        "Reset layout",
-        "Rebuilds the active mode's default layout.",
-        Button::new("reset-layout")
-            .label("Reset current mode")
-            .small()
-            .outline()
-            .on_click(|_, window, cx| {
-                window.dispatch_action(Box::new(crate::top_bar::ResetLayout), cx);
-                window.close_dialog(cx);
-            }),
-    )
-}
-
 fn setting_row(
     title: &'static str,
     blurb: &'static str,

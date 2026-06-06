@@ -65,24 +65,11 @@ pub enum FilterTab {
 }
 
 impl FilterTab {
-    fn label(self) -> &'static str {
-        match self {
-            FilterTab::All => "All",
-            FilterTab::Class(c) => c.display(),
-        }
-    }
-
     fn matches(self, instrument: InstrumentType) -> bool {
         match self {
             FilterTab::All => true,
             FilterTab::Class(c) => c == instrument,
         }
-    }
-
-    fn all() -> Vec<FilterTab> {
-        let mut tabs = vec![FilterTab::All];
-        tabs.extend(InstrumentType::ALL.iter().copied().map(FilterTab::Class));
-        tabs
     }
 }
 

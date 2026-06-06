@@ -25,7 +25,7 @@ pub mod trades;
 pub mod watchlist;
 
 pub use chart::{ChangeChartTimeframe, GoToLatest, ResetChartScale};
-pub use orderbook::ChangeOrderbookSizeMode;
+pub use orderbook::{ChangeOrderbookBucket, ChangeOrderbookSizeMode};
 pub use trades::ChangeTradesSizeMode;
 
 /// Minimum interval between chart re-paints driven by tick events. 50ms = 20Hz.
@@ -947,6 +947,18 @@ impl ContentPanel {
         self.set_orderbook_size_mode(mode, cx);
     }
 
+    fn on_change_orderbook_bucket(
+        &mut self,
+        action: &ChangeOrderbookBucket,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(bucket) = orderbook::OrderbookBucket::from_id(action.0.as_ref()) else {
+            return;
+        };
+        self.set_orderbook_bucket(bucket, cx);
+    }
+
     fn on_delete_selected_drawing(
         &mut self,
         _: &crate::drawings::actions::DeleteSelectedDrawing,
@@ -1097,17 +1109,29 @@ impl Panel for ContentPanel {
         self.kind.id()
     }
 
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        SharedString::from(self.kind.display())
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The single-tab dock path renders `title()` instead of `tab_name()`
+        // (see gpui-component `tab_panel.rs::render_title_bar` — when one
+        // panel is visible it skips the tab strip and falls back to the
+        // panel's title). Mirror the `tab_name` lookup here so the dock
+        // label stays `btc/usd@binancef` regardless of tab count.
+        self.tab_name(cx)
+            .unwrap_or_else(|| SharedString::from(self.kind.display()))
     }
 
-    fn tab_name(&self, _cx: &App) -> Option<SharedString> {
-        match self.kind {
-            Kind::Chart => self.chart_state.as_ref().map(|s| s.symbol().clone()),
-            Kind::Trades => self.trades_symbol.clone(),
-            Kind::Orderbook => self.orderbook_state.as_ref().map(|s| s.symbol.clone()),
-            _ => None,
-        }
+    fn tab_name(&self, cx: &App) -> Option<SharedString> {
+        let ticker: SharedString = match self.kind {
+            Kind::Chart => self.chart_state.as_ref().map(|s| s.symbol().clone())?,
+            Kind::Trades => self.trades_symbol.clone()?,
+            Kind::Orderbook => self.orderbook_state.as_ref().map(|s| s.symbol.clone())?,
+            _ => return None,
+        };
+        Some(
+            cx.global::<crate::services::symbols::SymbolsServiceHandle>()
+                .0
+                .read(cx)
+                .normalized_or_lower(ticker.as_ref()),
+        )
     }
 
     fn closable(&self, _cx: &App) -> bool {
@@ -1285,6 +1309,7 @@ impl Render for ContentPanel {
                 this.track_focus(&self.focus_handle)
                     .key_context("Orderbook")
                     .on_action(cx.listener(Self::on_change_orderbook_size_mode))
+                    .on_action(cx.listener(Self::on_change_orderbook_bucket))
             })
             .size_full()
             .border_2()

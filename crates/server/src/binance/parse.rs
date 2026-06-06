@@ -106,7 +106,6 @@ pub enum InboundEvent {
 #[derive(Clone, Debug)]
 pub struct DepthDiff {
     pub symbol: String,
-    pub event_time_ms: i64,
     pub first_update_id: i64,
     pub final_update_id: i64,
     pub prev_final_update_id: i64,
@@ -119,8 +118,6 @@ pub struct DepthDiff {
 struct DepthDiffEventRaw {
     #[serde(rename = "e")]
     event: String,
-    #[serde(rename = "E")]
-    event_time_ms: i64,
     #[serde(rename = "s")]
     symbol: String,
     #[serde(rename = "U")]
@@ -339,7 +336,6 @@ impl CombinedStreamMsg {
         }
         Ok(Some(DepthDiff {
             symbol: raw.symbol,
-            event_time_ms: raw.event_time_ms,
             first_update_id: raw.first_update_id,
             final_update_id: raw.final_update_id,
             prev_final_update_id: raw.prev_final_update_id,

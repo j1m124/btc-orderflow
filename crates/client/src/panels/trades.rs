@@ -100,7 +100,7 @@ pub fn passes_min_usd(t: &Trade, min_usd: Option<f64>) -> bool {
 }
 
 pub fn render(
-    symbol: SharedString,
+    _symbol: SharedString,
     trades: &[Trade],
     size_mode: TradesSizeMode,
     filter_input: &Entity<InputState>,
@@ -118,18 +118,15 @@ pub fn render(
         TradesSizeMode::Coin => "Size",
         TradesSizeMode::Usd => "Size ($)",
     };
+    // Header carries only the controls (size mode + min-USD filter) — the
+    // panel identifier sits in the dock tab name via `Panel::tab_name`, so a
+    // body header label would just duplicate it.
     let header = h_flex()
         .px_2()
         .py_1()
         .gap_2()
         .items_center()
-        .child(
-            div()
-                .flex_1()
-                .text_size(px(11.))
-                .text_color(fg)
-                .child(SharedString::from(format!("Trades \u{2014} {}", symbol))),
-        )
+        .child(div().flex_1())
         .child(size_mode_dropdown(size_mode, focus.clone()))
         .child(
             div()

@@ -55,6 +55,15 @@ const FOOTPRINT_SNAPSHOT_BARS: i64 = 100;
 /// Server-side batching window for live trade / book / footprint frames.
 const LIVE_BATCH_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Cadence of full-state `BookSnapshot` resends on the Book channel. Bounds
+/// how long any client-side drift can persist: the depth diff filter can
+/// silently drop a removal delta when the top-N window shifts under a fast
+/// market (Mode 2 in the bug investigation), and during a maintainer
+/// rebootstrap window the forwarder relays diffs against an empty
+/// `book_state` (Mode 1). Either way, the next periodic snapshot replaces
+/// the client's `cur_bids`/`cur_asks` wholesale.
+const BOOK_SNAPSHOT_REFRESH: Duration = Duration::from_secs(5);
+
 /// Per-subscription bookkeeping held by the session for routing
 /// `Unsubscribe` and `HistoryPage` ops. `channel` carries the per-kind
 /// parameters the HistoryPage handler needs to issue the right query.
@@ -69,7 +78,7 @@ enum SubChannel {
     Candles { tf: Timeframe },
     Trades,
     Footprint { tf: Timeframe, price_bucket: f64 },
-    Book { depth: u16 },
+    Book,
 }
 
 impl Drop for SubMeta {
@@ -242,7 +251,7 @@ async fn handle_text(
                             write_tx.clone(),
                         ),
                     );
-                    (SubChannel::Book { depth }, h)
+                    (SubChannel::Book, h)
                 }
             };
 
@@ -363,7 +372,7 @@ async fn history_page(
             .await?;
             send_frame(write_tx, &ServerFrame::FootprintHistoryPage { id, cells }).await;
         }
-        SubChannel::Book { .. } => {
+        SubChannel::Book => {
             let snapshots = db::fetch_book_history_page(&pool, &symbol, before_ms, count).await?;
             send_frame(write_tx, &ServerFrame::BookHistoryPage { id, snapshots }).await;
         }
@@ -600,6 +609,12 @@ async fn run_book_subscription(
     let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
     batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     batch_timer.tick().await;
+    // Periodic full snapshot resync — see `BOOK_SNAPSHOT_REFRESH`. The first
+    // tick is consumed here so we don't immediately re-send the snapshot we
+    // just emitted at subscription.
+    let mut refresh_timer = tokio::time::interval(BOOK_SNAPSHOT_REFRESH);
+    refresh_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refresh_timer.tick().await;
 
     loop {
         // See `run_trades_subscription` for why `biased;` is omitted: the
@@ -660,6 +675,34 @@ async fn run_book_subscription(
                     bids,
                     asks,
                     v: server_v,
+                };
+                if write_tx.send(message_from_frame(&frame)).await.is_err() {
+                    return Ok(());
+                }
+            }
+            _ = refresh_timer.tick() => {
+                // Read the current top-N under the shared lock. If the
+                // maintainer is mid-rebootstrap (`book_state` was reset to
+                // `Book::empty()`), skip this tick — sending an empty
+                // snapshot would briefly wipe the client's display. The next
+                // tick after the maintainer recovers will resync.
+                let snapshot = {
+                    let book = book_state.inner.read().await;
+                    if !book.is_initialized() {
+                        None
+                    } else {
+                        Some(book.top_n(depth))
+                    }
+                };
+                let Some((bids, asks)) = snapshot else {
+                    continue;
+                };
+                server_v += 1;
+                let frame = ServerFrame::BookSnapshot {
+                    id,
+                    bids: bids.into_iter().map(level_from_pair).collect(),
+                    asks: asks.into_iter().map(level_from_pair).collect(),
+                    server_v,
                 };
                 if write_tx.send(message_from_frame(&frame)).await.is_err() {
                     return Ok(());
@@ -861,5 +904,120 @@ fn truncate(s: &str) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..200])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the periodic `BookSnapshot` resync. Covers the two
+    //! drift-leak modes the resync is meant to mask: a maintainer
+    //! rebootstrap window (book briefly uninitialized) and the steady-state
+    //! self-heal cadence.
+    use super::*;
+    use crate::binance::book::Book;
+    use protocol::SubId;
+    use tokio::sync::broadcast;
+
+    fn decode(msg: &Message) -> ServerFrame {
+        match msg {
+            Message::Text(txt) => serde_json::from_str(&*txt).expect("ServerFrame deserialize"),
+            other => panic!("expected text message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_snapshot_resends_after_refresh_interval() {
+        let book_state = BookState::new();
+        {
+            let mut guard = book_state.inner.write().await;
+            *guard = Book::from_snapshot(
+                vec![(100.0, 1.0), (99.0, 2.0)],
+                vec![(101.0, 1.5), (102.0, 0.5)],
+                42,
+            );
+        }
+        let (depth_tx, depth_rx) = broadcast::channel::<DepthDiff>(16);
+        let (write_tx, mut write_rx) = mpsc::channel::<Message>(16);
+        let task = tokio::spawn(run_book_subscription(
+            SubId(7),
+            "BTCUSDT".to_string(),
+            10,
+            depth_rx,
+            book_state.clone(),
+            write_tx,
+        ));
+
+        // First frame: initial BookSnapshot at subscription start.
+        let first = write_rx
+            .recv()
+            .await
+            .expect("expected initial BookSnapshot frame");
+        match decode(&first) {
+            ServerFrame::BookSnapshot { bids, asks, .. } => {
+                assert_eq!(bids.len(), 2);
+                assert_eq!(asks.len(), 2);
+            }
+            other => panic!("expected initial BookSnapshot, got {other:?}"),
+        }
+
+        // Advance past the refresh interval. The 100ms batch_timer fires
+        // ~50× during the window but short-circuits because the bid/ask
+        // buffers are empty; refresh_timer fires and emits a fresh
+        // BookSnapshot.
+        tokio::time::advance(BOOK_SNAPSHOT_REFRESH + Duration::from_millis(100)).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(1), write_rx.recv())
+            .await
+            .expect("timed out waiting for periodic snapshot")
+            .expect("write channel closed before periodic snapshot");
+        match decode(&second) {
+            ServerFrame::BookSnapshot { id, bids, asks, .. } => {
+                assert_eq!(id, SubId(7));
+                assert_eq!(bids.len(), 2);
+                assert_eq!(asks.len(), 2);
+            }
+            other => panic!("expected periodic BookSnapshot, got {other:?}"),
+        }
+
+        drop(depth_tx);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_snapshot_skips_while_book_uninitialized() {
+        let book_state = BookState::new();
+        {
+            let mut guard = book_state.inner.write().await;
+            *guard = Book::from_snapshot(vec![(100.0, 1.0)], vec![(101.0, 1.0)], 10);
+        }
+        let (depth_tx, depth_rx) = broadcast::channel::<DepthDiff>(16);
+        let (write_tx, mut write_rx) = mpsc::channel::<Message>(16);
+        let task = tokio::spawn(run_book_subscription(
+            SubId(7),
+            "BTCUSDT".to_string(),
+            10,
+            depth_rx,
+            book_state.clone(),
+            write_tx,
+        ));
+        let _initial = write_rx.recv().await.expect("initial snapshot");
+
+        // Simulate maintainer rebootstrap: wipe `book_state` so
+        // `is_initialized()` is false during the refresh tick.
+        {
+            let mut guard = book_state.inner.write().await;
+            *guard = Book::empty();
+        }
+
+        tokio::time::advance(BOOK_SNAPSHOT_REFRESH + Duration::from_millis(100)).await;
+
+        let observed = tokio::time::timeout(Duration::from_millis(200), write_rx.recv()).await;
+        assert!(
+            observed.is_err(),
+            "no frame should be sent while book is uninitialized, got {observed:?}"
+        );
+
+        drop(depth_tx);
+        task.abort();
     }
 }

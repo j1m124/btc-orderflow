@@ -184,7 +184,6 @@ mod tests {
     fn diff(prev: i64, first: i64, last: i64, bids: &[(f64, f64)], asks: &[(f64, f64)]) -> DepthDiff {
         DepthDiff {
             symbol: "BTCUSDT".into(),
-            event_time_ms: 0,
             first_update_id: first,
             final_update_id: last,
             prev_final_update_id: prev,

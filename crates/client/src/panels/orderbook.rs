@@ -60,6 +60,14 @@ use crate::services::market_data::{BookLevel, MarketDataServiceHandle, Trade};
 #[action(namespace = client, no_json)]
 pub struct ChangeOrderbookSizeMode(pub SharedString);
 
+/// Switch the orderbook panel's bucket width. Carries the bucket id
+/// ("tick" / "1" / "5" / "10" / "25"); the handler on `ContentPanel`
+/// parses it back to an [`OrderbookBucket`]. Dispatched from the panel
+/// header's bucket dropdown, scoped to the panel's focus.
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct ChangeOrderbookBucket(pub SharedString);
+
 /// Whether the Size / Sum columns show coin quantity or USD notional.
 /// `Usd` multiplies each row's qty by the row's price.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,8 +218,10 @@ fn bucketize(raw: &[BookLevel], bucket: OrderbookBucket) -> Vec<DisplayRow> {
 }
 
 /// One virtualized item — either a ladder row (with side colour params
-/// baked in) or the centre last-trade strip. Owned by an `Rc<Vec<…>>` and
-/// indexed by the virtual_list render closure.
+/// baked in), the centre last-trade strip, or a blank padding row used to
+/// extend the content past viewport-height so sticky-center can place the
+/// strip at the viewport middle even when the real depth doesn't fill it.
+/// Owned by an `Rc<Vec<…>>` and indexed by the virtual_list render closure.
 enum RowItem {
     Row {
         key: f64,
@@ -226,6 +236,27 @@ enum RowItem {
         color: Hsla,
         bg: Hsla,
     },
+    Padding,
+}
+
+/// Number of blank `ROW_H` padding rows needed on one side so that the
+/// section reaches `(viewport_h - strip_h) / 2`. Returns 0 when the
+/// viewport hasn't been laid out yet (`viewport_h <= 0`) or when the side
+/// already meets or exceeds the half-height.
+fn pad_rows(viewport_h: Pixels, section_h: Pixels, strip_h: Pixels, row_h: Pixels) -> usize {
+    let viewport = viewport_h.as_f32();
+    let section = section_h.as_f32();
+    let strip = strip_h.as_f32();
+    let row = row_h.as_f32();
+    if viewport <= 0.0 || row <= 0.0 {
+        return 0;
+    }
+    let half_h = (viewport - strip) / 2.0;
+    if section >= half_h {
+        return 0;
+    }
+    let deficit = half_h - section;
+    (deficit / row).ceil().max(0.0) as usize
 }
 
 pub fn render(
@@ -247,11 +278,25 @@ pub fn render(
     let scroll = state.scroll.clone();
 
     let service = cx.global::<MarketDataServiceHandle>().0.clone();
-    let (raw_bids, raw_asks): (Vec<BookLevel>, Vec<BookLevel>) = service
+    let (mut raw_bids, mut raw_asks): (Vec<BookLevel>, Vec<BookLevel>) = service
         .read(cx)
         .book_snapshot(symbol.as_ref(), WS_DEPTH)
         .map(|(b, a)| (b.to_vec(), a.to_vec()))
         .unwrap_or_default();
+    // Belt-and-suspenders: drop any crossed levels before bucketize so the
+    // ladder can't display a bid above the best ask (or an ask below the
+    // best bid) during the up-to-5s window between server-side periodic
+    // BookSnapshot resyncs. Service state is untouched — heatmap and other
+    // future consumers still see the unfiltered view. `raw_bids` and
+    // `raw_asks` are already sorted best-first by the service.
+    let best_bid = raw_bids.first().map(|l| l.price);
+    let best_ask = raw_asks.first().map(|l| l.price);
+    if let Some(a) = best_ask {
+        raw_bids.retain(|l| l.price < a);
+    }
+    if let Some(b) = best_bid {
+        raw_asks.retain(|l| l.price > b);
+    }
     let last_trade: Option<Trade> = service
         .read(cx)
         .trades_snapshot(symbol.as_ref())
@@ -283,7 +328,18 @@ pub fn render(
     let max_bid_cum = bid_rows.last().map(|r| r.cum).unwrap_or(0.0);
     let max_ask_cum = ask_rows.first().map(|r| r.cum).unwrap_or(0.0);
 
-    let spread_idx = ask_rows.len();
+    // Pad each side independently so the section heights at minimum reach
+    // `(viewport_h - strip_h) / 2`. Without this, when row counts × ROW_H
+    // is shorter than the viewport (large buckets or thin book), the scroll
+    // offset gets clamped to 0 by v_virtual_list and the spread strip lands
+    // at its natural position from the top instead of viewport-middle.
+    let viewport_h = scroll.bounds().size.height;
+    let ask_section_h = ROW_H * ask_rows.len();
+    let bid_section_h = ROW_H * bid_rows.len();
+    let ask_pad_count = pad_rows(viewport_h, ask_section_h, LAST_STRIP_H, ROW_H);
+    let bid_pad_count = pad_rows(viewport_h, bid_section_h, LAST_STRIP_H, ROW_H);
+
+    let spread_idx = ask_pad_count + ask_rows.len();
     let (last_text, last_color) = match &last_trade {
         Some(t) => {
             let is_buy = !t.is_buyer_maker;
@@ -296,9 +352,15 @@ pub fn render(
     let last_bg = Hsla { a: 0.12, ..last_color };
 
     // Flatten the ladder into a single Vec<RowItem> in DOM order
-    // (asks top→bottom, last-strip middle, bids top→bottom). Indices into
-    // this vec are also indices into the parallel `item_sizes` Vec.
-    let mut items: Vec<RowItem> = Vec::with_capacity(ask_rows.len() + 1 + bid_rows.len());
+    // (ask-side padding, asks top→bottom, last-strip middle, bids top→bottom,
+    // bid-side padding). Indices into this vec are also indices into the
+    // parallel `item_sizes` Vec.
+    let mut items: Vec<RowItem> = Vec::with_capacity(
+        ask_pad_count + ask_rows.len() + 1 + bid_rows.len() + bid_pad_count,
+    );
+    for _ in 0..ask_pad_count {
+        items.push(RowItem::Padding);
+    }
     for r in &ask_rows {
         items.push(RowItem::Row {
             key: r.key,
@@ -324,6 +386,9 @@ pub fn render(
             tint: bullish,
         });
     }
+    for _ in 0..bid_pad_count {
+        items.push(RowItem::Padding);
+    }
 
     // Parallel item-sizes vec: the last-strip is its own taller item, all
     // others are uniform `ROW_H`. v_virtual_list ignores width.
@@ -331,7 +396,7 @@ pub fn render(
         .iter()
         .map(|it| match it {
             RowItem::LastStrip { .. } => size(px(0.), LAST_STRIP_H),
-            RowItem::Row { .. } => size(px(0.), ROW_H),
+            RowItem::Row { .. } | RowItem::Padding => size(px(0.), ROW_H),
         })
         .collect();
     let item_sizes_rc = Rc::new(item_sizes.clone());
@@ -346,20 +411,17 @@ pub fn render(
             }));
         if sticky_center { btn.primary() } else { btn.ghost() }
     };
+    // Header carries only the controls (size / bucket / center) — the panel
+    // identifier sits in the dock tab name via `Panel::tab_name`, so a body
+    // header label would just duplicate it.
     let header = h_flex()
         .px_2()
         .py_1()
         .gap_2()
         .items_center()
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(fg)
-                .child(SharedString::from(format!("Orderbook \u{2014} {}", symbol))),
-        )
         .child(div().flex_1())
         .child(size_mode_dropdown(size_mode, focus.clone()))
-        .child(bucket_selector(bucket, cx))
+        .child(bucket_dropdown(bucket, focus.clone()))
         .child(center_btn);
 
     let (size_label, sum_label) = match size_mode {
@@ -465,6 +527,12 @@ fn render_item(
             .border_y_1()
             .border_color(border)
             .child(text.clone())
+            .into_any_element(),
+        RowItem::Padding => h_flex()
+            .w_full()
+            .h(ROW_H)
+            .border_b_1()
+            .border_color(border)
             .into_any_element(),
     }
 }
@@ -593,23 +661,21 @@ fn size_mode_dropdown(
         })
 }
 
-fn bucket_selector(
-    current: OrderbookBucket,
-    cx: &mut Context<ContentPanel>,
-) -> impl IntoElement {
-    let mut row = h_flex().gap_1();
-    for b in OrderbookBucket::ALL {
-        let bucket = *b;
-        let is_active = bucket == current;
-        let btn_id = SharedString::from(format!("ob-bucket-{}", bucket.id()));
-        let mut btn = Button::new(btn_id).label(SharedString::from(bucket.label())).xsmall();
-        btn = if is_active { btn.primary() } else { btn.ghost() };
-        btn = btn.on_click(cx.listener(move |this, _, _, cx| {
-            this.set_orderbook_bucket(bucket, cx);
-        }));
-        row = row.child(btn);
-    }
-    row
+fn bucket_dropdown(current: OrderbookBucket, focus: FocusHandle) -> impl IntoElement {
+    Button::new("ob-bucket")
+        .label(SharedString::from(current.label()))
+        .xsmall()
+        .ghost()
+        .dropdown_menu(move |menu, _, _| {
+            let mut menu = menu.action_context(focus.clone());
+            for b in OrderbookBucket::ALL {
+                menu = menu.menu(
+                    SharedString::from(b.label()),
+                    Box::new(ChangeOrderbookBucket(SharedString::from(b.id()))),
+                );
+            }
+            menu
+        })
 }
 
 /// Adaptive USD notation matching the trades panel — compact `M`/`k`
@@ -637,5 +703,36 @@ fn format_qty(q: f64) -> String {
         format!("{:.2}", q)
     } else {
         format!("{:.3}", q)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn pad_rows_zero_viewport_returns_zero() {
+        // First-paint case: viewport hasn't been laid out yet.
+        assert_eq!(pad_rows(px(0.), px(0.), px(22.), px(15.)), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn pad_rows_tall_content_returns_zero() {
+        // 600px viewport, 400px section already covers half (=289px).
+        assert_eq!(pad_rows(px(600.), px(400.), px(22.), px(15.)), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn pad_rows_short_content_fills_deficit() {
+        // 600px viewport, 100px section. half = (600-22)/2 = 289.
+        // deficit = 189, ceil(189/15) = 13.
+        assert_eq!(pad_rows(px(600.), px(100.), px(22.), px(15.)), 13);
+    }
+
+    #[wasm_bindgen_test]
+    fn pad_rows_exact_half_returns_zero() {
+        // section exactly equals half-height → no padding needed.
+        assert_eq!(pad_rows(px(600.), px(289.), px(22.), px(15.)), 0);
     }
 }

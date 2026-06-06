@@ -92,7 +92,7 @@ impl TopBar {
         cx.notify();
     }
 
-    fn render_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_right_controls(&self) -> impl IntoElement {
         let add_menu = Button::new("add-panel")
             .label("+ Panel")
             .small()
@@ -135,6 +135,14 @@ impl TopBar {
                 menu
             });
 
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(add_menu)
+            .child(layout_menu)
+    }
+
+    fn render_left_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_tool = crate::drawings::tool::current_tool(cx);
         let draw_label = if active_tool.is_drawing_tool() {
             SharedString::from(format!("Draw: {}", active_tool.label()))
@@ -310,8 +318,6 @@ impl TopBar {
         h_flex()
             .gap_2()
             .items_center()
-            .child(add_menu)
-            .child(layout_menu)
             .child(draw_dropdown)
             .child(objects_dropdown)
     }
@@ -334,7 +340,8 @@ impl Render for TopBar {
             let theme = cx.theme();
             (theme.border, theme.foreground, theme.tab_bar)
         };
-        let controls = self.render_controls(cx);
+        let left_controls = self.render_left_controls(cx);
+        let right_controls = self.render_right_controls();
         let settings_btn = self.render_settings_button();
 
         div()
@@ -349,8 +356,9 @@ impl Render for TopBar {
             .border_color(border)
             .bg(tab_bar)
             .child(div().text_sm().text_color(fg).child(self.title.clone()))
+            .child(left_controls)
             .child(div().flex_1())
-            .child(controls)
+            .child(right_controls)
             .child(settings_btn)
     }
 }
