@@ -6,7 +6,12 @@
 //! assembly stay here.
 
 mod drawings_view;
+mod footprint;
 mod paint;
+
+pub use footprint::{
+    ColorScope, FootprintParams, RenderKind, RenderMetric, TextMetric, WireframeVariant,
+};
 
 use gpui::{
     Action, AppContext as _, Bounds, ContentMask, Context, Entity, FocusHandle, Focusable as _,
@@ -590,6 +595,25 @@ pub struct ChartState {
     /// reconstruct `ChartState`), not persisted to local_storage. Toggled by
     /// the header chip's click handler.
     pub indicators_collapsed: bool,
+    /// Active render mode (Candlestick / Footprint Cluster / Footprint
+    /// Profile). Drives the paint pipeline branch in [`paint`] and, in
+    /// later commits, the header dropdown + the synthesized render chip
+    /// pinned at the top of the indicator list. Defaults to `Candlestick`
+    /// and is preserved across symbol/timeframe switches (the render
+    /// choice follows the panel, mirroring how indicators do — see
+    /// [`Self::adopt_render_settings`]).
+    render_kind: RenderKind,
+    /// Eye-toggle state on the render chip. False suppresses the candle /
+    /// cell / profile paint (overlays + drawings still render). Ephemeral —
+    /// not persisted, defaults true.
+    render_visible: bool,
+    /// Persisted per-mode params for the Cluster render. Each footprint
+    /// mode remembers its own settings — switching Cluster ↔ Profile does
+    /// not bleed across — see the locked design in
+    /// `project_footprint_v1_design`.
+    cluster_params: FootprintParams,
+    /// Persisted per-mode params for the Profile render.
+    profile_params: FootprintParams,
 }
 
 /// Baseline captured at splitter mouse-down. The outer mouse-move handler
@@ -600,6 +624,18 @@ struct SplitterDrag {
     instance_id: InstanceId,
     start_y: f32,
     start_height: f32,
+}
+
+/// Captured by `switch_symbol` / `switch_timeframe` before they tear down
+/// `self` via `*self = Self::new(...)`. Adopted back onto the fresh
+/// `ChartState` so the user's render choice + per-mode params survive
+/// data-side changes.
+#[derive(Clone, Copy)]
+struct RenderSettingsSnapshot {
+    kind: RenderKind,
+    visible: bool,
+    cluster: FootprintParams,
+    profile: FootprintParams,
 }
 
 impl ChartState {
@@ -619,29 +655,147 @@ impl ChartState {
     /// timeframe), but only if `symbol` differs. Returns `true` if a switch
     /// happened (the caller can skip a redundant `cx.notify()`). Indicators
     /// carry over: the user's analytical setup follows the chart panel, not
-    /// the data — see /grill-me locked design.
+    /// the data — see /grill-me locked design. Render kind + per-mode
+    /// footprint params also carry over (the rendering mode is a user
+    /// choice, not a per-symbol one).
     pub fn switch_symbol(&mut self, symbol: &str, candles: Vec<Candle>) -> bool {
         if self.symbol == symbol {
             return false;
         }
         let indicators = std::mem::take(&mut self.indicators);
+        let render = self.snapshot_render_settings();
         *self = Self::new(symbol, self.timeframe, candles);
         self.adopt_indicators(indicators);
+        self.adopt_render_settings(render);
         true
     }
 
     /// Replace `self` with a fresh state at `tf` (keeping symbol), but only
     /// if `tf` differs. Returns `true` if a switch happened. Indicators carry
-    /// over (see `switch_symbol`).
+    /// over (see `switch_symbol`); render kind + per-mode footprint params
+    /// also carry over.
     pub fn switch_timeframe(&mut self, tf: Timeframe, candles: Vec<Candle>) -> bool {
         if self.timeframe == tf {
             return false;
         }
         let symbol = self.symbol.clone();
         let indicators = std::mem::take(&mut self.indicators);
+        let render = self.snapshot_render_settings();
         *self = Self::new(symbol.as_ref(), tf, candles);
         self.adopt_indicators(indicators);
+        self.adopt_render_settings(render);
         true
+    }
+
+    // ─────────────────────────── Render mode ───────────────────────────
+
+    /// Currently-active render kind. Defaults `Candlestick`; switched via
+    /// [`Self::switch_render`].
+    pub fn render_kind(&self) -> RenderKind {
+        self.render_kind
+    }
+
+    /// Eye-toggle state for the render chip. False suppresses the
+    /// candle/cell/profile paint (overlays + drawings still render).
+    pub fn render_visible(&self) -> bool {
+        self.render_visible
+    }
+
+    pub fn set_render_visible(&mut self, visible: bool) {
+        self.render_visible = visible;
+    }
+
+    /// Switch the active render kind. Returns `true` if it actually changed
+    /// (caller can skip a redundant `cx.notify()` / sub re-allocation).
+    ///
+    /// Sub-lifecycle wiring (drop the old footprint sub, allocate a new one
+    /// for the entered mode) happens at the [`crate::panels::ContentPanel`]
+    /// layer — same pattern as `chart_sub_handles` for the candles channel.
+    /// `ChartState` is purely state here.
+    pub fn switch_render(&mut self, kind: RenderKind) -> bool {
+        if self.render_kind == kind {
+            return false;
+        }
+        self.render_kind = kind;
+        true
+    }
+
+    pub fn cluster_params(&self) -> &FootprintParams {
+        &self.cluster_params
+    }
+
+    pub fn profile_params(&self) -> &FootprintParams {
+        &self.profile_params
+    }
+
+    /// Params for `kind`, or `None` for `Candlestick` (which has no params).
+    pub fn params_for(&self, kind: RenderKind) -> Option<&FootprintParams> {
+        match kind {
+            RenderKind::Candlestick => None,
+            RenderKind::Cluster => Some(&self.cluster_params),
+            RenderKind::Profile => Some(&self.profile_params),
+        }
+    }
+
+    /// Params for the active render, or `None` in Candlestick mode. Used by
+    /// the paint pipeline branch and (later) the settings popover.
+    pub fn active_footprint_params(&self) -> Option<&FootprintParams> {
+        self.params_for(self.render_kind)
+    }
+
+    /// Mutate the Cluster params in place. The closure should return `true`
+    /// if it changed a field that requires the caller to re-subscribe (i.e.
+    /// the `bucket`); `false` for cosmetic-only edits. Caller (typically
+    /// `ContentPanel`) acts on the return value to drop+reopen the
+    /// footprint sub.
+    pub fn update_cluster_params<F>(&mut self, f: F) -> bool
+    where
+        F: FnOnce(&mut FootprintParams) -> bool,
+    {
+        f(&mut self.cluster_params)
+    }
+
+    pub fn update_profile_params<F>(&mut self, f: F) -> bool
+    where
+        F: FnOnce(&mut FootprintParams) -> bool,
+    {
+        f(&mut self.profile_params)
+    }
+
+    /// Snapshot the render state (kind + both per-mode params + visibility)
+    /// so `switch_symbol` / `switch_timeframe` can restore it onto the
+    /// freshly-constructed `ChartState`. Visibility carries over too — the
+    /// user's "hidden render" choice shouldn't reset on a symbol flip.
+    fn snapshot_render_settings(&self) -> RenderSettingsSnapshot {
+        RenderSettingsSnapshot {
+            kind: self.render_kind,
+            visible: self.render_visible,
+            cluster: self.cluster_params,
+            profile: self.profile_params,
+        }
+    }
+
+    fn adopt_render_settings(&mut self, snap: RenderSettingsSnapshot) {
+        self.render_kind = snap.kind;
+        self.render_visible = snap.visible;
+        self.cluster_params = snap.cluster;
+        self.profile_params = snap.profile;
+    }
+
+    /// Direct setters used by `ContentPanel::new_restored` to seed
+    /// persisted render state (`ChartPrefs.render_kind` / `cluster` /
+    /// `profile`) onto a freshly-constructed `ChartState` without going
+    /// through the switch_* / update_* path that may have side effects in
+    /// later commits.
+    pub fn seed_render(
+        &mut self,
+        kind: RenderKind,
+        cluster: FootprintParams,
+        profile: FootprintParams,
+    ) {
+        self.render_kind = kind;
+        self.cluster_params = cluster;
+        self.profile_params = profile;
     }
 
     pub fn timeframe(&self) -> Timeframe {
@@ -1081,6 +1235,10 @@ impl ChartState {
             sub_cursor: None,
             pane_bounds: std::collections::HashMap::new(),
             indicators_collapsed: false,
+            render_kind: RenderKind::default(),
+            render_visible: true,
+            cluster_params: FootprintParams::cluster_default(),
+            profile_params: FootprintParams::profile_default(),
         };
         // Every fresh chart is born with a Volume overlay. `switch_*`
         // callers preserve the user's indicator list, so this seeding only
