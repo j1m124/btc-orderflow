@@ -147,17 +147,54 @@ fn ensure_chart_sub(
 struct ChartPrefs {
     symbol: String,
     tf: String,
+    /// Render kind id (`"candlestick"` / `"cluster"` / `"profile"`). New in
+    /// v5; older persisted state defaults to Candlestick via `serde(default)`.
+    #[serde(default)]
+    render_kind: Option<String>,
+    /// Per-mode params. Both are written even when only one is active so
+    /// switching modes after restore preserves the user's last settings
+    /// in each. New in v5; older state seeds Candlestick defaults.
+    #[serde(default)]
+    cluster: Option<chart::FootprintParams>,
+    #[serde(default)]
+    profile: Option<chart::FootprintParams>,
 }
 
-fn chart_prefs_from_info(
-    info: &PanelInfo,
-) -> Option<(SharedString, crate::services::market_data::Timeframe)> {
+/// Restored chart prefs after parsing from persisted PanelInfo. Render-mode
+/// fields are optional — older v3/v4 state loads cleanly with `None` for
+/// each, in which case `ChartState::new` seeds the defaults.
+struct ChartRestored {
+    symbol: SharedString,
+    tf: crate::services::market_data::Timeframe,
+    render_kind: chart::RenderKind,
+    cluster: chart::FootprintParams,
+    profile: chart::FootprintParams,
+}
+
+fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
     let PanelInfo::Panel(value) = info else {
         return None;
     };
     let prefs: ChartPrefs = serde_json::from_value(value.clone()).ok()?;
     let tf = crate::services::market_data::Timeframe::from_str(&prefs.tf)?;
-    Some((SharedString::from(prefs.symbol), tf))
+    let render_kind = prefs
+        .render_kind
+        .as_deref()
+        .and_then(chart::RenderKind::from_id)
+        .unwrap_or_default();
+    let cluster = prefs
+        .cluster
+        .unwrap_or_else(chart::FootprintParams::cluster_default);
+    let profile = prefs
+        .profile
+        .unwrap_or_else(chart::FootprintParams::profile_default);
+    Some(ChartRestored {
+        symbol: SharedString::from(prefs.symbol),
+        tf,
+        render_kind,
+        cluster,
+        profile,
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -334,7 +371,7 @@ impl ContentPanel {
 
     fn new_inner(
         kind: Kind,
-        chart_prefs: Option<(SharedString, crate::services::market_data::Timeframe)>,
+        chart_prefs: Option<ChartRestored>,
         trades_prefs: Option<(SharedString, Option<f64>, trades::TradesSizeMode)>,
         orderbook_prefs: Option<(
             SharedString,
@@ -347,8 +384,12 @@ impl ContentPanel {
         let focus_handle = cx.focus_handle();
         let mut chart_handles: Vec<crate::services::market_data::SubscriptionHandle> = Vec::new();
         let chart_state = matches!(kind, Kind::Chart).then(|| {
-            let (symbol, tf) = match &chart_prefs {
-                Some((s, t)) => (s.clone(), *t),
+            let (symbol, tf, render_seed) = match &chart_prefs {
+                Some(restored) => (
+                    restored.symbol.clone(),
+                    restored.tf,
+                    Some((restored.render_kind, restored.cluster, restored.profile)),
+                ),
                 None => {
                     let default_tf = chart::ChartState::default_timeframe();
                     let default_symbol: SharedString = cx
@@ -359,12 +400,16 @@ impl ContentPanel {
                         .unwrap_or_else(|| {
                             SharedString::from(chart::ChartState::default_symbol())
                         });
-                    (default_symbol, default_tf)
+                    (default_symbol, default_tf, None)
                 }
             };
             chart_handles = vec![ensure_chart_sub(symbol.as_ref(), tf, cx)];
             let live = live_snapshot(symbol.as_ref(), tf, cx);
-            chart::ChartState::new(symbol.as_ref(), tf, live)
+            let mut state = chart::ChartState::new(symbol.as_ref(), tf, live);
+            if let Some((kind, cluster, profile)) = render_seed {
+                state.seed_render(kind, cluster, profile);
+            }
+            state
         });
         let watchlist_handles = if matches!(kind, Kind::Watchlist) {
             let h = watchlist::initial_handles(cx);
@@ -773,6 +818,12 @@ impl ContentPanel {
         // until the next live tick.
         if matches!(kind, Kind::Trades) {
             new_self.reseed_trades_persist(cx);
+        }
+        // Allocate the footprint sub for a restored chart whose persisted
+        // render kind is Cluster / Profile. No-op for Candlestick (the
+        // refresh helper short-circuits when needs_footprint_sub() is false).
+        if matches!(kind, Kind::Chart) {
+            new_self.refresh_chart_footprint_sub(cx);
         }
         new_self
     }
@@ -1359,6 +1410,9 @@ impl Panel for ContentPanel {
             if let Ok(value) = serde_json::to_value(ChartPrefs {
                 symbol: chart.symbol().to_string(),
                 tf: chart.timeframe().as_str().to_string(),
+                render_kind: Some(chart.render_kind().as_id().to_string()),
+                cluster: Some(*chart.cluster_params()),
+                profile: Some(*chart.profile_params()),
             }) {
                 state.info = PanelInfo::panel(value);
             }

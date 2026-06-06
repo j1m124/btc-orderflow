@@ -28,7 +28,7 @@ use crate::top_bar::{
     RemoveWatchlistSymbol, ResetLayout, SaveLayout, SetTheme, TopBar,
 };
 
-const LAYOUT_VERSION: usize = 4;
+const LAYOUT_VERSION: usize = 5;
 const DOCK_AREA_ID: &str = "main-dock";
 
 pub struct TerminalWorkspace {
