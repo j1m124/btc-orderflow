@@ -18,6 +18,7 @@ use super::footprint::{
 };
 use super::{Drawing, DrawingId, index_to_screen, price_to_screen};
 use crate::indicators::IndicatorOutput;
+use crate::persistence::VolumeUnit;
 use crate::services::market_data::{Candle, FootprintCell};
 
 /// Colours fed to the drawings overlay so its paint closure doesn't need
@@ -49,6 +50,11 @@ pub(super) struct MainChartColors {
     pub bearish: Hsla,
     pub grid: Hsla,
     pub label: Hsla,
+    /// Full-contrast text color (theme `foreground`) for cell labels that
+    /// must read on top of coloured fill backgrounds — flips white/black
+    /// with the theme automatically. Distinct from `label` (muted) which
+    /// is for the axis gutters.
+    pub cell_text: Hsla,
     /// Solid fill for the axis gutters (right + bottom). Painted on top of
     /// the chart area so drawings that bleed past the chart-canvas
     /// boundary don't show through alongside the axis labels.
@@ -378,6 +384,7 @@ pub(super) fn paint_main_chart(
     // `render_visible` gates this whole layer — false suppresses the
     // candle / cell / wireframe paint while the grid + axes + overlays
     // keep painting (driven by the synthetic render chip's eye toggle).
+    let volume_unit = crate::prefs::chart_volume_unit();
     let render_cells_available =
         matches!(render_kind, RenderKind::Cluster | RenderKind::Profile)
             && !footprint_cells.is_empty()
@@ -403,14 +410,14 @@ pub(super) fn paint_main_chart(
                 paint_cluster_cells(
                     origin, candles, footprint_cells, start_idx, view_start, view_size,
                     canvas_w, canvas_h, chart_w, y_lo, y_hi, y_axis_gap, params,
-                    colors.bullish, colors.bearish, colors.label, window, cx,
+                    colors.bullish, colors.bearish, colors.cell_text, volume_unit, window, cx,
                 );
             }
             RenderKind::Profile => {
                 paint_profile_bars(
                     origin, candles, footprint_cells, start_idx, view_start, view_size,
                     canvas_w, canvas_h, chart_w, y_lo, y_hi, y_axis_gap, params,
-                    colors.bullish, colors.bearish, colors.label, window, cx,
+                    colors.bullish, colors.bearish, colors.cell_text, volume_unit, window, cx,
                 );
             }
             RenderKind::Candlestick => unreachable!("guarded by render_cells_available"),
@@ -434,12 +441,13 @@ pub(super) fn paint_main_chart(
     }
 
     // -- 4. y-axis labels (right gutter) --
+    let price_decimals = crate::prefs::chart_price_decimals() as usize;
     for &y_val in &y_ticks {
         let y = price_to_screen(y_lo, y_hi, y_val, canvas_h);
         if y < chart_top - 6.0 || y > chart_bottom + 6.0 {
             continue;
         }
-        let label = SharedString::from(format!("{:.2}", y_val));
+        let label = SharedString::from(format!("{:.*}", price_decimals, y_val));
         let run = TextRun {
             len: label.len(),
             font: window.text_style().font(),
@@ -704,29 +712,34 @@ fn paint_bar_wireframes(
         match variant {
             WireframeVariant::Behind => {
                 // Faded silhouette so the cell colour layer reads cleanly on
-                // top. Wick down the center, open/close as short horizontal
-                // ticks on the body edges.
+                // top. Wick down the centre, plus two vertical lines bracketing
+                // the body (open→close extent) at the body's left + right
+                // edges — reads as a translucent OHLC frame the cells sit
+                // inside, per user feedback.
                 let faded = Hsla { a: 0.45, ..color };
                 let wick_top = high_y.min(low_y);
                 let wick_h = (high_y - low_y).abs().max(1.0);
                 fill_rect(window, origin, center_x - 0.5, 1.0, wick_top, wick_h, faded);
-                let tick_w = (slot_width * 0.4).max(3.0);
+                let body_top = open_y.min(close_y);
+                let body_h = (open_y - close_y).abs().max(1.0);
+                let body_w = (slot_width * CANDLE_BODY_FRACTION).max(2.0);
+                let half_body = body_w * 0.5;
                 fill_rect(
                     window,
                     origin,
-                    center_x - tick_w * 0.5,
-                    tick_w,
-                    open_y - 0.5,
+                    center_x - half_body,
                     1.0,
+                    body_top,
+                    body_h,
                     faded,
                 );
                 fill_rect(
                     window,
                     origin,
-                    center_x - tick_w * 0.5,
-                    tick_w,
-                    close_y - 0.5,
+                    center_x + half_body - 1.0,
                     1.0,
+                    body_top,
+                    body_h,
                     faded,
                 );
             }
@@ -784,7 +797,8 @@ fn paint_cluster_cells(
     params: &FootprintParams,
     bullish: Hsla,
     bearish: Hsla,
-    label_color: Hsla,
+    text_color: Hsla,
+    volume_unit: VolumeUnit,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -810,7 +824,7 @@ fn paint_cluster_cells(
     let scope = params.color_scope;
     let metric = params.render_metric;
     let global_max = if matches!(scope, ColorScope::Visible | ColorScope::Daily) {
-        compute_global_metric_max(cells, metric)
+        compute_global_metric_max(cells, metric, bucket, volume_unit)
     } else {
         0.0
     };
@@ -842,7 +856,7 @@ fn paint_cluster_cells(
         let local_max = if matches!(scope, ColorScope::Individual) {
             bar_cells
                 .iter()
-                .map(|c| metric_value(c, metric).abs())
+                .map(|c| metric_value(c, metric, bucket, volume_unit).abs())
                 .fold(0.0_f64, f64::max)
         } else {
             global_max
@@ -860,12 +874,16 @@ fn paint_cluster_cells(
             if y_top + cell_h < 0.0 || y_top > canvas_h {
                 continue;
             }
+            // Sided volumes in the selected unit. Cluster paints sides
+            // individually for BidAsk, so we convert per-side rather than
+            // collapsing to a single metric scalar.
+            let (bid_v, ask_v) = sided_volumes(c, bucket, volume_unit);
             match metric {
                 RenderMetric::BidAsk => {
                     let side_w = cell_w * 0.5;
-                    let side_max = c.bid_vol.max(c.ask_vol).max(1e-9);
-                    let bid_intensity = (c.bid_vol / side_max) as f32;
-                    let ask_intensity = (c.ask_vol / side_max) as f32;
+                    let side_max = bid_v.max(ask_v).max(1e-9);
+                    let bid_intensity = (bid_v / side_max) as f32;
+                    let ask_intensity = (ask_v / side_max) as f32;
                     let bid_color = Hsla {
                         a: 0.25 + 0.55 * bid_intensity,
                         ..bearish
@@ -886,19 +904,19 @@ fn paint_cluster_cells(
                     );
                 }
                 RenderMetric::Volume => {
-                    let v = c.bid_vol + c.ask_vol;
+                    let v = bid_v + ask_v;
                     if v <= 0.0 {
                         continue;
                     }
                     let intensity = ((v / local_max) as f32).min(1.0);
                     let color = Hsla {
                         a: 0.20 + 0.65 * intensity,
-                        ..label_color
+                        ..text_color
                     };
                     fill_rect(window, origin, cell_left, cell_w, y_top, cell_h, color);
                 }
                 RenderMetric::Delta => {
-                    let d = c.ask_vol - c.bid_vol;
+                    let d = ask_v - bid_v;
                     let intensity = ((d.abs() / local_max) as f32).min(1.0);
                     let base = if d >= 0.0 { bullish } else { bearish };
                     let color = Hsla {
@@ -910,35 +928,101 @@ fn paint_cluster_cells(
             }
 
             if show_text {
-                let text = format_cell_text(c, params.text_metric);
-                if !text.is_empty() {
-                    let label = SharedString::from(text);
-                    let run = TextRun {
-                        len: label.len(),
-                        font: window.text_style().font(),
-                        color: label_color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
-                    let line = window
-                        .text_system()
-                        .shape_line(label, px(10.0), &[run], None);
-                    let tw = line.width().as_f32();
-                    let tx = cell_left + (cell_w - tw) * 0.5;
-                    let ty = y_top + (cell_h - 10.0) * 0.5;
-                    let _ = line.paint(
-                        point(px(tx) + origin.x, px(ty) + origin.y),
-                        px(10.0),
-                        gpui::TextAlign::Left,
-                        None,
+                // Per-half centring for BidAsk text: bid number sits in the
+                // left half (over the bid fill), ask in the right half. For
+                // every other text metric, fall back to single-string
+                // centring across the whole cell.
+                if matches!(params.text_metric, TextMetric::BidAsk) {
+                    let half_w = cell_w * 0.5;
+                    paint_centred_text(
                         window,
                         cx,
+                        origin,
+                        cell_left,
+                        half_w,
+                        y_top,
+                        cell_h,
+                        text_color,
+                        &format_short(bid_v),
                     );
+                    paint_centred_text(
+                        window,
+                        cx,
+                        origin,
+                        cell_left + half_w,
+                        half_w,
+                        y_top,
+                        cell_h,
+                        text_color,
+                        &format_short(ask_v),
+                    );
+                } else {
+                    let text = format_cell_text(c, params.text_metric, bucket, volume_unit);
+                    if !text.is_empty() {
+                        paint_centred_text(
+                            window, cx, origin, cell_left, cell_w, y_top, cell_h, text_color,
+                            &text,
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+/// Convert a cell's raw bid/ask coin volumes into the requested display unit.
+/// USD uses the bucket midpoint as the conversion price — cheap to compute
+/// and matches what the cell's labels display. Returns `(bid, ask)`.
+fn sided_volumes(c: &FootprintCell, bucket: f64, unit: VolumeUnit) -> (f64, f64) {
+    match unit {
+        VolumeUnit::Coin => (c.bid_vol, c.ask_vol),
+        VolumeUnit::Usd => {
+            let mid = c.price_bucket_low + bucket * 0.5;
+            (c.bid_vol * mid, c.ask_vol * mid)
+        }
+    }
+}
+
+/// Shape + paint a label centred inside `(x, w) × (y, h)`. Hoisted so the
+/// per-side bid/ask path and the single-string path share one shaper.
+#[allow(clippy::too_many_arguments)]
+fn paint_centred_text(
+    window: &mut Window,
+    cx: &mut App,
+    origin: Point<Pixels>,
+    x: f32,
+    w: f32,
+    y: f32,
+    h: f32,
+    color: Hsla,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let label = SharedString::from(text.to_string());
+    let run = TextRun {
+        len: label.len(),
+        font: window.text_style().font(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window
+        .text_system()
+        .shape_line(label, px(10.0), &[run], None);
+    let tw = line.width().as_f32();
+    let tx = x + (w - tw) * 0.5;
+    let ty = y + (h - 10.0) * 0.5;
+    let _ = line.paint(
+        point(px(tx) + origin.x, px(ty) + origin.y),
+        px(10.0),
+        gpui::TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
 }
 
 /// Paint per-bar volume profile bars (one horizontal bar per price bucket).
@@ -965,7 +1049,8 @@ fn paint_profile_bars(
     params: &FootprintParams,
     bullish: Hsla,
     bearish: Hsla,
-    label_color: Hsla,
+    text_color: Hsla,
+    volume_unit: VolumeUnit,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -986,7 +1071,7 @@ fn paint_profile_bars(
     let scope = params.color_scope;
     let metric = params.render_metric;
     let global_max = if matches!(scope, ColorScope::Visible | ColorScope::Daily) {
-        compute_global_metric_max(cells, metric)
+        compute_global_metric_max(cells, metric, bucket, volume_unit)
     } else {
         0.0
     };
@@ -1016,7 +1101,7 @@ fn paint_profile_bars(
         let local_max = if matches!(scope, ColorScope::Individual) {
             bar_cells
                 .iter()
-                .map(|c| metric_value(c, metric).abs())
+                .map(|c| metric_value(c, metric, bucket, volume_unit).abs())
                 .fold(0.0_f64, f64::max)
         } else {
             global_max
@@ -1034,9 +1119,10 @@ fn paint_profile_bars(
             if y_top + cell_h < 0.0 || y_top > canvas_h {
                 continue;
             }
+            let (bid_v, ask_v) = sided_volumes(c, bucket, volume_unit);
             match metric {
                 RenderMetric::Volume => {
-                    let v = c.bid_vol + c.ask_vol;
+                    let v = bid_v + ask_v;
                     if v <= 0.0 {
                         continue;
                     }
@@ -1044,34 +1130,32 @@ fn paint_profile_bars(
                     let bar_w = (bar_w_total * frac).max(1.0);
                     let color = Hsla {
                         a: 0.65,
-                        ..label_color
+                        ..text_color
                     };
                     fill_rect(window, origin, bar_x_min, bar_w, y_top, cell_h, color);
                 }
                 RenderMetric::Delta => {
-                    let d = c.ask_vol - c.bid_vol;
+                    let d = ask_v - bid_v;
                     if d.abs() <= 0.0 {
                         continue;
                     }
                     let frac = ((d.abs() / local_max) as f32).min(1.0);
-                    // Anchor at slot midpoint; positive deltas extend right,
-                    // negative extend left. Standard signed-magnitude read.
-                    let mid = (bar_x_min + bar_x_max) * 0.5;
-                    let bar_w = (bar_w_total * 0.5 * frac).max(1.0);
-                    let (x, color) = if d >= 0.0 {
-                        (mid, bullish)
-                    } else {
-                        (mid - bar_w, bearish)
-                    };
-                    let color = Hsla { a: 0.75, ..color };
-                    fill_rect(window, origin, x, bar_w, y_top, cell_h, color);
+                    // Anchor every delta bar at the slot's left edge — both
+                    // signs grow rightwards. Color encodes sign (bull/bear),
+                    // length encodes magnitude. Per user feedback: reads
+                    // cleaner as a one-sided horizontal histogram than a
+                    // diverging-from-midpoint layout.
+                    let bar_w = (bar_w_total * frac).max(1.0);
+                    let base = if d >= 0.0 { bullish } else { bearish };
+                    let color = Hsla { a: 0.75, ..base };
+                    fill_rect(window, origin, bar_x_min, bar_w, y_top, cell_h, color);
                 }
                 RenderMetric::BidAsk => {
                     // Stacked bid/ask: bid extends left of midpoint, ask right.
                     let mid = (bar_x_min + bar_x_max) * 0.5;
                     let half_w = bar_w_total * 0.5;
-                    let bid_frac = ((c.bid_vol / local_max) as f32).min(1.0);
-                    let ask_frac = ((c.ask_vol / local_max) as f32).min(1.0);
+                    let bid_frac = ((bid_v / local_max) as f32).min(1.0);
+                    let ask_frac = ((ask_v / local_max) as f32).min(1.0);
                     let bid_w = (half_w * bid_frac).max(0.0);
                     let ask_w = (half_w * ask_frac).max(0.0);
                     if bid_w > 0.0 {
@@ -1086,71 +1170,85 @@ fn paint_profile_bars(
             }
 
             if show_text {
-                let text = format_cell_text(c, params.text_metric);
-                if !text.is_empty() {
-                    let label = SharedString::from(text);
-                    let run = TextRun {
-                        len: label.len(),
-                        font: window.text_style().font(),
-                        color: label_color,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    };
-                    let line = window
-                        .text_system()
-                        .shape_line(label, px(10.0), &[run], None);
-                    let tw = line.width().as_f32();
-                    let tx = bar_x_min + (bar_w_total - tw) * 0.5;
-                    let ty = y_top + (cell_h - 10.0) * 0.5;
-                    let _ = line.paint(
-                        point(px(tx) + origin.x, px(ty) + origin.y),
-                        px(10.0),
-                        gpui::TextAlign::Left,
-                        None,
+                if matches!(params.text_metric, TextMetric::BidAsk) {
+                    let half_w = bar_w_total * 0.5;
+                    paint_centred_text(
                         window,
                         cx,
+                        origin,
+                        bar_x_min,
+                        half_w,
+                        y_top,
+                        cell_h,
+                        text_color,
+                        &format_short(bid_v),
                     );
+                    paint_centred_text(
+                        window,
+                        cx,
+                        origin,
+                        bar_x_min + half_w,
+                        half_w,
+                        y_top,
+                        cell_h,
+                        text_color,
+                        &format_short(ask_v),
+                    );
+                } else {
+                    let text = format_cell_text(c, params.text_metric, bucket, volume_unit);
+                    if !text.is_empty() {
+                        paint_centred_text(
+                            window, cx, origin, bar_x_min, bar_w_total, y_top, cell_h, text_color,
+                            &text,
+                        );
+                    }
                 }
             }
         }
     }
 }
 
-/// Extract the metric scalar for a cell. `Volume` = bid+ask; `Delta` =
-/// signed ask-bid; `BidAsk` returns `max(bid, ask)` so that normalisation
-/// against this value gives each side its own 0..1 intensity range when
-/// dividing per-side downstream.
-fn metric_value(c: &FootprintCell, metric: RenderMetric) -> f64 {
+/// Extract the metric scalar for a cell in the display unit. `Volume` =
+/// bid+ask; `Delta` = signed ask-bid; `BidAsk` returns `max(bid, ask)` so
+/// that normalisation against this value gives each side its own 0..1
+/// intensity range when dividing per-side downstream.
+fn metric_value(c: &FootprintCell, metric: RenderMetric, bucket: f64, unit: VolumeUnit) -> f64 {
+    let (bid, ask) = sided_volumes(c, bucket, unit);
     match metric {
-        RenderMetric::Volume => c.bid_vol + c.ask_vol,
-        RenderMetric::Delta => c.ask_vol - c.bid_vol,
-        RenderMetric::BidAsk => c.bid_vol.max(c.ask_vol),
+        RenderMetric::Volume => bid + ask,
+        RenderMetric::Delta => ask - bid,
+        RenderMetric::BidAsk => bid.max(ask),
     }
 }
 
 /// Max absolute metric value across all cells — used by `Visible` / `Daily`
 /// colour scopes. `Daily` currently falls back to Visible (no day cache
 /// yet — see design memo Phase 3 note).
-fn compute_global_metric_max(cells: &[FootprintCell], metric: RenderMetric) -> f64 {
+fn compute_global_metric_max(
+    cells: &[FootprintCell],
+    metric: RenderMetric,
+    bucket: f64,
+    unit: VolumeUnit,
+) -> f64 {
     cells
         .iter()
-        .map(|c| metric_value(c, metric).abs())
+        .map(|c| metric_value(c, metric, bucket, unit).abs())
         .fold(0.0_f64, f64::max)
 }
 
 /// Format the in-cell text for a footprint cell. None → empty (auto-hide
 /// also bypasses this path). Volumes use 0-decimal short form when ≥ 1000.
-fn format_cell_text(c: &FootprintCell, metric: TextMetric) -> String {
+fn format_cell_text(c: &FootprintCell, metric: TextMetric, bucket: f64, unit: VolumeUnit) -> String {
+    let (bid, ask) = sided_volumes(c, bucket, unit);
     match metric {
         TextMetric::None => String::new(),
-        TextMetric::Volume => format_short(c.bid_vol + c.ask_vol),
-        TextMetric::Delta => format_short(c.ask_vol - c.bid_vol),
-        TextMetric::BidAsk => format!(
-            "{}×{}",
-            format_short(c.bid_vol),
-            format_short(c.ask_vol)
-        ),
+        TextMetric::Volume => format_short(bid + ask),
+        TextMetric::Delta => format_short(ask - bid),
+        // Single-string fallback when this helper is reached from a path
+        // that DOESN'T split bid/ask per-half (currently unused — the
+        // cluster + profile painters short-circuit BidAsk into per-half
+        // paint_centred_text calls above).
+        TextMetric::BidAsk => format!("{}×{}", format_short(bid), format_short(ask)),
     }
 }
 

@@ -1207,7 +1207,7 @@ impl ChartState {
     /// Full recompute over the current `candles`. Cheap by v1 specs (~5
     /// indicators × ~1000 bars × sub-µs per op). Called after every tick,
     /// fabrication, snapshot, prepend, or instance edit.
-    fn recompute_indicators(&mut self) {
+    pub fn recompute_indicators(&mut self) {
         if self.indicators.len() != self.indicator_outputs.len() {
             self.indicator_outputs
                 .resize_with(self.indicators.len(), || IndicatorOutput::Line(Vec::new()));
@@ -1434,18 +1434,27 @@ impl ChartState {
 }
 
 /// Width of the y-axis label gutter for a given price range. Labels paint
-/// with `format!("{:.2}", value)` at px(10), so the widest label width
-/// drives the gutter. Clamped so the gutter never collapses (small prices)
-/// nor steals the whole chart (anomalous ranges).
+/// at px(10) using the user's `price_decimals` setting, so the widest
+/// label width drives the gutter. Clamped so the gutter never collapses
+/// (small prices) nor steals the whole chart (anomalous ranges).
 pub(super) fn compute_y_axis_gap(y_lo: f64, y_hi: f64) -> f32 {
     let widest = y_lo.abs().max(y_hi.abs());
     if !widest.is_finite() {
         return 52.0;
     }
-    let label = format!("{:.2}", widest);
+    let label = format_price(widest);
     // Each character ~6.5 px at the px(10) font size used in paint, plus
     // 14 px combined left+right padding so labels don't kiss the chart.
     (label.len() as f32 * 6.5 + 14.0).clamp(44.0, 120.0)
+}
+
+/// Format a price value using the user's `chart_price_decimals` setting.
+/// All on-chart price readouts (axis labels, OHLC pill, live-price pill,
+/// crosshair, ray pills, position E/TP/SL labels) flow through this so
+/// they stay in lockstep with the global setting.
+pub(super) fn format_price(value: f64) -> String {
+    let d = crate::prefs::chart_price_decimals() as usize;
+    format!("{:.*}", d, value)
 }
 
 /// Convert a screen-space x pixel (relative to canvas origin) to a fractional
@@ -2563,6 +2572,7 @@ pub fn render(
             ..theme_border
         },
         label: theme_muted_foreground,
+        cell_text: theme_foreground,
         axis_bg: theme_background,
         axis_border: theme_border,
     };
@@ -2898,22 +2908,22 @@ pub fn render(
                         .child(
                             div()
                                 .text_color(theme_foreground)
-                                .child(format!("O {:.2}", c.open)),
+                                .child(format!("O {}", format_price(c.open))),
                         )
                         .child(
                             div()
                                 .text_color(theme_chart_bullish)
-                                .child(format!("H {:.2}", c.high)),
+                                .child(format!("H {}", format_price(c.high))),
                         )
                         .child(
                             div()
                                 .text_color(theme_chart_bearish)
-                                .child(format!("L {:.2}", c.low)),
+                                .child(format!("L {}", format_price(c.low))),
                         )
                         .child(
                             div()
                                 .text_color(theme_foreground)
-                                .child(format!("C {:.2}", c.close)),
+                                .child(format!("C {}", format_price(c.close))),
                         )
                         .when(!change_text.is_empty(), |this| {
                             this.child(div().text_color(change_color).child(change_text))
@@ -2970,7 +2980,7 @@ pub fn render(
                         .border_1()
                         .border_color(theme_border)
                         .rounded(px(2.0))
-                        .child(format!("{:.2}", world_p))
+                        .child(format_price(world_p))
                         .into_any_element(),
                 );
             }
@@ -3052,7 +3062,7 @@ pub fn render(
                 .text_color(theme_background)
                 .bg(bar_color)
                 .rounded(px(2.0))
-                .child(format!("{:.2}", last.close))
+                .child(format_price(last.close))
                 .into_any_element(),
         );
 
@@ -3120,7 +3130,7 @@ pub fn render(
                     .text_color(theme_background)
                     .bg(theme_foreground)
                     .rounded(px(2.0))
-                    .child(format!("{:.2}", anchor.1))
+                    .child(format_price(anchor.1))
                     .into_any_element(),
             );
         }
@@ -3310,17 +3320,17 @@ pub fn render(
             };
             out.push(make_label(
                 y_entry,
-                format!("E ${:.2}", entry),
+                format!("E ${}", format_price(entry)),
                 theme_muted_foreground,
             ));
             out.push(make_label(
                 y_tp,
-                format!("TP ${:.2}", tp),
+                format!("TP ${}", format_price(tp)),
                 theme_chart_bullish,
             ));
             out.push(make_label(
                 y_sl,
-                format!("SL ${:.2}", sl),
+                format!("SL ${}", format_price(sl)),
                 theme_chart_bearish,
             ));
             // R:R: reward / risk. Sign-flipped per direction so the printed

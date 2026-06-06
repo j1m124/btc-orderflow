@@ -273,11 +273,27 @@ pub struct TzPref {
     pub iana: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeUnit {
+    #[default]
+    Coin,
+    Usd,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChartPrefs {
     pub default_view: f32,
     pub right_buffer: f32,
     pub y_padding: f32,
+    #[serde(default = "default_price_decimals")]
+    pub price_decimals: u8,
+    #[serde(default)]
+    pub volume_unit: VolumeUnit,
+}
+
+fn default_price_decimals() -> u8 {
+    2
 }
 
 impl Default for ChartPrefs {
@@ -286,6 +302,8 @@ impl Default for ChartPrefs {
             default_view: 60.0,
             right_buffer: 0.40,
             y_padding: 0.05,
+            price_decimals: default_price_decimals(),
+            volume_unit: VolumeUnit::Coin,
         }
     }
 }

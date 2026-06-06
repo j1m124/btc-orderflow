@@ -3,13 +3,27 @@
 //! pane mode in settings. Per-bar polarity uses `close >= open` so
 //! up-bars and down-bars get distinct tinting (paint pass owns the
 //! actual colors; we just emit the boolean).
+//!
+//! Volume display unit is taken from the global `chart_volume_unit()`
+//! setting at compute time — USD multiplies the raw base-asset quantity
+//! by `c.close`, so the histogram, y-range, and readout all stay in
+//! lockstep. The setting takes effect on the next recompute (which
+//! happens on every candle tick).
 
 use gpui::SharedString;
 use serde::{Deserialize, Serialize};
 
 use super::kind::{IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
+
+fn convert_volume(c: &Candle, unit: VolumeUnit) -> f64 {
+    match unit {
+        VolumeUnit::Coin => c.volume,
+        VolumeUnit::Usd => c.volume * c.close,
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VolumeParams {
@@ -29,7 +43,11 @@ impl IndicatorKind for VolumeParams {
         "Volume".into()
     }
     fn compute(&self, candles: &[Candle]) -> IndicatorOutput {
-        let values: Vec<Option<f64>> = candles.iter().map(|c| Some(c.volume)).collect();
+        let unit = crate::prefs::chart_volume_unit();
+        let values: Vec<Option<f64>> = candles
+            .iter()
+            .map(|c| Some(convert_volume(c, unit)))
+            .collect();
         let up: Vec<bool> = candles.iter().map(|c| c.close >= c.open).collect();
         IndicatorOutput::Histogram { values, up }
     }

@@ -23,7 +23,18 @@ use serde::{Deserialize, Serialize};
 
 use super::kind::{IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
+
+/// Scale a delta value (`2*tbv - volume`) into the global volume unit.
+/// USD multiplies by `c.close` so the histogram, y-range, and readout
+/// stay in lockstep with the rest of the chart.
+fn convert_delta(c: &Candle, raw_delta: f64, unit: VolumeUnit) -> f64 {
+    match unit {
+        VolumeUnit::Coin => raw_delta,
+        VolumeUnit::Usd => raw_delta * c.close,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VolumeDeltaMode {
@@ -82,6 +93,7 @@ impl IndicatorKind for VolumeDeltaParams {
     fn compute(&self, candles: &[Candle]) -> IndicatorOutput {
         let n = candles.len();
         let none_series = vec![None; n];
+        let unit = crate::prefs::chart_volume_unit();
 
         // Per-bar signed delta. `None` propagates when the source candle is
         // missing `taker_buy_vol` (e.g., an exchange that doesn't surface it
@@ -89,7 +101,10 @@ impl IndicatorKind for VolumeDeltaParams {
         let delta: Vec<Option<f64>> = if self.shows_histogram() {
             candles
                 .iter()
-                .map(|c| c.taker_buy_vol.map(|tbv| 2.0 * tbv - c.volume))
+                .map(|c| {
+                    c.taker_buy_vol
+                        .map(|tbv| convert_delta(c, 2.0 * tbv - c.volume, unit))
+                })
                 .collect()
         } else {
             none_series.clone()
@@ -105,7 +120,7 @@ impl IndicatorKind for VolumeDeltaParams {
                 .iter()
                 .map(|c| match c.taker_buy_vol {
                     Some(tbv) => {
-                        acc += 2.0 * tbv - c.volume;
+                        acc += convert_delta(c, 2.0 * tbv - c.volume, unit);
                         started = true;
                         Some(acc)
                     }

@@ -25,7 +25,7 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::persistence::{self, ChartPrefs};
+use crate::persistence::{self, ChartPrefs, VolumeUnit};
 use crate::prefs::{self, ChartPrefsGlobal, TZ_PRESETS, UserTz};
 use crate::themes;
 use crate::top_bar::SetTheme;
@@ -68,6 +68,8 @@ const RIGHT_BUFFER_MIN: f32 = 0.0;
 const RIGHT_BUFFER_MAX: f32 = 0.8;
 const Y_PAD_MIN: f32 = 0.0;
 const Y_PAD_MAX: f32 = 0.25;
+const PRICE_DECIMALS_MIN: u8 = 0;
+const PRICE_DECIMALS_MAX: u8 = 6;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Tab {
@@ -267,6 +269,8 @@ fn render_general(
         .child(candles_row(cx))
         .child(right_buffer_row(cx))
         .child(y_padding_row(cx))
+        .child(price_decimals_row(cx))
+        .child(volume_unit_row(cx))
         .child(div().px_4().child(Separator::horizontal()))
         .child(reset_all_row(cx))
 }
@@ -629,7 +633,70 @@ fn adjust_chart(cx: &mut gpui::App, mutate: impl FnOnce(&mut ChartPrefs)) {
     prefs.default_view = prefs.default_view.clamp(CANDLES_MIN, CANDLES_MAX);
     prefs.right_buffer = prefs.right_buffer.clamp(RIGHT_BUFFER_MIN, RIGHT_BUFFER_MAX);
     prefs.y_padding = prefs.y_padding.clamp(Y_PAD_MIN, Y_PAD_MAX);
+    prefs.price_decimals = prefs.price_decimals.clamp(PRICE_DECIMALS_MIN, PRICE_DECIMALS_MAX);
     prefs::set_chart_prefs(cx, prefs);
+}
+
+fn price_decimals_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
+    let value = cx.global::<ChartPrefsGlobal>().0.price_decimals;
+    setting_row(
+        "Price decimals",
+        "How many decimal places price labels round to on the y-axis and OHLC pill.",
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                Button::new("price-decimals-minus")
+                    .label("−")
+                    .small()
+                    .outline()
+                    .on_click(|_, _, cx| adjust_chart(cx, |p| {
+                        p.price_decimals = p.price_decimals.saturating_sub(1);
+                    })),
+            )
+            .child(stepper_value(format!("{value}"), cx))
+            .child(
+                Button::new("price-decimals-plus")
+                    .label("+")
+                    .small()
+                    .outline()
+                    .on_click(|_, _, cx| adjust_chart(cx, |p| {
+                        p.price_decimals = p.price_decimals.saturating_add(1);
+                    })),
+            )
+            .child(undo_button(
+                "price-decimals-undo",
+                "Reset to default",
+                |_, _, cx| adjust_chart(cx, |p| p.price_decimals = ChartPrefs::default().price_decimals),
+            )),
+    )
+}
+
+fn volume_unit_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
+    let current = cx.global::<ChartPrefsGlobal>().0.volume_unit;
+    setting_row(
+        "Volume unit",
+        "Coin renders raw base-asset quantity (BTC). USD multiplies by close \
+         price for indicators and by bucket midpoint for footprint cells. \
+         Applies to all charts (volume histogram, volume delta / CVD, footprint).",
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(volume_unit_button("vu-coin", "Coin", VolumeUnit::Coin, current))
+            .child(volume_unit_button("vu-usd", "USD", VolumeUnit::Usd, current)),
+    )
+}
+
+fn volume_unit_button(
+    id: &'static str,
+    label: &'static str,
+    value: VolumeUnit,
+    current: VolumeUnit,
+) -> impl IntoElement {
+    let is_active = value == current;
+    let mut btn = Button::new(id).label(label).small();
+    btn = if is_active { btn.primary() } else { btn.outline() };
+    btn.on_click(move |_, _, cx| adjust_chart(cx, move |p| p.volume_unit = value))
 }
 
 fn setting_row(

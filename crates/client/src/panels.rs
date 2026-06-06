@@ -320,6 +320,10 @@ pub struct ContentPanel {
     _chart_tick_flush: Option<Task<()>>,
     _chart_clock_tick: Option<Task<()>>,
     _tz_subscription: Option<gpui::Subscription>,
+    /// Recomputes indicators (volume / volume-delta convert their values
+    /// per the global `volume_unit`) and repaints when the user changes
+    /// any chart-wide setting (volume unit, price decimals, …).
+    _chart_prefs_subscription: Option<gpui::Subscription>,
     chart_sub_handles: Vec<crate::services::market_data::SubscriptionHandle>,
     /// Footprint subscription for the chart's active render kind. Allocated
     /// lazily when render kind enters Cluster / Profile; dropped on the way
@@ -459,6 +463,7 @@ impl ContentPanel {
         let mut chart_tick_flush: Option<Task<()>> = None;
         let mut chart_clock_tick: Option<Task<()>> = None;
         let mut tz_subscription: Option<gpui::Subscription> = None;
+        let mut chart_prefs_subscription: Option<gpui::Subscription> = None;
         if matches!(kind, Kind::Chart) {
             let service =
                 cx.global::<crate::services::market_data::MarketDataServiceHandle>()
@@ -623,6 +628,18 @@ impl ContentPanel {
             tz_subscription = Some(cx.observe_global::<crate::prefs::UserTz>(|_, cx| {
                 cx.notify();
             }));
+            // Recompute indicators on any chart-prefs change so the volume
+            // unit (Coin/USD) takes effect immediately without waiting for
+            // the next candle tick. Other prefs (price decimals, default
+            // view, …) just need a repaint, which `cx.notify()` covers.
+            chart_prefs_subscription = Some(cx.observe_global::<crate::prefs::ChartPrefsGlobal>(
+                |this, cx| {
+                    if let Some(state) = this.chart_state.as_mut() {
+                        state.recompute_indicators();
+                    }
+                    cx.notify();
+                },
+            ));
         }
         let orderbook_state = if matches!(kind, Kind::Orderbook) {
             let (sym, bucket, size_mode) = orderbook_prefs.unwrap_or_else(|| {
@@ -799,6 +816,7 @@ impl ContentPanel {
             _chart_tick_flush: chart_tick_flush,
             _chart_clock_tick: chart_clock_tick,
             _tz_subscription: tz_subscription,
+            _chart_prefs_subscription: chart_prefs_subscription,
             chart_sub_handles: chart_handles,
             chart_footprint_sub: None,
             chart_footprint_key: None,
