@@ -15,7 +15,18 @@ use gpui::SharedString;
 use serde::{Deserialize, Serialize};
 
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
+
+/// Cross-cutting per-compute context, threaded from `ChartState` into each
+/// `IndicatorKind::compute` call. Lets per-chart settings (e.g., the volume
+/// unit toggle that sits in the chart header) flow into indicator math
+/// without going through a global. Add fields here as more per-chart
+/// scaling/normalisation knobs surface.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ComputeCtx {
+    pub volume_unit: VolumeUnit,
+}
 
 /// Where an indicator can render. Drives picker entry placement, default
 /// `Placement` on add, and which chip strip the chip lives in.
@@ -96,8 +107,9 @@ pub trait IndicatorKind: Any + Send + Sync {
 
     /// Pure compute: full recompute over the candle array. Output length
     /// matches `candles.len()`; positions where there isn't enough history
-    /// (e.g., the first `period - 1` bars) are `None`.
-    fn compute(&self, candles: &[Candle]) -> IndicatorOutput;
+    /// (e.g., the first `period - 1` bars) are `None`. `ctx` carries any
+    /// chart-scoped knobs that affect indicator math (e.g., volume unit).
+    fn compute(&self, candles: &[Candle], ctx: ComputeCtx) -> IndicatorOutput;
 
     /// Crosshair-active chip readout at a specific bar index. Each kind
     /// formats this differently — single-line kinds return `One(...)`,

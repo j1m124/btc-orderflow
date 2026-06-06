@@ -21,7 +21,7 @@ use std::any::Any;
 use gpui::SharedString;
 use serde::{Deserialize, Serialize};
 
-use super::kind::{IndicatorKind, PaneKind};
+use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
@@ -90,10 +90,10 @@ impl IndicatorKind for VolumeDeltaParams {
         }
     }
 
-    fn compute(&self, candles: &[Candle]) -> IndicatorOutput {
+    fn compute(&self, candles: &[Candle], ctx: ComputeCtx) -> IndicatorOutput {
         let n = candles.len();
         let none_series = vec![None; n];
-        let unit = crate::prefs::chart_volume_unit();
+        let unit = ctx.volume_unit;
 
         // Per-bar signed delta. `None` propagates when the source candle is
         // missing `taker_buy_vol` (e.g., an exchange that doesn't surface it

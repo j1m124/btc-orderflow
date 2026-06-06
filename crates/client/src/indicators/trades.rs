@@ -9,7 +9,7 @@
 use gpui::SharedString;
 use serde::{Deserialize, Serialize};
 
-use super::kind::{IndicatorKind, PaneKind};
+use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::services::market_data::Candle;
 
@@ -26,7 +26,7 @@ impl IndicatorKind for TradesParams {
     fn label(&self) -> SharedString {
         "Trades".into()
     }
-    fn compute(&self, candles: &[Candle]) -> IndicatorOutput {
+    fn compute(&self, candles: &[Candle], _ctx: ComputeCtx) -> IndicatorOutput {
         let values: Vec<Option<f64>> = candles
             .iter()
             .map(|c| c.trades.map(|n| n as f64))

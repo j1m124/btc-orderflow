@@ -25,8 +25,8 @@ pub mod trades;
 pub mod watchlist;
 
 pub use chart::{
-    ChangeChartRender, ChangeChartTimeframe, ChartRenderSettingsView, GoToLatest,
-    OpenChartRenderSettings, ResetChartScale, ToggleChartRenderVisible,
+    ChangeChartRender, ChangeChartTimeframe, ChangeChartVolumeUnit, ChartRenderSettingsView,
+    GoToLatest, OpenChartRenderSettings, ResetChartScale, ToggleChartRenderVisible,
 };
 pub use orderbook::{ChangeOrderbookBucket, ChangeOrderbookSizeMode};
 pub use trades::ChangeTradesSizeMode;
@@ -158,6 +158,10 @@ struct ChartPrefs {
     cluster: Option<chart::FootprintParams>,
     #[serde(default)]
     profile: Option<chart::FootprintParams>,
+    /// Volume display unit (`"coin"` / `"usd"`). Per-chart, not global.
+    /// New in v6; older state defaults to Coin via `serde(default)`.
+    #[serde(default)]
+    volume_unit: Option<String>,
 }
 
 /// Restored chart prefs after parsing from persisted PanelInfo. Render-mode
@@ -169,6 +173,22 @@ struct ChartRestored {
     render_kind: chart::RenderKind,
     cluster: chart::FootprintParams,
     profile: chart::FootprintParams,
+    volume_unit: crate::persistence::VolumeUnit,
+}
+
+fn parse_volume_unit(s: &str) -> Option<crate::persistence::VolumeUnit> {
+    match s {
+        "coin" => Some(crate::persistence::VolumeUnit::Coin),
+        "usd" => Some(crate::persistence::VolumeUnit::Usd),
+        _ => None,
+    }
+}
+
+fn volume_unit_id(u: crate::persistence::VolumeUnit) -> &'static str {
+    match u {
+        crate::persistence::VolumeUnit::Coin => "coin",
+        crate::persistence::VolumeUnit::Usd => "usd",
+    }
 }
 
 fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
@@ -188,12 +208,18 @@ fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
     let profile = prefs
         .profile
         .unwrap_or_else(chart::FootprintParams::profile_default);
+    let volume_unit = prefs
+        .volume_unit
+        .as_deref()
+        .and_then(parse_volume_unit)
+        .unwrap_or_default();
     Some(ChartRestored {
         symbol: SharedString::from(prefs.symbol),
         tf,
         render_kind,
         cluster,
         profile,
+        volume_unit,
     })
 }
 
@@ -392,7 +418,12 @@ impl ContentPanel {
                 Some(restored) => (
                     restored.symbol.clone(),
                     restored.tf,
-                    Some((restored.render_kind, restored.cluster, restored.profile)),
+                    Some((
+                        restored.render_kind,
+                        restored.cluster,
+                        restored.profile,
+                        restored.volume_unit,
+                    )),
                 ),
                 None => {
                     let default_tf = chart::ChartState::default_timeframe();
@@ -410,8 +441,12 @@ impl ContentPanel {
             chart_handles = vec![ensure_chart_sub(symbol.as_ref(), tf, cx)];
             let live = live_snapshot(symbol.as_ref(), tf, cx);
             let mut state = chart::ChartState::new(symbol.as_ref(), tf, live);
-            if let Some((kind, cluster, profile)) = render_seed {
+            if let Some((kind, cluster, profile, volume_unit)) = render_seed {
                 state.seed_render(kind, cluster, profile);
+                state.set_volume_unit(volume_unit);
+                // Re-run indicator math with the persisted unit so the chart
+                // doesn't show one frame of Coin numbers before settling.
+                state.recompute_indicators();
             }
             state
         });
@@ -628,15 +663,12 @@ impl ContentPanel {
             tz_subscription = Some(cx.observe_global::<crate::prefs::UserTz>(|_, cx| {
                 cx.notify();
             }));
-            // Recompute indicators on any chart-prefs change so the volume
-            // unit (Coin/USD) takes effect immediately without waiting for
-            // the next candle tick. Other prefs (price decimals, default
-            // view, …) just need a repaint, which `cx.notify()` covers.
+            // Repaint on any global chart-prefs change (price decimals,
+            // default view, …). The volume-unit toggle is now per-chart
+            // (header dropdown → `set_chart_volume_unit`), so this
+            // subscription no longer needs to recompute indicators.
             chart_prefs_subscription = Some(cx.observe_global::<crate::prefs::ChartPrefsGlobal>(
-                |this, cx| {
-                    if let Some(state) = this.chart_state.as_mut() {
-                        state.recompute_indicators();
-                    }
+                |_this, cx| {
                     cx.notify();
                 },
             ));
@@ -1203,6 +1235,39 @@ impl ContentPanel {
         cx.notify();
     }
 
+    fn on_change_chart_volume_unit(
+        &mut self,
+        action: &ChangeChartVolumeUnit,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(unit) = parse_volume_unit(action.0.as_ref()) else {
+            return;
+        };
+        self.set_chart_volume_unit(unit, cx);
+    }
+
+    /// Apply a volume-unit choice to the chart and propagate: recompute
+    /// indicators so Volume / Volume Delta / CVD reflect the new unit,
+    /// repaint so the footprint paint pipeline picks it up too, and persist
+    /// the choice via the dock-area layout-changed signal.
+    pub fn set_chart_volume_unit(
+        &mut self,
+        unit: crate::persistence::VolumeUnit,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.chart_state.as_mut() else {
+            return;
+        };
+        if state.volume_unit() == unit {
+            return;
+        }
+        state.set_volume_unit(unit);
+        state.recompute_indicators();
+        cx.notify();
+        request_layout_save(cx);
+    }
+
     fn on_change_trades_size_mode(
         &mut self,
         action: &ChangeTradesSizeMode,
@@ -1431,6 +1496,7 @@ impl Panel for ContentPanel {
                 render_kind: Some(chart.render_kind().as_id().to_string()),
                 cluster: Some(*chart.cluster_params()),
                 profile: Some(*chart.profile_params()),
+                volume_unit: Some(volume_unit_id(chart.volume_unit()).to_string()),
             }) {
                 state.info = PanelInfo::panel(value);
             }
@@ -1575,6 +1641,7 @@ impl Render for ContentPanel {
                     .key_context("Chart")
                     .on_action(cx.listener(Self::on_change_chart_timeframe))
                     .on_action(cx.listener(Self::on_change_chart_render))
+                    .on_action(cx.listener(Self::on_change_chart_volume_unit))
                     .on_action(cx.listener(Self::on_toggle_chart_render_visible))
                     .on_action(cx.listener(Self::on_move_indicator_pane_up))
                     .on_action(cx.listener(Self::on_move_indicator_pane_down))

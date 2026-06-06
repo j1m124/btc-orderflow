@@ -257,6 +257,7 @@ pub(super) fn paint_main_chart(
     render_visible: bool,
     footprint_params: Option<&FootprintParams>,
     footprint_cells: &[FootprintCell],
+    volume_unit: VolumeUnit,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -384,7 +385,6 @@ pub(super) fn paint_main_chart(
     // `render_visible` gates this whole layer — false suppresses the
     // candle / cell / wireframe paint while the grid + axes + overlays
     // keep painting (driven by the synthetic render chip's eye toggle).
-    let volume_unit = crate::prefs::chart_volume_unit();
     let render_cells_available =
         matches!(render_kind, RenderKind::Cluster | RenderKind::Profile)
             && !footprint_cells.is_empty()
@@ -441,13 +441,12 @@ pub(super) fn paint_main_chart(
     }
 
     // -- 4. y-axis labels (right gutter) --
-    let price_decimals = crate::prefs::chart_price_decimals() as usize;
     for &y_val in &y_ticks {
         let y = price_to_screen(y_lo, y_hi, y_val, canvas_h);
         if y < chart_top - 6.0 || y > chart_bottom + 6.0 {
             continue;
         }
-        let label = SharedString::from(format!("{:.*}", price_decimals, y_val));
+        let label = SharedString::from(format!("{:.2}", y_val));
         let run = TextRun {
             len: label.len(),
             font: window.text_style().font(),
@@ -520,16 +519,39 @@ fn pick_bucket_y_step(range: f64, target_count: usize, bucket: f64) -> f64 {
     n * bucket
 }
 
-/// Slot fraction occupied by the candle body in candlestick render mode. The
-/// wireframe `SideOhlc` variant reuses this for the side candle (narrower).
-const CANDLE_BODY_FRACTION: f32 = 0.7;
+/// Per-bar gap policy. At default zoom (`slot_width` ~5–15 px) the gap is
+/// ~30% of the slot, matching the classic candlestick look. When the user
+/// zooms way in (footprint inspection often pushes `slot_width` past 50 px),
+/// scaling the gap proportionally would leave huge empty stripes between
+/// bars — so the gap is capped at `MAX_BAR_GAP` and the body grows to fill
+/// the rest. Floor is 1 px so bars never visually merge.
+const BAR_GAP_FRACTION: f32 = 0.30;
+const MAX_BAR_GAP: f32 = 5.0;
+const MIN_BAR_GAP: f32 = 1.0;
 const SIDE_OHLC_FRACTION: f32 = 0.22;
+
+/// Body width for a candle / wireframe / cluster bar centred in `slot_width`.
+/// Uses the gap policy above (capped, with a floor) so both the candlestick
+/// render and the footprint footprint layout share one source of truth.
+#[inline]
+fn slot_body_width(slot_width: f32) -> f32 {
+    let gap = (slot_width * BAR_GAP_FRACTION).clamp(MIN_BAR_GAP, MAX_BAR_GAP);
+    (slot_width - gap).max(1.0)
+}
+
+/// Per-side edge pad: half the gap left after the body claims its width.
+#[inline]
+fn slot_edge_pad(slot_width: f32) -> f32 {
+    (slot_width - slot_body_width(slot_width)) * 0.5
+}
 
 /// Minimum cell pixel dimensions for in-cell text to render. Below this, the
 /// number auto-hides — readability tested at the chart's 10pt text size with
-/// 4-digit volumes. Independent of `TextMetric::None`, which always hides.
-const MIN_CELL_W_FOR_TEXT: f32 = 28.0;
-const MIN_CELL_H_FOR_TEXT: f32 = 11.0;
+/// 4-digit volumes. Tuned wider/taller than the bare legibility floor so
+/// shrinking the chart hides text *before* cells get cramped and unreadable,
+/// rather than after. Independent of `TextMetric::None`, which always hides.
+const MIN_CELL_W_FOR_TEXT: f32 = 48.0;
+const MIN_CELL_H_FOR_TEXT: f32 = 14.0;
 
 /// Paint the classic candlestick layer: per-candle wick + body in sparse
 /// mode, column-aggregated bars in dense mode. Extracted verbatim from
@@ -554,7 +576,7 @@ fn paint_candle_bodies(
 ) {
     let slot_width = chart_w / view_size.max(1.0);
     if slot_width >= 1.0 {
-        let body_width = (slot_width * CANDLE_BODY_FRACTION).max(1.0);
+        let body_width = slot_body_width(slot_width);
         let half_body = body_width / 2.0;
         for (i, candle) in candles.iter().enumerate() {
             let idx = (start_idx + i) as f32;
@@ -636,28 +658,59 @@ struct SlotLayout {
     side_candle_body_w: f32,
 }
 
+/// Inset between the Behind body's outer edge and the cell band. The body
+/// outline paints at 1 px; the inset adds a small breathing gap on top so
+/// cells visibly sit *inside* the frame rather than flush against it.
+const BEHIND_CELL_INSET: f32 = 2.0;
+
 /// Build the slot layout for a bar whose center is `center_x` and slot width
-/// is `slot_width`. SideOhlc tucks the candle into the right edge of the
-/// slot; Behind / None let cells / bars use the full slot.
+/// is `slot_width`. Cells are inset on both sides by the same gap candlestick
+/// bodies leave (slot - body) so footprint bars breathe the same as candles —
+/// without this, cells stretched edge-to-edge merge into one continuous band
+/// at typical zoom levels. SideOhlc tucks the candle into the left edge of
+/// the slot, with cells filling the leftover space to the right. Behind
+/// nudges the cell band further inward so cells live inside the body frame.
 fn footprint_slot_layout(center_x: f32, slot_width: f32, variant: WireframeVariant) -> SlotLayout {
     let half = slot_width * 0.5;
     let slot_left = center_x - half;
     let slot_right = center_x + half;
+    // Same per-bar breathing room as candlestick bodies — shared with the
+    // candlestick paint via `slot_edge_pad` so both renders line up.
+    let edge_pad = slot_edge_pad(slot_width);
+    let bar_left = slot_left + edge_pad;
+    let bar_right = slot_right - edge_pad;
     match variant {
         WireframeVariant::SideOhlc => {
             let side_w = (slot_width * SIDE_OHLC_FRACTION).max(2.0);
-            let cell_x_max = (slot_right - side_w).max(slot_left);
-            let side_center = (cell_x_max + slot_right) * 0.5;
+            // Side candle anchored to the LEFT edge of the inset bar area;
+            // cells fill from where the candle ends out to `bar_right`. User
+            // preference: candle reads left → cells right, matching the
+            // direction price/time flow on the chart.
+            let cell_x_min = (bar_left + side_w).min(bar_right);
+            let side_center = (bar_left + cell_x_min) * 0.5;
             SlotLayout {
-                cell_x_min: slot_left,
-                cell_x_max,
+                cell_x_min,
+                cell_x_max: bar_right,
                 side_candle_center: Some(side_center),
                 side_candle_body_w: side_w.max(1.0),
             }
         }
-        WireframeVariant::Behind | WireframeVariant::None => SlotLayout {
-            cell_x_min: slot_left,
-            cell_x_max: slot_right,
+        WireframeVariant::Behind => {
+            // Sit cells inside the body frame so the wireframe outline reads
+            // cleanly around them. Inset capped at half the bar width so
+            // very narrow bars don't collapse the cell band to nothing.
+            let max_inset = ((bar_right - bar_left) * 0.5 - 0.5).max(0.0);
+            let inset = BEHIND_CELL_INSET.min(max_inset);
+            SlotLayout {
+                cell_x_min: bar_left + inset,
+                cell_x_max: bar_right - inset,
+                side_candle_center: None,
+                side_candle_body_w: 0.0,
+            }
+        }
+        WireframeVariant::None => SlotLayout {
+            cell_x_min: bar_left,
+            cell_x_max: bar_right,
             side_candle_center: None,
             side_candle_body_w: 0.0,
         },
@@ -711,36 +764,68 @@ fn paint_bar_wireframes(
         let layout = footprint_slot_layout(center_x, slot_width, variant);
         match variant {
             WireframeVariant::Behind => {
-                // Faded silhouette so the cell colour layer reads cleanly on
-                // top. Wick down the centre, plus two vertical lines bracketing
-                // the body (open→close extent) at the body's left + right
-                // edges — reads as a translucent OHLC frame the cells sit
-                // inside, per user feedback.
-                let faded = Hsla { a: 0.45, ..color };
-                let wick_top = high_y.min(low_y);
-                let wick_h = (high_y - low_y).abs().max(1.0);
-                fill_rect(window, origin, center_x - 0.5, 1.0, wick_top, wick_h, faded);
+                // Full-contrast OHLC frame: top/bottom wick stubs that STOP at
+                // the body frame (so no vertical line tracks through the
+                // body's interior — that's the user's reading surface for the
+                // cells), plus a hollow rectangle around the open→close body
+                // (top, bottom, left, right). Painted at full bullish/bearish
+                // opacity (no alpha tint) so the bar shape stays the dominant
+                // read with cells overlaid inside it.
                 let body_top = open_y.min(close_y);
-                let body_h = (open_y - close_y).abs().max(1.0);
-                let body_w = (slot_width * CANDLE_BODY_FRACTION).max(2.0);
-                let half_body = body_w * 0.5;
+                let body_bottom = open_y.max(close_y);
+                let body_h = (body_bottom - body_top).max(1.0);
+                let body_w = slot_body_width(slot_width).max(2.0);
+                let body_left = center_x - body_w * 0.5;
+                let wick_top = high_y.min(low_y);
+                let wick_bottom = high_y.max(low_y);
+                // Upper wick: high → top of body. Skip if the body is at the
+                // top of the candle's range (no upper wick).
+                if body_top > wick_top {
+                    fill_rect(
+                        window,
+                        origin,
+                        center_x - 0.5,
+                        1.0,
+                        wick_top,
+                        body_top - wick_top,
+                        color,
+                    );
+                }
+                // Lower wick: bottom of body → low. Skip if body is at the
+                // bottom of the candle's range.
+                if wick_bottom > body_bottom {
+                    fill_rect(
+                        window,
+                        origin,
+                        center_x - 0.5,
+                        1.0,
+                        body_bottom,
+                        wick_bottom - body_bottom,
+                        color,
+                    );
+                }
+                // Left + right edges
+                fill_rect(window, origin, body_left, 1.0, body_top, body_h, color);
                 fill_rect(
                     window,
                     origin,
-                    center_x - half_body,
+                    body_left + body_w - 1.0,
                     1.0,
                     body_top,
                     body_h,
-                    faded,
+                    color,
                 );
+                // Top + bottom edges — close the rectangle so the body
+                // reads as a fully enclosed frame, not three loose verticals.
+                fill_rect(window, origin, body_left, body_w, body_top, 1.0, color);
                 fill_rect(
                     window,
                     origin,
-                    center_x + half_body - 1.0,
+                    body_left,
+                    body_w,
+                    body_top + body_h - 1.0,
                     1.0,
-                    body_top,
-                    body_h,
-                    faded,
+                    color,
                 );
             }
             WireframeVariant::SideOhlc => {
@@ -1252,8 +1337,20 @@ fn format_cell_text(c: &FootprintCell, metric: TextMetric, bucket: f64, unit: Vo
     }
 }
 
+/// In-cell label for footprint volumes. When the user toggles "Truncate
+/// footprint decimals" on, fractional digits are dropped (cells render as
+/// whole numbers; K/M suffix preserved). Otherwise the standard
+/// `K`/`M` shorthand at 1dp with a 2dp tail for sub-10 values.
 fn format_short(v: f64) -> String {
     let abs = v.abs();
+    if crate::prefs::footprint_truncate_decimals() {
+        if abs >= 1_000_000.0 {
+            return format!("{:.0}M", (v / 1_000_000.0).trunc());
+        } else if abs >= 1_000.0 {
+            return format!("{:.0}K", (v / 1_000.0).trunc());
+        }
+        return format!("{:.0}", v.trunc());
+    }
     if abs >= 1_000_000.0 {
         format!("{:.1}M", v / 1_000_000.0)
     } else if abs >= 1_000.0 {
@@ -1859,10 +1956,10 @@ pub(super) fn paint_overlay_indicators(
     let visible_end = start_idx.saturating_add(visible_count);
 
     // Slot width mirrors the candle paint pipeline so volume bars line up
-    // with candle bodies. 0.7 of the slot leaves narrow gaps between bars
-    // for visual separation.
+    // with candle bodies. Uses the shared `slot_body_width` helper so the
+    // gap policy stays in lockstep with the main candles (cap on zoom-in).
     let slot_w = (chart_w / view_size).max(0.5);
-    let bar_w = (slot_w * 0.7).max(1.0);
+    let bar_w = slot_body_width(slot_w);
 
     for item in items {
         let primary = item.color_at(0);
@@ -2182,7 +2279,7 @@ pub(super) fn paint_sub_pane(
 
     // -- the indicator's series --
     let slot_w = (chart_w / view_size.max(1.0)).max(0.5);
-    let bar_w = (slot_w * 0.7).max(1.0);
+    let bar_w = slot_body_width(slot_w);
     match &item.output {
         IndicatorOutput::Line(series) => {
             // RSI overbought/oversold/midline guides. Stronger-alpha grid so

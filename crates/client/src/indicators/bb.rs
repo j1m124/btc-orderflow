@@ -5,7 +5,7 @@
 use gpui::SharedString;
 use serde::{Deserialize, Serialize};
 
-use super::kind::{IndicatorKind, PaneKind, Source};
+use super::kind::{ComputeCtx, IndicatorKind, PaneKind, Source};
 use super::math::{extract_source, rolling_sma, rolling_stddev};
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::services::market_data::Candle;
@@ -44,7 +44,7 @@ impl IndicatorKind for BbParams {
         };
         format!("BB({}, {})", self.period, sd).into()
     }
-    fn compute(&self, candles: &[Candle]) -> IndicatorOutput {
+    fn compute(&self, candles: &[Candle], _ctx: ComputeCtx) -> IndicatorOutput {
         let src = extract_source(candles, self.source);
         let middle = rolling_sma(&src, self.period);
         let sigma = rolling_stddev(&src, self.period);

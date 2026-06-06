@@ -4,16 +4,17 @@
 //! up-bars and down-bars get distinct tinting (paint pass owns the
 //! actual colors; we just emit the boolean).
 //!
-//! Volume display unit is taken from the global `chart_volume_unit()`
-//! setting at compute time — USD multiplies the raw base-asset quantity
-//! by `c.close`, so the histogram, y-range, and readout all stay in
-//! lockstep. The setting takes effect on the next recompute (which
-//! happens on every candle tick).
+//! Volume display unit is taken from the per-chart `ComputeCtx.volume_unit`
+//! threaded in by `ChartState::recompute_indicators` — USD multiplies the
+//! raw base-asset quantity by `c.close`, so the histogram, y-range, and
+//! readout all stay in lockstep with the chart's header toggle. Switching
+//! the unit triggers an immediate recompute (no need to wait for the next
+//! candle tick).
 
 use gpui::SharedString;
 use serde::{Deserialize, Serialize};
 
-use super::kind::{IndicatorKind, PaneKind};
+use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
@@ -42,8 +43,8 @@ impl IndicatorKind for VolumeParams {
     fn label(&self) -> SharedString {
         "Volume".into()
     }
-    fn compute(&self, candles: &[Candle]) -> IndicatorOutput {
-        let unit = crate::prefs::chart_volume_unit();
+    fn compute(&self, candles: &[Candle], ctx: ComputeCtx) -> IndicatorOutput {
+        let unit = ctx.volume_unit;
         let values: Vec<Option<f64>> = candles
             .iter()
             .map(|c| Some(convert_volume(c, unit)))

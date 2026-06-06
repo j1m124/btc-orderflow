@@ -22,7 +22,7 @@ pub use instance::{
     COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, default_pane_height, new_instance_id,
     palette_color_for,
 };
-pub use kind::{IndicatorKind, PaneKind, Placement, Source};
+pub use kind::{ComputeCtx, IndicatorKind, PaneKind, Placement, Source};
 pub use output::{IndicatorOutput, Series, ValueReadout};
 pub use trades::TradesParams;
 pub use volume::VolumeParams;

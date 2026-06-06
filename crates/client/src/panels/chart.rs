@@ -41,9 +41,10 @@ use super::ContentPanel;
 use crate::drawings::service::{DrawingId, DrawingServiceHandle};
 use crate::drawings::tool::Tool;
 use crate::indicators::{
-    IndicatorInstance, IndicatorKind, IndicatorOutput, InstanceId, Placement, ValueReadout,
-    VolumeParams, palette_color_for,
+    ComputeCtx, IndicatorInstance, IndicatorKind, IndicatorOutput, InstanceId, Placement,
+    ValueReadout, VolumeParams, palette_color_for,
 };
+use crate::persistence::VolumeUnit;
 use crate::panels::LastFocusedChart;
 use crate::services::market_data::{self, Candle, Timeframe};
 
@@ -92,6 +93,16 @@ pub struct ChangeChartRender(pub SharedString);
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = client, no_json)]
 pub struct ToggleChartRenderVisible;
+
+/// Switch the chart's volume display unit (`coin` / `usd`). Dispatched
+/// from the header volume-unit dropdown (between the render-kind selector
+/// and the `+ Indicator` button). Carries the wire id; the handler parses
+/// it back and routes through `ContentPanel::set_chart_volume_unit` so
+/// indicators (Volume / Volume Delta / CVD) recompute and the footprint
+/// paint pipeline picks up the new unit in one shot.
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct ChangeChartVolumeUnit(pub SharedString);
 
 // Drawing-delete + clear actions now live in `crate::drawings::actions` so
 // they're shared with workspace-wide key bindings and the Objects popover.
@@ -643,6 +654,13 @@ pub struct ChartState {
     /// fallback to candle bodies so the chart never goes blank during the
     /// snapshot round-trip.
     footprint_cells: Vec<crate::services::market_data::FootprintCell>,
+    /// Per-chart volume display unit. Affects this chart's volume /
+    /// volume-delta / CVD indicators (threaded into `ComputeCtx`) AND its
+    /// footprint paint pipeline. Surfaces as the header Coin/USD dropdown
+    /// between the render-kind selector and `+ Indicator`. Carries over
+    /// symbol/timeframe switches (the rendering unit is a user choice, not
+    /// a per-symbol one) and persists in `ChartPrefs`.
+    volume_unit: VolumeUnit,
 }
 
 /// Baseline captured at splitter mouse-down. The outer mouse-move handler
@@ -665,6 +683,7 @@ struct RenderSettingsSnapshot {
     visible: bool,
     cluster: FootprintParams,
     profile: FootprintParams,
+    volume_unit: VolumeUnit,
 }
 
 impl ChartState {
@@ -801,6 +820,7 @@ impl ChartState {
             visible: self.render_visible,
             cluster: self.cluster_params,
             profile: self.profile_params,
+            volume_unit: self.volume_unit,
         }
     }
 
@@ -809,6 +829,7 @@ impl ChartState {
         self.render_visible = snap.visible;
         self.cluster_params = snap.cluster;
         self.profile_params = snap.profile;
+        self.volume_unit = snap.volume_unit;
     }
 
     /// Direct setters used by `ContentPanel::new_restored` to seed
@@ -825,6 +846,29 @@ impl ChartState {
         self.render_kind = kind;
         self.cluster_params = cluster;
         self.profile_params = profile;
+    }
+
+    /// Current volume display unit (Coin or USD). Read by `compute_ctx()`
+    /// + the paint pipeline so indicators and footprint cells agree on
+    /// the same unit at every render.
+    pub fn volume_unit(&self) -> VolumeUnit {
+        self.volume_unit
+    }
+
+    /// Set the volume unit. Caller is responsible for invoking
+    /// `recompute_indicators()` + `cx.notify()` so the change takes
+    /// visible effect in one frame.
+    pub fn set_volume_unit(&mut self, unit: VolumeUnit) {
+        self.volume_unit = unit;
+    }
+
+    /// Build the `ComputeCtx` for the current chart settings — threaded
+    /// into every `IndicatorKind::compute` call so per-chart knobs (volume
+    /// unit, future fields) flow through without a global.
+    fn compute_ctx(&self) -> ComputeCtx {
+        ComputeCtx {
+            volume_unit: self.volume_unit,
+        }
     }
 
     pub fn timeframe(&self) -> Timeframe {
@@ -1045,7 +1089,7 @@ impl ChartState {
         let color = palette_color_for(count);
         let instance = IndicatorInstance::new(kind, color);
         let id = instance.id;
-        let output = instance.kind.compute(&self.candles);
+        let output = instance.kind.compute(&self.candles, self.compute_ctx());
         self.indicators.push(instance);
         self.indicator_outputs.push(output);
         id
@@ -1087,7 +1131,7 @@ impl ChartState {
         // instance's per-slot color Vec so paint and the settings UI
         // see a consistent shape.
         self.indicators[idx].sync_colors();
-        let new_output = self.indicators[idx].kind.compute(&self.candles);
+        let new_output = self.indicators[idx].kind.compute(&self.candles, self.compute_ctx());
         self.indicator_outputs[idx] = new_output;
         true
     }
@@ -1100,10 +1144,11 @@ impl ChartState {
         let Some(idx) = self.indicators.iter().position(|i| i.id == id) else {
             return false;
         };
+        let ctx = self.compute_ctx();
         let inst = &mut self.indicators[idx];
         inst.kind_id = kind.kind_id();
         inst.kind = kind;
-        let new_output = inst.kind.compute(&self.candles);
+        let new_output = inst.kind.compute(&self.candles, ctx);
         self.indicator_outputs[idx] = new_output;
         true
     }
@@ -1212,8 +1257,9 @@ impl ChartState {
             self.indicator_outputs
                 .resize_with(self.indicators.len(), || IndicatorOutput::Line(Vec::new()));
         }
+        let ctx = self.compute_ctx();
         for (i, inst) in self.indicators.iter().enumerate() {
-            self.indicator_outputs[i] = inst.kind.compute(&self.candles);
+            self.indicator_outputs[i] = inst.kind.compute(&self.candles, ctx);
         }
     }
 
@@ -1291,6 +1337,7 @@ impl ChartState {
             cluster_params: FootprintParams::cluster_default(),
             profile_params: FootprintParams::profile_default(),
             footprint_cells: Vec::new(),
+            volume_unit: VolumeUnit::default(),
         };
         // Every fresh chart is born with a Volume overlay. `switch_*`
         // callers preserve the user's indicator list, so this seeding only
@@ -1434,9 +1481,9 @@ impl ChartState {
 }
 
 /// Width of the y-axis label gutter for a given price range. Labels paint
-/// at px(10) using the user's `price_decimals` setting, so the widest
-/// label width drives the gutter. Clamped so the gutter never collapses
-/// (small prices) nor steals the whole chart (anomalous ranges).
+/// at px(10) via `format_price`, so the widest label width drives the
+/// gutter. Clamped so the gutter never collapses (small prices) nor steals
+/// the whole chart (anomalous ranges).
 pub(super) fn compute_y_axis_gap(y_lo: f64, y_hi: f64) -> f32 {
     let widest = y_lo.abs().max(y_hi.abs());
     if !widest.is_finite() {
@@ -1448,13 +1495,12 @@ pub(super) fn compute_y_axis_gap(y_lo: f64, y_hi: f64) -> f32 {
     (label.len() as f32 * 6.5 + 14.0).clamp(44.0, 120.0)
 }
 
-/// Format a price value using the user's `chart_price_decimals` setting.
-/// All on-chart price readouts (axis labels, OHLC pill, live-price pill,
-/// crosshair, ray pills, position E/TP/SL labels) flow through this so
-/// they stay in lockstep with the global setting.
+/// Format a price value at the standard 2dp used across the main chart
+/// (axis labels, OHLC pill, live-price pill, crosshair, ray pills, position
+/// E/TP/SL labels). Single place so any future precision change can land
+/// in one diff.
 pub(super) fn format_price(value: f64) -> String {
-    let d = crate::prefs::chart_price_decimals() as usize;
-    format!("{:.*}", d, value)
+    format!("{:.2}", value)
 }
 
 /// Convert a screen-space x pixel (relative to canvas origin) to a fractional
@@ -2458,6 +2504,32 @@ pub fn render(
             menu
         });
 
+    // Per-chart volume-unit dropdown (Coin / USD). Sits between the
+    // render-kind selector and `+ Indicator`. Drives this chart's
+    // Volume / Volume Delta / CVD indicators (via `ComputeCtx`) and its
+    // footprint paint pipeline. Per-chart rather than global so two charts
+    // open side-by-side can show the same data in different units.
+    let volume_unit_focus = focus.clone();
+    let current_volume_unit = state.volume_unit();
+    let volume_unit_label = match current_volume_unit {
+        VolumeUnit::Coin => "Coin",
+        VolumeUnit::Usd => "USD",
+    };
+    let volume_unit_btn = Button::new("chart-volume-unit-select")
+        .label(SharedString::from(volume_unit_label))
+        .small()
+        .ghost()
+        .dropdown_menu(move |menu, _, _| {
+            let mut menu = menu.action_context(volume_unit_focus.clone());
+            for (label, id) in [("Coin", "coin"), ("USD", "usd")] {
+                menu = menu.menu(
+                    SharedString::from(label),
+                    Box::new(ChangeChartVolumeUnit(SharedString::from(id))),
+                );
+            }
+            menu
+        });
+
     // Snapshot the candle slice the paint pass needs. Cloning is fine — at
     // default `view_size = 60` we copy ~60 `Candle`s once per render, the
     // same cost the deleted `visible_for_chart_with_y` had. The closure
@@ -2483,6 +2555,7 @@ pub fn render(
         state.active_footprint_params().copied();
     let paint_footprint_cells: Vec<market_data::FootprintCell> =
         state.footprint_cells().to_vec();
+    let paint_volume_unit = state.volume_unit();
     // Pre-filter overlay indicators for the paint closure: skip hidden /
     // pane-placed instances, snapshot color + output so the closure stays
     // 'static. Per-render clone — `Series` is a `Vec<Option<f64>>`, so the
@@ -4101,6 +4174,7 @@ pub fn render(
                             paint_render_visible,
                             paint_footprint_params.as_ref(),
                             &paint_footprint_cells,
+                            paint_volume_unit,
                             window,
                             cx,
                         );
@@ -4562,6 +4636,7 @@ pub fn render(
                 .child(symbol_button)
                 .child(timeframe_btn)
                 .child(render_btn)
+                .child(volume_unit_btn)
                 // `+ Indicator` button — dispatches `OpenIndicatorPicker`
                 // which the workspace resolves to this chart via the
                 // `LastFocusedChart` global (already kept fresh by the

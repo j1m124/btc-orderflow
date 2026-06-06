@@ -286,14 +286,11 @@ pub struct ChartPrefs {
     pub default_view: f32,
     pub right_buffer: f32,
     pub y_padding: f32,
-    #[serde(default = "default_price_decimals")]
-    pub price_decimals: u8,
+    /// When true, footprint cell labels drop their fractional digits and
+    /// render as whole numbers. Footprint-only — main chart price labels
+    /// and indicator readouts ignore this flag.
     #[serde(default)]
-    pub volume_unit: VolumeUnit,
-}
-
-fn default_price_decimals() -> u8 {
-    2
+    pub truncate_footprint_decimals: bool,
 }
 
 impl Default for ChartPrefs {
@@ -302,8 +299,7 @@ impl Default for ChartPrefs {
             default_view: 60.0,
             right_buffer: 0.40,
             y_padding: 0.05,
-            price_decimals: default_price_decimals(),
-            volume_unit: VolumeUnit::Coin,
+            truncate_footprint_decimals: false,
         }
     }
 }
