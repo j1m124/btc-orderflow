@@ -7,11 +7,13 @@
 
 mod drawings_view;
 mod footprint;
+mod footprint_settings;
 mod paint;
 
 pub use footprint::{
     ColorScope, FootprintParams, RenderKind, RenderMetric, TextMetric, WireframeVariant,
 };
+pub use footprint_settings::{ChartRenderSettingsView, OpenChartRenderSettings};
 
 use gpui::{
     Action, AppContext as _, Bounds, ContentMask, Context, Entity, FocusHandle, Focusable as _,
@@ -1716,14 +1718,17 @@ fn render_synthetic_render_chip(
         );
 
     // Gear: enabled only for footprint kinds (Candlestick has no params).
-    // Click target wired up in Commit 4 (settings popover); for now it's a
-    // bare button so the layout is final.
+    // Dispatches `OpenChartRenderSettings`; the workspace handler resolves
+    // the target chart via `LastFocusedChart` and opens the singleton
+    // floating settings window scoped to whichever render kind is active.
     let gear_btn = Button::new("chip-render-gear")
         .label(SharedString::from("\u{2699}")) // ⚙
         .xsmall()
         .ghost();
     chip = if has_settings {
-        chip.child(gear_btn)
+        chip.child(gear_btn.on_click(|_ev, window, cx| {
+            window.dispatch_action(Box::new(OpenChartRenderSettings), cx);
+        }))
     } else {
         chip.child(gear_btn.disabled(true))
     };

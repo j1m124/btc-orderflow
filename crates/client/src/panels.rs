@@ -25,8 +25,8 @@ pub mod trades;
 pub mod watchlist;
 
 pub use chart::{
-    ChangeChartRender, ChangeChartTimeframe, GoToLatest, ResetChartScale,
-    ToggleChartRenderVisible,
+    ChangeChartRender, ChangeChartTimeframe, ChartRenderSettingsView, GoToLatest,
+    OpenChartRenderSettings, ResetChartScale, ToggleChartRenderVisible,
 };
 pub use orderbook::{ChangeOrderbookBucket, ChangeOrderbookSizeMode};
 pub use trades::ChangeTradesSizeMode;
@@ -963,6 +963,51 @@ impl ContentPanel {
             cx.notify();
             request_layout_save(cx);
         }
+    }
+
+    /// Apply a mutation to the active render's `FootprintParams`. The
+    /// closure receives `&mut FootprintParams` and runs against whichever
+    /// mode is currently active (Cluster or Profile). Returns `true` if
+    /// the mutation actually ran (i.e. the active render is a footprint
+    /// kind, not Candlestick).
+    ///
+    /// After the mutation, the footprint subscription is reconciled —
+    /// `refresh_chart_footprint_sub` will detect any bucket change and
+    /// drop+reopen the sub for the new bucket.
+    pub fn apply_active_footprint_params<F>(&mut self, f: F, cx: &mut Context<Self>) -> bool
+    where
+        F: FnOnce(&mut chart::FootprintParams),
+    {
+        let Some(state) = self.chart_state.as_mut() else {
+            return false;
+        };
+        let kind = state.render_kind();
+        let ran = match kind {
+            chart::RenderKind::Candlestick => false,
+            chart::RenderKind::Cluster => {
+                state.update_cluster_params(|p| {
+                    f(p);
+                    false
+                });
+                true
+            }
+            chart::RenderKind::Profile => {
+                state.update_profile_params(|p| {
+                    f(p);
+                    false
+                });
+                true
+            }
+        };
+        if ran {
+            // Bucket drift inside refresh_chart_footprint_sub triggers the
+            // drop+reopen; cosmetic-only edits (wireframe / metric / scope)
+            // are no-ops at the sub layer but still need a repaint.
+            self.refresh_chart_footprint_sub(cx);
+            cx.notify();
+            request_layout_save(cx);
+        }
+        ran
     }
 
     /// Switch the chart's render kind. If the kind actually changed, the

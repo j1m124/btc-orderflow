@@ -18,7 +18,9 @@ use crate::indicator_picker::{
     IndicatorPickerEvent, IndicatorPickerIntent, IndicatorPickerState, OpenIndicatorPicker,
 };
 use crate::indicator_settings::{IndicatorSettingsView, OpenIndicatorSettings};
-use crate::panels::{self, ContentPanel, Kind, LastFocusedChart};
+use crate::panels::{
+    self, ChartRenderSettingsView, ContentPanel, Kind, LastFocusedChart, OpenChartRenderSettings,
+};
 use crate::persistence::{self, WorkspaceState};
 use crate::symbol_picker::{OpenSymbolPicker, PickerEvent, PickerIntent, SymbolPickerState};
 use crate::top_bar::{
@@ -40,6 +42,7 @@ pub struct TerminalWorkspace {
     symbol_picker: Entity<SymbolPickerState>,
     indicator_picker: Entity<IndicatorPickerState>,
     indicator_settings: Option<FloatingIndicatorSettingsSlot>,
+    chart_render_settings: Option<FloatingChartRenderSettingsSlot>,
     floating_code_editor: Option<FloatingCodeEditorSlot>,
 }
 
@@ -49,6 +52,15 @@ struct FloatingCodeEditorSlot {
 
 struct FloatingIndicatorSettingsSlot {
     window: Entity<FloatingWindow>,
+}
+
+struct FloatingChartRenderSettingsSlot {
+    window: Entity<FloatingWindow>,
+    /// View handle kept so a re-dispatch of `OpenChartRenderSettings`
+    /// against a different chart can retarget the existing window
+    /// instead of opening a second one (matches the indicator-settings
+    /// singleton semantics).
+    view: Entity<ChartRenderSettingsView>,
 }
 
 impl TerminalWorkspace {
@@ -117,6 +129,7 @@ impl TerminalWorkspace {
             symbol_picker,
             indicator_picker,
             indicator_settings: None,
+            chart_render_settings: None,
             floating_code_editor: None,
         }
     }
@@ -426,6 +439,58 @@ impl TerminalWorkspace {
         self.indicator_settings = Some(FloatingIndicatorSettingsSlot { window: win });
     }
 
+    /// Open the chart-render settings panel (sibling to indicator settings,
+    /// but scoped to the chart's active footprint render rather than an
+    /// individual `IndicatorInstance`). Resolves the target chart via
+    /// `LastFocusedChart`, falling back to the first chart in the dock so
+    /// the gear is reachable even when focus has bounced elsewhere.
+    /// Singleton: a second dispatch retargets the existing view instead
+    /// of opening a duplicate window.
+    fn on_open_chart_render_settings(
+        &mut self,
+        _action: &OpenChartRenderSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chart = cx
+            .global::<LastFocusedChart>()
+            .0
+            .borrow()
+            .clone()
+            .and_then(|w| w.upgrade())
+            .filter(|e| e.read(cx).kind() == Kind::Chart);
+        let chart = chart
+            .or_else(|| find_first_chart(&self.dock_area.read(cx).center().clone(), cx));
+        let Some(chart) = chart else {
+            return;
+        };
+        let target = chart.downgrade();
+        if let Some(slot) = self.chart_render_settings.as_ref() {
+            let view = slot.view.clone();
+            view.update(cx, |v, cx| v.retarget(target, window, cx));
+            return;
+        }
+        let view = cx.new(|cx| ChartRenderSettingsView::new(target, window, cx));
+        let content: AnyView = view.clone().into();
+        let win = cx.new(|cx| FloatingWindow::new("Chart Render Settings", content, window, cx));
+        cx.subscribe_in(&win, window, |this, _w, _ev: &DismissEvent, _window, cx| {
+            // Defer the drop: see `on_open_indicator_settings` for the
+            // gpui_web RefCell-borrow panic this works around.
+            let weak = cx.weak_entity();
+            cx.defer(move |cx| {
+                if let Some(ws) = weak.upgrade() {
+                    ws.update(cx, |ws, _cx| {
+                        ws.chart_render_settings = None;
+                    });
+                }
+            });
+            let _ = this;
+        })
+        .detach();
+        self.chart_render_settings =
+            Some(FloatingChartRenderSettingsSlot { window: win, view });
+    }
+
     fn on_toggle_floating_code_editor(
         &mut self,
         _: &ToggleFloatingCodeEditor,
@@ -716,6 +781,7 @@ impl Render for TerminalWorkspace {
             .on_action(cx.listener(Self::on_open_symbol_picker))
             .on_action(cx.listener(Self::on_open_indicator_picker))
             .on_action(cx.listener(Self::on_open_indicator_settings))
+            .on_action(cx.listener(Self::on_open_chart_render_settings))
             .on_action(cx.listener(Self::on_toggle_floating_code_editor))
             .on_action(cx.listener(Self::on_set_active_tool))
             .on_action(cx.listener(Self::on_select_drawing))
@@ -749,6 +815,11 @@ impl Render for TerminalWorkspace {
                     )
                     .children(
                         self.indicator_settings
+                            .as_ref()
+                            .map(|slot| slot.window.clone()),
+                    )
+                    .children(
+                        self.chart_render_settings
                             .as_ref()
                             .map(|slot| slot.window.clone()),
                     ),
