@@ -13,9 +13,12 @@ use gpui::{
 };
 use gpui_component::plot::AXIS_GAP;
 
+use super::footprint::{
+    ColorScope, FootprintParams, RenderKind, RenderMetric, TextMetric, WireframeVariant,
+};
 use super::{Drawing, DrawingId, index_to_screen, price_to_screen};
 use crate::indicators::IndicatorOutput;
-use crate::services::market_data::Candle;
+use crate::services::market_data::{Candle, FootprintCell};
 
 /// Colours fed to the drawings overlay so its paint closure doesn't need
 /// access to `cx` at paint time.
@@ -222,10 +225,17 @@ fn format_fib_level(level: f32) -> String {
     }
 }
 
-/// Paint the main chart canvas: horizontal y-grid, vertical x-grid,
-/// continuous-position candle wicks + bodies, and axis labels in the right
-/// + bottom gutters. Runs in a single `canvas` paint pass — z-order is
-/// determined by paint sequence (grid → candles → labels).
+/// Paint the main chart canvas: horizontal y-grid, vertical x-grid, the
+/// active render (candles or footprint), and axis labels in the right +
+/// bottom gutters. Runs in a single `canvas` paint pass — z-order is
+/// determined by paint sequence (grid → render → labels).
+///
+/// `render_kind` selects the main render: Candlestick paints wicks + bodies
+/// the classical way; Cluster / Profile paint a wireframe-then-cells stack
+/// driven by `footprint_params` + `footprint_cells`. When a footprint kind
+/// is selected but no cells are loaded yet, the renderer falls back to
+/// candlesticks so the chart never goes blank.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn paint_main_chart(
     bounds: Bounds<Pixels>,
     candles: &[Candle],
@@ -237,6 +247,9 @@ pub(super) fn paint_main_chart(
     candle_interval_ms: i64,
     y_axis_gap: f32,
     colors: MainChartColors,
+    render_kind: RenderKind,
+    footprint_params: Option<&FootprintParams>,
+    footprint_cells: &[FootprintCell],
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -248,11 +261,27 @@ pub(super) fn paint_main_chart(
     let origin = bounds.origin;
 
     // -- y-axis ticks (price levels) --
+    //
+    // Footprint modes snap the step to a multiple of `bucket` so cells line
+    // up with grid lines; in candlestick mode (or until cells load) we fall
+    // back to the classic d3 nice-step picker.
     let target_y_count = ((chart_bottom - chart_top) / 50.0).floor().max(2.0) as usize;
-    let y_step = pick_nice_y_step(y_hi - y_lo, target_y_count);
+    let bucket_snap = match render_kind {
+        RenderKind::Cluster | RenderKind::Profile => footprint_params
+            .map(|p| p.bucket)
+            .filter(|b| FootprintParams::bucket_is_valid(*b)),
+        RenderKind::Candlestick => None,
+    };
+    let y_step = match bucket_snap {
+        Some(bucket) => pick_bucket_y_step(y_hi - y_lo, target_y_count, bucket),
+        None => pick_nice_y_step(y_hi - y_lo, target_y_count),
+    };
     let mut y_ticks: Vec<f64> = Vec::new();
     if y_step > 0.0 && y_step.is_finite() {
-        let first = (y_lo / y_step).ceil() * y_step;
+        // When snapping, anchor the first tick to a bucket boundary so the
+        // whole tick column lines up with bar cells across the chart.
+        let anchor = bucket_snap.unwrap_or(y_step);
+        let first = (y_lo / anchor).ceil() * anchor;
         let mut t = first;
         // Cap iterations so a degenerate range can never spin forever.
         for _ in 0..200 {
@@ -338,95 +367,46 @@ pub(super) fn paint_main_chart(
         );
     }
 
-    // -- 3. candles (continuous x positions) --
+    // -- 3. main render layer --
     //
-    // Wicks + bodies are painted as quads (not stroked paths) so per-candle
-    // paint cost is a flat instanced primitive. Two regimes:
-    //
-    //  * Sparse (>= 1px per candle): draw each candle's wick + body normally.
-    //  * Dense  (more candles than pixels): aggregate consecutive candles that
-    //    fall in the same pixel column into a single high↔low bar coloured by
-    //    the column's net direction. This bounds the primitive count to ~chart
-    //    width regardless of how far the user zooms out, and avoids painting
-    //    thousands of overlapping sub-pixel quads.
-    let slot_width = chart_w / view_size.max(1.0);
-    if slot_width >= 1.0 {
-        let body_width = (slot_width * 0.7).max(1.0);
-        let half_body = body_width / 2.0;
-        for (i, candle) in candles.iter().enumerate() {
-            let idx = (start_idx + i) as f32;
-            let center_x = index_to_screen(view_start, view_size, idx, canvas_w, y_axis_gap);
-            // Skip candles whose body would paint entirely outside the chart
-            // area — keeps GPU paint work proportional to visible candles.
-            if center_x + half_body < 0.0 || center_x - half_body > chart_w {
-                continue;
-            }
-            let open_y = price_to_screen(y_lo, y_hi, candle.open, canvas_h);
-            let high_y = price_to_screen(y_lo, y_hi, candle.high, canvas_h);
-            let low_y = price_to_screen(y_lo, y_hi, candle.low, canvas_h);
-            let close_y = price_to_screen(y_lo, y_hi, candle.close, canvas_h);
-            let color = if candle.close >= candle.open {
-                colors.bullish
-            } else {
-                colors.bearish
-            };
-
-            // Wick (high ↔ low) as a 1px-wide quad.
-            let wick_top = high_y.min(low_y);
-            let wick_h = (high_y - low_y).abs().max(1.0);
-            fill_rect(window, origin, center_x - 0.5, 1.0, wick_top, wick_h, color);
-
-            // Body (open ↔ close). Min 1px height keeps doji visible.
-            let body_top = open_y.min(close_y);
-            let body_h = (open_y - close_y).abs().max(1.0);
-            fill_rect(
-                window,
-                origin,
-                center_x - half_body,
-                body_width,
-                body_top,
-                body_h,
-                color,
-            );
-        }
+    // Dispatch on the chart's active render kind. Candlestick paints the
+    // classic wick+body pipeline; the footprint kinds fall back to candles
+    // until per-bucket cells are loaded, then paint a wireframe (Behind /
+    // SideOhlc / None per `params.wireframe`) plus cluster or profile cells.
+    let render_cells_available =
+        matches!(render_kind, RenderKind::Cluster | RenderKind::Profile)
+            && !footprint_cells.is_empty()
+            && footprint_params.is_some();
+    if !render_cells_available {
+        paint_candle_bodies(
+            origin, candles, start_idx, view_start, view_size, canvas_w, canvas_h, chart_w,
+            y_lo, y_hi, y_axis_gap, colors.bullish, colors.bearish, window,
+        );
     } else {
-        // Dense mode: bucket consecutive candles by integer pixel column.
-        // `index_to_screen` is monotonic in idx, so columns are non-decreasing
-        // and a single forward pass groups them.
-        let mut i = 0usize;
-        while i < candles.len() {
-            let col = index_to_screen(view_start, view_size, (start_idx + i) as f32, canvas_w, y_axis_gap)
-                .floor();
-            let mut hi = candles[i].high;
-            let mut lo = candles[i].low;
-            let open = candles[i].open;
-            let mut close = candles[i].close;
-            let mut j = i + 1;
-            while j < candles.len() {
-                let cx = index_to_screen(view_start, view_size, (start_idx + j) as f32, canvas_w, y_axis_gap);
-                if cx.floor() != col {
-                    break;
-                }
-                hi = hi.max(candles[j].high);
-                lo = lo.min(candles[j].low);
-                close = candles[j].close;
-                j += 1;
+        let params = footprint_params.expect("guarded above");
+        // Wireframe paints first so cells/bars land on top of it (Behind
+        // semantics). SideOhlc renders the candle alongside cells rather than
+        // behind — `paint_bar_wireframes` handles the layout split internally.
+        paint_bar_wireframes(
+            origin, candles, start_idx, view_start, view_size, canvas_w, canvas_h, chart_w,
+            y_lo, y_hi, y_axis_gap, params.wireframe, colors.bullish, colors.bearish, window,
+        );
+        match render_kind {
+            RenderKind::Cluster => {
+                paint_cluster_cells(
+                    origin, candles, footprint_cells, start_idx, view_start, view_size,
+                    canvas_w, canvas_h, chart_w, y_lo, y_hi, y_axis_gap, params,
+                    colors.bullish, colors.bearish, colors.label, window, cx,
+                );
             }
-            i = j;
-
-            if col + 1.0 < 0.0 || col > chart_w {
-                continue;
+            RenderKind::Profile => {
+                paint_profile_bars(
+                    origin, candles, footprint_cells, start_idx, view_start, view_size,
+                    canvas_w, canvas_h, chart_w, y_lo, y_hi, y_axis_gap, params,
+                    colors.bullish, colors.bearish, colors.label, window, cx,
+                );
             }
-            let color = if close >= open {
-                colors.bullish
-            } else {
-                colors.bearish
-            };
-            let hi_y = price_to_screen(y_lo, y_hi, hi, canvas_h);
-            let lo_y = price_to_screen(y_lo, y_hi, lo, canvas_h);
-            let top = hi_y.min(lo_y);
-            let h = (hi_y - lo_y).abs().max(1.0);
-            fill_rect(window, origin, col, 1.0, top, h, color);
+            RenderKind::Candlestick => unreachable!("guarded by render_cells_available"),
         }
     }
 
@@ -499,6 +479,684 @@ pub(super) fn paint_main_chart(
             window,
             cx,
         );
+    }
+}
+
+// ============================================================================
+// Render-mode dispatch helpers — candle / wireframe / cluster / profile
+// ============================================================================
+//
+// All three live behind `paint_main_chart`'s render-kind switch. They share
+// the same coordinate plumbing (slot width, `index_to_screen`,
+// `price_to_screen`) so a Cluster / Profile bar always lines up with its
+// candlestick counterpart at the same view.
+
+/// Snap a price-range step to a bucket multiple — produces a step of the
+/// form `n × bucket` (n ≥ 1) closest to `range / target_count`. Used for the
+/// y-axis grid in footprint modes so tick lines fall on bucket boundaries.
+fn pick_bucket_y_step(range: f64, target_count: usize, bucket: f64) -> f64 {
+    if !range.is_finite() || range <= 0.0 || !bucket.is_finite() || bucket <= 0.0 {
+        return bucket.max(1.0);
+    }
+    let raw = range / (target_count.max(1) as f64);
+    // Smallest multiple of bucket that is ≥ raw; minimum 1× bucket so the
+    // grid never falls below cell resolution.
+    let n = (raw / bucket).ceil().max(1.0);
+    n * bucket
+}
+
+/// Slot fraction occupied by the candle body in candlestick render mode. The
+/// wireframe `SideOhlc` variant reuses this for the side candle (narrower).
+const CANDLE_BODY_FRACTION: f32 = 0.7;
+const SIDE_OHLC_FRACTION: f32 = 0.22;
+
+/// Minimum cell pixel dimensions for in-cell text to render. Below this, the
+/// number auto-hides — readability tested at the chart's 10pt text size with
+/// 4-digit volumes. Independent of `TextMetric::None`, which always hides.
+const MIN_CELL_W_FOR_TEXT: f32 = 28.0;
+const MIN_CELL_H_FOR_TEXT: f32 = 11.0;
+
+/// Paint the classic candlestick layer: per-candle wick + body in sparse
+/// mode, column-aggregated bars in dense mode. Extracted verbatim from
+/// `paint_main_chart` so the render-kind switch can dispatch to it
+/// without duplicating the (well-tuned) sparse/dense split.
+#[allow(clippy::too_many_arguments)]
+fn paint_candle_bodies(
+    origin: Point<Pixels>,
+    candles: &[Candle],
+    start_idx: usize,
+    view_start: f32,
+    view_size: f32,
+    canvas_w: f32,
+    canvas_h: f32,
+    chart_w: f32,
+    y_lo: f64,
+    y_hi: f64,
+    y_axis_gap: f32,
+    bullish: Hsla,
+    bearish: Hsla,
+    window: &mut Window,
+) {
+    let slot_width = chart_w / view_size.max(1.0);
+    if slot_width >= 1.0 {
+        let body_width = (slot_width * CANDLE_BODY_FRACTION).max(1.0);
+        let half_body = body_width / 2.0;
+        for (i, candle) in candles.iter().enumerate() {
+            let idx = (start_idx + i) as f32;
+            let center_x = index_to_screen(view_start, view_size, idx, canvas_w, y_axis_gap);
+            // Skip candles whose body would paint entirely outside the chart
+            // area — keeps GPU paint work proportional to visible candles.
+            if center_x + half_body < 0.0 || center_x - half_body > chart_w {
+                continue;
+            }
+            let open_y = price_to_screen(y_lo, y_hi, candle.open, canvas_h);
+            let high_y = price_to_screen(y_lo, y_hi, candle.high, canvas_h);
+            let low_y = price_to_screen(y_lo, y_hi, candle.low, canvas_h);
+            let close_y = price_to_screen(y_lo, y_hi, candle.close, canvas_h);
+            let color = if candle.close >= candle.open {
+                bullish
+            } else {
+                bearish
+            };
+            let wick_top = high_y.min(low_y);
+            let wick_h = (high_y - low_y).abs().max(1.0);
+            fill_rect(window, origin, center_x - 0.5, 1.0, wick_top, wick_h, color);
+            let body_top = open_y.min(close_y);
+            let body_h = (open_y - close_y).abs().max(1.0);
+            fill_rect(
+                window,
+                origin,
+                center_x - half_body,
+                body_width,
+                body_top,
+                body_h,
+                color,
+            );
+        }
+    } else {
+        let mut i = 0usize;
+        while i < candles.len() {
+            let col = index_to_screen(view_start, view_size, (start_idx + i) as f32, canvas_w, y_axis_gap)
+                .floor();
+            let mut hi = candles[i].high;
+            let mut lo = candles[i].low;
+            let open = candles[i].open;
+            let mut close = candles[i].close;
+            let mut j = i + 1;
+            while j < candles.len() {
+                let cx = index_to_screen(view_start, view_size, (start_idx + j) as f32, canvas_w, y_axis_gap);
+                if cx.floor() != col {
+                    break;
+                }
+                hi = hi.max(candles[j].high);
+                lo = lo.min(candles[j].low);
+                close = candles[j].close;
+                j += 1;
+            }
+            i = j;
+            if col + 1.0 < 0.0 || col > chart_w {
+                continue;
+            }
+            let color = if close >= open { bullish } else { bearish };
+            let hi_y = price_to_screen(y_lo, y_hi, hi, canvas_h);
+            let lo_y = price_to_screen(y_lo, y_hi, lo, canvas_h);
+            let top = hi_y.min(lo_y);
+            let h = (hi_y - lo_y).abs().max(1.0);
+            fill_rect(window, origin, col, 1.0, top, h, color);
+        }
+    }
+}
+
+/// Layout for one footprint bar slot: where the cells/bars paint vs where
+/// the side-OHLC candle (if any) paints. Cluster / Profile cell painters
+/// honour `cell_x_min`/`cell_x_max`; the wireframe painter uses
+/// `side_candle_center` when SideOhlc is selected.
+#[derive(Clone, Copy)]
+struct SlotLayout {
+    cell_x_min: f32,
+    cell_x_max: f32,
+    /// Pixel center of the side-OHLC candle; `None` for Behind / None.
+    side_candle_center: Option<f32>,
+    /// Pixel body-width for the side-OHLC candle when present.
+    side_candle_body_w: f32,
+}
+
+/// Build the slot layout for a bar whose center is `center_x` and slot width
+/// is `slot_width`. SideOhlc tucks the candle into the right edge of the
+/// slot; Behind / None let cells / bars use the full slot.
+fn footprint_slot_layout(center_x: f32, slot_width: f32, variant: WireframeVariant) -> SlotLayout {
+    let half = slot_width * 0.5;
+    let slot_left = center_x - half;
+    let slot_right = center_x + half;
+    match variant {
+        WireframeVariant::SideOhlc => {
+            let side_w = (slot_width * SIDE_OHLC_FRACTION).max(2.0);
+            let cell_x_max = (slot_right - side_w).max(slot_left);
+            let side_center = (cell_x_max + slot_right) * 0.5;
+            SlotLayout {
+                cell_x_min: slot_left,
+                cell_x_max,
+                side_candle_center: Some(side_center),
+                side_candle_body_w: side_w.max(1.0),
+            }
+        }
+        WireframeVariant::Behind | WireframeVariant::None => SlotLayout {
+            cell_x_min: slot_left,
+            cell_x_max: slot_right,
+            side_candle_center: None,
+            side_candle_body_w: 0.0,
+        },
+    }
+}
+
+/// Paint the wireframe layer per `WireframeVariant`:
+///
+/// - `Behind`: thin OHLC outline across the slot, painted before cells so
+///   cells render on top. Wick at center, open/close as horizontal ticks.
+/// - `SideOhlc`: a narrow real candle painted to the right of the cells.
+/// - `None`: no-op.
+#[allow(clippy::too_many_arguments)]
+fn paint_bar_wireframes(
+    origin: Point<Pixels>,
+    candles: &[Candle],
+    start_idx: usize,
+    view_start: f32,
+    view_size: f32,
+    canvas_w: f32,
+    canvas_h: f32,
+    chart_w: f32,
+    y_lo: f64,
+    y_hi: f64,
+    y_axis_gap: f32,
+    variant: WireframeVariant,
+    bullish: Hsla,
+    bearish: Hsla,
+    window: &mut Window,
+) {
+    if matches!(variant, WireframeVariant::None) {
+        return;
+    }
+    let slot_width = (chart_w / view_size.max(1.0)).max(1.0);
+    for (i, candle) in candles.iter().enumerate() {
+        let idx = (start_idx + i) as f32;
+        let center_x = index_to_screen(view_start, view_size, idx, canvas_w, y_axis_gap);
+        let half = slot_width * 0.5;
+        if center_x + half < 0.0 || center_x - half > chart_w {
+            continue;
+        }
+        let open_y = price_to_screen(y_lo, y_hi, candle.open, canvas_h);
+        let high_y = price_to_screen(y_lo, y_hi, candle.high, canvas_h);
+        let low_y = price_to_screen(y_lo, y_hi, candle.low, canvas_h);
+        let close_y = price_to_screen(y_lo, y_hi, candle.close, canvas_h);
+        let color = if candle.close >= candle.open {
+            bullish
+        } else {
+            bearish
+        };
+        let layout = footprint_slot_layout(center_x, slot_width, variant);
+        match variant {
+            WireframeVariant::Behind => {
+                // Faded silhouette so the cell colour layer reads cleanly on
+                // top. Wick down the center, open/close as short horizontal
+                // ticks on the body edges.
+                let faded = Hsla { a: 0.45, ..color };
+                let wick_top = high_y.min(low_y);
+                let wick_h = (high_y - low_y).abs().max(1.0);
+                fill_rect(window, origin, center_x - 0.5, 1.0, wick_top, wick_h, faded);
+                let tick_w = (slot_width * 0.4).max(3.0);
+                fill_rect(
+                    window,
+                    origin,
+                    center_x - tick_w * 0.5,
+                    tick_w,
+                    open_y - 0.5,
+                    1.0,
+                    faded,
+                );
+                fill_rect(
+                    window,
+                    origin,
+                    center_x - tick_w * 0.5,
+                    tick_w,
+                    close_y - 0.5,
+                    1.0,
+                    faded,
+                );
+            }
+            WireframeVariant::SideOhlc => {
+                // A real (full-alpha) narrow candle on the slot's right side.
+                let Some(side_x) = layout.side_candle_center else {
+                    continue;
+                };
+                let body_w = layout.side_candle_body_w;
+                let wick_top = high_y.min(low_y);
+                let wick_h = (high_y - low_y).abs().max(1.0);
+                fill_rect(window, origin, side_x - 0.5, 1.0, wick_top, wick_h, color);
+                let body_top = open_y.min(close_y);
+                let body_h = (open_y - close_y).abs().max(1.0);
+                fill_rect(
+                    window,
+                    origin,
+                    side_x - body_w * 0.5,
+                    body_w,
+                    body_top,
+                    body_h,
+                    color,
+                );
+            }
+            WireframeVariant::None => {}
+        }
+    }
+}
+
+/// Paint per-bar cluster cells (one cell per (bar, price_bucket)).
+///
+/// Bid/Ask render splits the cell horizontally into two sub-cells (bid left,
+/// ask right) coloured by `bearish` / `bullish` with intensity from the
+/// side's local volume; Volume / Delta render one cell per bucket coloured
+/// by the metric. Text label is per `params.text_metric`, auto-hidden when
+/// the cell box is too small to read.
+///
+/// No-op when `cells` is empty — the dispatcher in `paint_main_chart`
+/// already falls back to candle bodies in that case; this guard is a
+/// belt-and-braces safety so the function can be called speculatively.
+#[allow(clippy::too_many_arguments)]
+fn paint_cluster_cells(
+    origin: Point<Pixels>,
+    candles: &[Candle],
+    cells: &[FootprintCell],
+    start_idx: usize,
+    view_start: f32,
+    view_size: f32,
+    canvas_w: f32,
+    canvas_h: f32,
+    chart_w: f32,
+    y_lo: f64,
+    y_hi: f64,
+    y_axis_gap: f32,
+    params: &FootprintParams,
+    bullish: Hsla,
+    bearish: Hsla,
+    label_color: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if cells.is_empty() || candles.is_empty() {
+        return;
+    }
+    let bucket = params.bucket;
+    if !FootprintParams::bucket_is_valid(bucket) {
+        return;
+    }
+    let slot_width = (chart_w / view_size.max(1.0)).max(1.0);
+    // Cell pixel height = bucket in price space mapped to screen.
+    let cell_h = {
+        let p0 = price_to_screen(y_lo, y_hi, 0.0, canvas_h);
+        let p1 = price_to_screen(y_lo, y_hi, bucket, canvas_h);
+        (p0 - p1).abs().max(1.0)
+    };
+
+    // Per-bar normalisation factor depends on the colour scope. Individual
+    // recomputes per bar inside the loop; Visible / Daily would precompute
+    // a viewport / day max (Daily falls back to Visible until a day cache
+    // exists — see Phase 3 notes in the design memo).
+    let scope = params.color_scope;
+    let metric = params.render_metric;
+    let global_max = if matches!(scope, ColorScope::Visible | ColorScope::Daily) {
+        compute_global_metric_max(cells, metric)
+    } else {
+        0.0
+    };
+
+    // Build a per-bar cells index to avoid an O(bars × cells) scan. Cells
+    // share an `open_time` per bar; bucket by that key.
+    let mut by_bar: std::collections::HashMap<i64, Vec<&FootprintCell>> =
+        std::collections::HashMap::new();
+    for c in cells {
+        by_bar.entry(c.open_time).or_default().push(c);
+    }
+
+    let show_text_base = !matches!(params.text_metric, TextMetric::None);
+
+    for (i, candle) in candles.iter().enumerate() {
+        let Some(bar_cells) = by_bar.get(&candle.open_time) else {
+            continue;
+        };
+        let idx = (start_idx + i) as f32;
+        let center_x = index_to_screen(view_start, view_size, idx, canvas_w, y_axis_gap);
+        let layout = footprint_slot_layout(center_x, slot_width, params.wireframe);
+        let cell_left = layout.cell_x_min;
+        let cell_right = layout.cell_x_max;
+        let cell_w = (cell_right - cell_left).max(1.0);
+        if cell_right < 0.0 || cell_left > chart_w {
+            continue;
+        }
+
+        let local_max = if matches!(scope, ColorScope::Individual) {
+            bar_cells
+                .iter()
+                .map(|c| metric_value(c, metric).abs())
+                .fold(0.0_f64, f64::max)
+        } else {
+            global_max
+        };
+        if local_max <= 0.0 {
+            continue;
+        }
+        let show_text = show_text_base
+            && cell_w >= MIN_CELL_W_FOR_TEXT
+            && cell_h >= MIN_CELL_H_FOR_TEXT;
+
+        for c in bar_cells {
+            let top_price = c.price_bucket_low + bucket;
+            let y_top = price_to_screen(y_lo, y_hi, top_price, canvas_h);
+            if y_top + cell_h < 0.0 || y_top > canvas_h {
+                continue;
+            }
+            match metric {
+                RenderMetric::BidAsk => {
+                    let side_w = cell_w * 0.5;
+                    let side_max = c.bid_vol.max(c.ask_vol).max(1e-9);
+                    let bid_intensity = (c.bid_vol / side_max) as f32;
+                    let ask_intensity = (c.ask_vol / side_max) as f32;
+                    let bid_color = Hsla {
+                        a: 0.25 + 0.55 * bid_intensity,
+                        ..bearish
+                    };
+                    let ask_color = Hsla {
+                        a: 0.25 + 0.55 * ask_intensity,
+                        ..bullish
+                    };
+                    fill_rect(window, origin, cell_left, side_w, y_top, cell_h, bid_color);
+                    fill_rect(
+                        window,
+                        origin,
+                        cell_left + side_w,
+                        side_w,
+                        y_top,
+                        cell_h,
+                        ask_color,
+                    );
+                }
+                RenderMetric::Volume => {
+                    let v = c.bid_vol + c.ask_vol;
+                    if v <= 0.0 {
+                        continue;
+                    }
+                    let intensity = ((v / local_max) as f32).min(1.0);
+                    let color = Hsla {
+                        a: 0.20 + 0.65 * intensity,
+                        ..label_color
+                    };
+                    fill_rect(window, origin, cell_left, cell_w, y_top, cell_h, color);
+                }
+                RenderMetric::Delta => {
+                    let d = c.ask_vol - c.bid_vol;
+                    let intensity = ((d.abs() / local_max) as f32).min(1.0);
+                    let base = if d >= 0.0 { bullish } else { bearish };
+                    let color = Hsla {
+                        a: 0.20 + 0.65 * intensity,
+                        ..base
+                    };
+                    fill_rect(window, origin, cell_left, cell_w, y_top, cell_h, color);
+                }
+            }
+
+            if show_text {
+                let text = format_cell_text(c, params.text_metric);
+                if !text.is_empty() {
+                    let label = SharedString::from(text);
+                    let run = TextRun {
+                        len: label.len(),
+                        font: window.text_style().font(),
+                        color: label_color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let line = window
+                        .text_system()
+                        .shape_line(label, px(10.0), &[run], None);
+                    let tw = line.width().as_f32();
+                    let tx = cell_left + (cell_w - tw) * 0.5;
+                    let ty = y_top + (cell_h - 10.0) * 0.5;
+                    let _ = line.paint(
+                        point(px(tx) + origin.x, px(ty) + origin.y),
+                        px(10.0),
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Paint per-bar volume profile bars (one horizontal bar per price bucket).
+///
+/// Bar length encodes `params.render_metric` (Volume: total; Delta: signed
+/// magnitude; BidAsk: stacked left/right of bar center). Optional text label
+/// is per `params.text_metric`, auto-hidden when the bar is too small.
+///
+/// No-op when `cells` is empty.
+#[allow(clippy::too_many_arguments)]
+fn paint_profile_bars(
+    origin: Point<Pixels>,
+    candles: &[Candle],
+    cells: &[FootprintCell],
+    start_idx: usize,
+    view_start: f32,
+    view_size: f32,
+    canvas_w: f32,
+    canvas_h: f32,
+    chart_w: f32,
+    y_lo: f64,
+    y_hi: f64,
+    y_axis_gap: f32,
+    params: &FootprintParams,
+    bullish: Hsla,
+    bearish: Hsla,
+    label_color: Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if cells.is_empty() || candles.is_empty() {
+        return;
+    }
+    let bucket = params.bucket;
+    if !FootprintParams::bucket_is_valid(bucket) {
+        return;
+    }
+    let slot_width = (chart_w / view_size.max(1.0)).max(1.0);
+    let cell_h = {
+        let p0 = price_to_screen(y_lo, y_hi, 0.0, canvas_h);
+        let p1 = price_to_screen(y_lo, y_hi, bucket, canvas_h);
+        (p0 - p1).abs().max(1.0)
+    };
+
+    let scope = params.color_scope;
+    let metric = params.render_metric;
+    let global_max = if matches!(scope, ColorScope::Visible | ColorScope::Daily) {
+        compute_global_metric_max(cells, metric)
+    } else {
+        0.0
+    };
+
+    let mut by_bar: std::collections::HashMap<i64, Vec<&FootprintCell>> =
+        std::collections::HashMap::new();
+    for c in cells {
+        by_bar.entry(c.open_time).or_default().push(c);
+    }
+
+    let show_text_base = !matches!(params.text_metric, TextMetric::None);
+
+    for (i, candle) in candles.iter().enumerate() {
+        let Some(bar_cells) = by_bar.get(&candle.open_time) else {
+            continue;
+        };
+        let idx = (start_idx + i) as f32;
+        let center_x = index_to_screen(view_start, view_size, idx, canvas_w, y_axis_gap);
+        let layout = footprint_slot_layout(center_x, slot_width, params.wireframe);
+        let bar_x_min = layout.cell_x_min;
+        let bar_x_max = layout.cell_x_max;
+        let bar_w_total = (bar_x_max - bar_x_min).max(1.0);
+        if bar_x_max < 0.0 || bar_x_min > chart_w {
+            continue;
+        }
+
+        let local_max = if matches!(scope, ColorScope::Individual) {
+            bar_cells
+                .iter()
+                .map(|c| metric_value(c, metric).abs())
+                .fold(0.0_f64, f64::max)
+        } else {
+            global_max
+        };
+        if local_max <= 0.0 {
+            continue;
+        }
+        let show_text = show_text_base
+            && bar_w_total >= MIN_CELL_W_FOR_TEXT
+            && cell_h >= MIN_CELL_H_FOR_TEXT;
+
+        for c in bar_cells {
+            let top_price = c.price_bucket_low + bucket;
+            let y_top = price_to_screen(y_lo, y_hi, top_price, canvas_h);
+            if y_top + cell_h < 0.0 || y_top > canvas_h {
+                continue;
+            }
+            match metric {
+                RenderMetric::Volume => {
+                    let v = c.bid_vol + c.ask_vol;
+                    if v <= 0.0 {
+                        continue;
+                    }
+                    let frac = ((v / local_max) as f32).min(1.0);
+                    let bar_w = (bar_w_total * frac).max(1.0);
+                    let color = Hsla {
+                        a: 0.65,
+                        ..label_color
+                    };
+                    fill_rect(window, origin, bar_x_min, bar_w, y_top, cell_h, color);
+                }
+                RenderMetric::Delta => {
+                    let d = c.ask_vol - c.bid_vol;
+                    if d.abs() <= 0.0 {
+                        continue;
+                    }
+                    let frac = ((d.abs() / local_max) as f32).min(1.0);
+                    // Anchor at slot midpoint; positive deltas extend right,
+                    // negative extend left. Standard signed-magnitude read.
+                    let mid = (bar_x_min + bar_x_max) * 0.5;
+                    let bar_w = (bar_w_total * 0.5 * frac).max(1.0);
+                    let (x, color) = if d >= 0.0 {
+                        (mid, bullish)
+                    } else {
+                        (mid - bar_w, bearish)
+                    };
+                    let color = Hsla { a: 0.75, ..color };
+                    fill_rect(window, origin, x, bar_w, y_top, cell_h, color);
+                }
+                RenderMetric::BidAsk => {
+                    // Stacked bid/ask: bid extends left of midpoint, ask right.
+                    let mid = (bar_x_min + bar_x_max) * 0.5;
+                    let half_w = bar_w_total * 0.5;
+                    let bid_frac = ((c.bid_vol / local_max) as f32).min(1.0);
+                    let ask_frac = ((c.ask_vol / local_max) as f32).min(1.0);
+                    let bid_w = (half_w * bid_frac).max(0.0);
+                    let ask_w = (half_w * ask_frac).max(0.0);
+                    if bid_w > 0.0 {
+                        let color = Hsla { a: 0.7, ..bearish };
+                        fill_rect(window, origin, mid - bid_w, bid_w, y_top, cell_h, color);
+                    }
+                    if ask_w > 0.0 {
+                        let color = Hsla { a: 0.7, ..bullish };
+                        fill_rect(window, origin, mid, ask_w, y_top, cell_h, color);
+                    }
+                }
+            }
+
+            if show_text {
+                let text = format_cell_text(c, params.text_metric);
+                if !text.is_empty() {
+                    let label = SharedString::from(text);
+                    let run = TextRun {
+                        len: label.len(),
+                        font: window.text_style().font(),
+                        color: label_color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let line = window
+                        .text_system()
+                        .shape_line(label, px(10.0), &[run], None);
+                    let tw = line.width().as_f32();
+                    let tx = bar_x_min + (bar_w_total - tw) * 0.5;
+                    let ty = y_top + (cell_h - 10.0) * 0.5;
+                    let _ = line.paint(
+                        point(px(tx) + origin.x, px(ty) + origin.y),
+                        px(10.0),
+                        gpui::TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Extract the metric scalar for a cell. `Volume` = bid+ask; `Delta` =
+/// signed ask-bid; `BidAsk` returns `max(bid, ask)` so that normalisation
+/// against this value gives each side its own 0..1 intensity range when
+/// dividing per-side downstream.
+fn metric_value(c: &FootprintCell, metric: RenderMetric) -> f64 {
+    match metric {
+        RenderMetric::Volume => c.bid_vol + c.ask_vol,
+        RenderMetric::Delta => c.ask_vol - c.bid_vol,
+        RenderMetric::BidAsk => c.bid_vol.max(c.ask_vol),
+    }
+}
+
+/// Max absolute metric value across all cells — used by `Visible` / `Daily`
+/// colour scopes. `Daily` currently falls back to Visible (no day cache
+/// yet — see design memo Phase 3 note).
+fn compute_global_metric_max(cells: &[FootprintCell], metric: RenderMetric) -> f64 {
+    cells
+        .iter()
+        .map(|c| metric_value(c, metric).abs())
+        .fold(0.0_f64, f64::max)
+}
+
+/// Format the in-cell text for a footprint cell. None → empty (auto-hide
+/// also bypasses this path). Volumes use 0-decimal short form when ≥ 1000.
+fn format_cell_text(c: &FootprintCell, metric: TextMetric) -> String {
+    match metric {
+        TextMetric::None => String::new(),
+        TextMetric::Volume => format_short(c.bid_vol + c.ask_vol),
+        TextMetric::Delta => format_short(c.ask_vol - c.bid_vol),
+        TextMetric::BidAsk => format!(
+            "{}×{}",
+            format_short(c.bid_vol),
+            format_short(c.ask_vol)
+        ),
+    }
+}
+
+fn format_short(v: f64) -> String {
+    let abs = v.abs();
+    if abs >= 1_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.1}K", v / 1_000.0)
+    } else if abs >= 10.0 {
+        format!("{:.0}", v)
+    } else {
+        format!("{:.2}", v)
     }
 }
 

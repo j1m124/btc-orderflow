@@ -2281,6 +2281,14 @@ pub fn render(
     let paint_view_size = state.view_size;
     let paint_candle_interval_ms = state.candle_interval_ms();
     let paint_y_axis_gap = state.y_axis_gap_px.get();
+    // Render-mode dispatch params. The data path (footprint cells via the
+    // market_data service) is wired up in Commit 3 — for now we pass the
+    // active params + an empty cell slice so `paint_main_chart`'s footprint
+    // branch falls back to candles automatically.
+    let paint_render_kind = state.render_kind();
+    let paint_footprint_params: Option<FootprintParams> =
+        state.active_footprint_params().copied();
+    let paint_footprint_cells: Vec<market_data::FootprintCell> = Vec::new();
     // Pre-filter overlay indicators for the paint closure: skip hidden /
     // pane-placed instances, snapshot color + output so the closure stays
     // 'static. Per-render clone — `Series` is a `Vec<Option<f64>>`, so the
@@ -3894,6 +3902,9 @@ pub fn render(
                             paint_candle_interval_ms,
                             paint_y_axis_gap,
                             main_chart_colors,
+                            paint_render_kind,
+                            paint_footprint_params.as_ref(),
+                            &paint_footprint_cells,
                             window,
                             cx,
                         );
