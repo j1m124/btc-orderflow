@@ -28,8 +28,8 @@ use gpui_component::{
 use serde::Deserialize;
 
 use crate::indicators::{
-    BbParams, COLOR_PALETTE_SIZE, InstanceId, Placement, Source, VolumeDeltaMode,
-    VolumeDeltaParams, palette_color_for,
+    BarStatGrade, BarStatParams, BbParams, COLOR_PALETTE_SIZE, InstanceId, Placement, Source,
+    VolumeDeltaMode, VolumeDeltaParams, palette_color_for,
 };
 use crate::panels::ContentPanel;
 
@@ -172,6 +172,7 @@ impl Render for IndicatorSettingsView {
             "bb" => render_bb(&snapshot, target.clone(), id, cx),
             "volume" => render_volume(&snapshot, target.clone(), id, cx),
             "volume_delta" => render_volume_delta(&snapshot, target.clone(), id, cx),
+            "bar_stat" => render_bar_stat(&snapshot, target.clone(), id, cx),
             _ => div()
                 .text_color(muted)
                 .child("Unknown indicator kind")
@@ -249,16 +250,31 @@ fn render_bb(
     id: InstanceId,
     cx: &mut Context<IndicatorSettingsView>,
 ) -> gpui::AnyElement {
-    let p = snap.params.pointer("/period").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-    let sd = snap.params.pointer("/stddev").and_then(|v| v.as_f64()).unwrap_or(2.0);
+    let p = snap
+        .params
+        .pointer("/period")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as usize;
+    let sd = snap
+        .params
+        .pointer("/stddev")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(2.0);
     let s = read_source(&snap.params).unwrap_or(Source::Close);
     v_flex()
         .gap_2()
-        .child(period_row("Period", p, target.clone(), id, |kind, delta| {
-            mutate::<BbParams>(kind, |x| {
-                x.period = step_period(x.period, delta);
-            });
-        }, cx))
+        .child(period_row(
+            "Period",
+            p,
+            target.clone(),
+            id,
+            |kind, delta| {
+                mutate::<BbParams>(kind, |x| {
+                    x.period = step_period(x.period, delta);
+                });
+            },
+            cx,
+        ))
         .child(float_row(
             "StdDev",
             format!("{:.1}", sd),
@@ -338,7 +354,11 @@ fn render_volume_delta(
         let mut btn = Button::new(btn_id)
             .label(SharedString::from(mode.label()))
             .small();
-        btn = if is_active { btn.primary() } else { btn.ghost() };
+        btn = if is_active {
+            btn.primary()
+        } else {
+            btn.ghost()
+        };
         btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
             let Some(panel) = target.upgrade() else {
                 return;
@@ -349,6 +369,7 @@ fn render_volume_delta(
                         mutate::<VolumeDeltaParams>(kind, |x| x.mode = mode);
                     });
                     cx.notify();
+                    crate::panels::request_layout_save(cx);
                 }
             });
         }));
@@ -372,6 +393,69 @@ fn read_volume_delta_mode(params: &serde_json::Value) -> Option<VolumeDeltaMode>
     Some(match s {
         "Histogram" => VolumeDeltaMode::Histogram,
         "Cvd" => VolumeDeltaMode::Cvd,
+        _ => return None,
+    })
+}
+
+/// Bar Stats form: a single Grading selector (Off / Per-bar / Visible range
+/// / Daily). No placement toggle — kind is PaneOnly. No color slot —
+/// bull/bear come from the theme.
+fn render_bar_stat(
+    snap: &InstanceSnapshot,
+    target: WeakEntity<ContentPanel>,
+    id: InstanceId,
+    cx: &mut Context<IndicatorSettingsView>,
+) -> gpui::AnyElement {
+    let current = read_bar_stat_grade(&snap.params).unwrap_or_default();
+    let muted = cx.theme().muted_foreground;
+    let mut buttons = h_flex().gap_2();
+    for g in BarStatGrade::ALL {
+        let target = target.clone();
+        let grade = *g;
+        let is_active = grade == current;
+        let btn_id = SharedString::from(format!("bs-grade-{}-{}", id, grade.label()));
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(grade.label()))
+            .small();
+        btn = if is_active {
+            btn.primary()
+        } else {
+            btn.ghost()
+        };
+        btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target.upgrade() else {
+                return;
+            };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<BarStatParams>(kind, |x| x.grade = grade);
+                    });
+                    cx.notify();
+                    crate::panels::request_layout_save(cx);
+                }
+            });
+        }));
+        buttons = buttons.child(btn);
+    }
+    v_flex()
+        .gap_2()
+        .child(label_row("Color grading"))
+        .child(buttons)
+        .child(div().text_xs().text_color(muted).child(
+            "Top row: bar volume. Bottom row: signed delta. Grading scales the cell tint by \
+                    visible-range or trailing-24h max.",
+        ))
+        .into_any_element()
+}
+
+fn read_bar_stat_grade(params: &serde_json::Value) -> Option<BarStatGrade> {
+    let s = params.pointer("/grade")?.as_str()?;
+    Some(match s {
+        "Off" => BarStatGrade::Off,
+        "Bar" => BarStatGrade::Bar,
+        "VisibleRange" => BarStatGrade::VisibleRange,
+        "Daily" => BarStatGrade::Daily,
         _ => return None,
     })
 }
@@ -488,8 +572,14 @@ fn source_row(
         let src = *s;
         let btn_id = SharedString::from(format!("source-{}-{}", id, s.label()));
         let is_active = src == current;
-        let mut btn = Button::new(btn_id).label(SharedString::from(s.label())).xsmall();
-        btn = if is_active { btn.primary() } else { btn.ghost() };
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(s.label()))
+            .xsmall();
+        btn = if is_active {
+            btn.primary()
+        } else {
+            btn.ghost()
+        };
         btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
             let Some(panel) = target.upgrade() else {
                 return;
@@ -498,6 +588,7 @@ fn source_row(
                 if let Some(chart) = p.chart_state.as_mut() {
                     chart.update_indicator(id, |kind| mutate_fn(kind, src));
                     cx.notify();
+                    crate::panels::request_layout_save(cx);
                 }
             });
         }));
@@ -531,6 +622,7 @@ fn placement_btn(
             if let Some(chart) = p.chart_state.as_mut() {
                 chart.set_indicator_placement(id, placement);
                 cx.notify();
+                crate::panels::request_layout_save(cx);
             }
         });
     }))
@@ -549,11 +641,7 @@ fn featured_palette() -> Vec<Hsla> {
 /// sized to the kind's `color_slots().len()`. Empty if the panel or
 /// instance has gone away (the caller — `rebuild_color_states` — then
 /// allocates zero picker states, which matches Volume's no-color setup).
-fn lookup_slot_colors(
-    target: &WeakEntity<ContentPanel>,
-    id: InstanceId,
-    cx: &App,
-) -> Vec<Hsla> {
+fn lookup_slot_colors(target: &WeakEntity<ContentPanel>, id: InstanceId, cx: &App) -> Vec<Hsla> {
     let Some(panel) = target.upgrade() else {
         return Vec::new();
     };
@@ -584,6 +672,7 @@ fn apply_slot_color(
         if let Some(chart) = p.chart_state.as_mut() {
             chart.set_indicator_color(id, slot, color);
             cx.notify();
+            crate::panels::request_layout_save(cx);
         }
     });
 }
@@ -611,7 +700,10 @@ fn read_source(params: &serde_json::Value) -> Option<Source> {
 /// Downcast the dynamic `kind` to a concrete params struct and apply a
 /// mutation. No-op if the downcast fails (kind id and concrete type don't
 /// match — should never happen unless persistence loaded the wrong type).
-fn mutate<T: 'static>(kind: &mut Box<dyn crate::indicators::IndicatorKind>, f: impl FnOnce(&mut T)) {
+fn mutate<T: 'static>(
+    kind: &mut Box<dyn crate::indicators::IndicatorKind>,
+    f: impl FnOnce(&mut T),
+) {
     if let Some(p) = kind.as_any_mut().downcast_mut::<T>() {
         f(p);
     }
@@ -634,6 +726,7 @@ fn apply_mutation(
         if let Some(chart) = p.chart_state.as_mut() {
             chart.update_indicator(id, |kind| mutate_fn(kind, delta));
             cx.notify();
+            crate::panels::request_layout_save(cx);
         }
     });
 }

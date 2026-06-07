@@ -8,6 +8,7 @@
 //! window. Picker is a `SymbolPicker`-style modal.
 //! Persistence keyed by chart-id under `terminal_demo.indicators.v1`.
 
+pub mod bar_stat;
 pub mod bb;
 pub mod instance;
 pub mod kind;
@@ -17,6 +18,7 @@ pub mod trades;
 pub mod volume;
 pub mod volume_delta;
 
+pub use bar_stat::{BarStatGrade, BarStatParams};
 pub use bb::BbParams;
 pub use instance::{
     COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, default_pane_height, new_instance_id,
@@ -86,6 +88,13 @@ pub fn kind_entries() -> Vec<KindEntry> {
             category: Category::Volume,
             spawn: || Box::new(VolumeDeltaParams::default()),
         },
+        KindEntry {
+            kind_id: "bar_stat",
+            name: "Bar Stats".into(),
+            description: "Per-bar volume + delta row, with optional heatmap grading".into(),
+            category: Category::Volume,
+            spawn: || Box::new(BarStatParams::default()),
+        },
     ]
 }
 
@@ -105,6 +114,9 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "volume_delta" => serde_json::from_value::<VolumeDeltaParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "bar_stat" => serde_json::from_value::<BarStatParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy

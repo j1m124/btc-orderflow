@@ -254,13 +254,20 @@ fn footprint_bucket_interval(tf: Timeframe) -> &'static str {
 /// Footprint cells for the most recent `bars` bars at `(tf, price_bucket)`.
 /// Returned chronological (oldest bar first, within each bar buckets are
 /// ordered ascending by price).
+///
+/// Also returns `MAX(agg_id)` over the full `trades` table for `symbol` —
+/// captured atomically with the snapshot via a scalar subquery so a live
+/// forwarder can use it as a dedup watermark for trades streamed via the
+/// broadcast (any trade with `agg_id <= snapshot_max_agg_id` is already
+/// summed into the snapshot). `None` when the trades table holds no rows
+/// for the symbol (forwarder treats that as "process everything").
 pub async fn fetch_footprint_snapshot(
     pool: &PgPool,
     symbol: &str,
     tf: Timeframe,
     price_bucket: f64,
     bars: i64,
-) -> Result<Vec<FootprintCell>> {
+) -> Result<(Vec<FootprintCell>, Option<i64>)> {
     let interval = footprint_bucket_interval(tf);
     let sql = format!(
         "WITH recent_bars AS ( \
@@ -272,7 +279,8 @@ pub async fn fetch_footprint_snapshot(
             rb.bar AS open_time, \
             floor(t.price / $3) * $3 AS price_bucket_low, \
             coalesce(sum(t.qty) FILTER (WHERE t.is_buyer_maker), 0.0) AS bid_vol, \
-            coalesce(sum(t.qty) FILTER (WHERE NOT t.is_buyer_maker), 0.0) AS ask_vol \
+            coalesce(sum(t.qty) FILTER (WHERE NOT t.is_buyer_maker), 0.0) AS ask_vol, \
+            (SELECT max(agg_id) FROM trades WHERE symbol = $1) AS snapshot_max_agg_id \
         FROM trades t \
         JOIN recent_bars rb \
           ON time_bucket(INTERVAL '{interval}', t.ts) = rb.bar \
@@ -288,7 +296,21 @@ pub async fn fetch_footprint_snapshot(
         .fetch_all(pool)
         .await?;
 
-    build_footprint(rows)
+    // The scalar subquery is constant across rows; if the result set is
+    // empty (no trades for this symbol yet), fall back to a separate
+    // query so we still surface "no trades exist" cleanly as None.
+    let snapshot_max_agg_id = if let Some(first) = rows.first() {
+        first.try_get::<Option<i64>, _>("snapshot_max_agg_id")?
+    } else {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT max(agg_id) FROM trades WHERE symbol = $1",
+        )
+        .bind(symbol)
+        .fetch_one(pool)
+        .await?
+    };
+
+    Ok((build_footprint(rows)?, snapshot_max_agg_id))
 }
 
 /// Footprint cells for `bars` bars strictly older than `before_open_time_ms`,

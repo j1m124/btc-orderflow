@@ -34,9 +34,12 @@ pub fn chart_y_padding() -> f32 {
     f32::from_bits(Y_PADDING.load(Ordering::Relaxed))
 }
 
-/// When true, footprint cell labels render their fractional component
-/// truncated away (whole numbers only). Footprint-only — main chart prices
-/// and indicator readouts never read this.
+/// When true, cell-style labels (footprint cells, Bar Stats rows) render
+/// their fractional component truncated away (whole numbers only). Main
+/// chart prices and pane-axis indicator readouts never read this — the
+/// flag is scoped to per-bar text cells. Field name retained
+/// (`truncate_footprint_decimals`) for backward compat with persisted
+/// blobs even though the scope is broader.
 pub fn footprint_truncate_decimals() -> bool {
     TRUNCATE_FOOTPRINT_DECIMALS.load(Ordering::Relaxed)
 }

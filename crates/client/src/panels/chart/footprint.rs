@@ -198,6 +198,12 @@ pub struct FootprintParams {
 /// UI is free-form so the user can override per panel.
 const DEFAULT_BUCKET_BTCUSDT: f64 = 10.0;
 
+/// Binance BTCUSDT-perp price tick size ($0.10). Storage stays in raw
+/// quote currency (the WS sub plumbing keys on the f64 price-bucket), but
+/// the settings UI expresses bucket as a multiple of this tick to match
+/// how orderflow traders think about cell sizing.
+pub const BTCUSDT_TICK_SIZE: f64 = 0.10;
+
 impl FootprintParams {
     /// Cluster defaults: bid/ask render, bid/ask text, behind-cells wireframe,
     /// per-bar color normalization, $10 bucket.

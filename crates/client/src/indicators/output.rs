@@ -44,6 +44,24 @@ pub enum IndicatorOutput {
         signal: Series,
         histogram: Series,
     },
+
+    /// Per-bar statistic row: total volume + signed delta stacked as two
+    /// text rows inside one cell per bar. Volume cell paints with a fixed
+    /// blue base tint; delta cell paints bull/bear based on the sign of
+    /// the delta itself. `daily_max_vol`/`daily_max_delta` are per-bar
+    /// rolling 24h maxima of the same series (precomputed so the paint
+    /// pass doesn't recompute every frame); paint divides into them to
+    /// derive the "Daily" gradient intensity. `grade` is mirrored into
+    /// the output so the paint pass picks up grading-mode changes via the
+    /// normal `update_indicator` → `recompute_indicators` flow without
+    /// PanePaintItem needing a new field.
+    BarStat {
+        grade: crate::indicators::BarStatGrade,
+        volume: Series,
+        delta: Series,
+        daily_max_vol: Series,
+        daily_max_delta: Series,
+    },
 }
 
 impl IndicatorOutput {
@@ -54,6 +72,7 @@ impl IndicatorOutput {
             IndicatorOutput::Histogram { values, .. } => values.len(),
             IndicatorOutput::Bands { upper, .. } => upper.len(),
             IndicatorOutput::Macd { macd, .. } => macd.len(),
+            IndicatorOutput::BarStat { volume, .. } => volume.len(),
         }
     }
 

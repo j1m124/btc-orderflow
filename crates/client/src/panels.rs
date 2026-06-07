@@ -162,6 +162,82 @@ struct ChartPrefs {
     /// New in v6; older state defaults to Coin via `serde(default)`.
     #[serde(default)]
     volume_unit: Option<String>,
+    /// Attached indicator instances (kind + params + presentation state).
+    /// New in v7; older state defaults to an empty Vec via `serde(default)`,
+    /// which combined with `ChartState::new` no longer seeding a default
+    /// Volume means restored charts pre-v7 boot up with zero indicators —
+    /// matches the new "fresh chart starts empty" behaviour.
+    #[serde(default)]
+    indicators: Vec<IndicatorPrefs>,
+}
+
+/// Serialized form of one `IndicatorInstance`. Kind reconstruction goes
+/// through `crate::indicators::build_kind(kind_id, &params)`; unknown
+/// `kind_id`s are silently dropped on restore (forward-compat with future
+/// kinds and removal of legacy ones).
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct IndicatorPrefs {
+    pub kind_id: String,
+    pub params: serde_json::Value,
+    pub placement: PlacementPref,
+    #[serde(default)]
+    pub pane_height: Option<f32>,
+    #[serde(default)]
+    pub colors: Vec<HslaPref>,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub(crate) enum PlacementPref {
+    Overlay,
+    Pane,
+}
+
+impl From<crate::indicators::Placement> for PlacementPref {
+    fn from(p: crate::indicators::Placement) -> Self {
+        match p {
+            crate::indicators::Placement::Overlay => PlacementPref::Overlay,
+            crate::indicators::Placement::Pane => PlacementPref::Pane,
+        }
+    }
+}
+
+impl PlacementPref {
+    pub fn into_placement(self) -> crate::indicators::Placement {
+        match self {
+            PlacementPref::Overlay => crate::indicators::Placement::Overlay,
+            PlacementPref::Pane => crate::indicators::Placement::Pane,
+        }
+    }
+}
+
+/// HSLA as plain f32 quadruple — sidesteps depending on gpui's `Hsla`
+/// serde derive (which isn't guaranteed). Lossless round-trip via
+/// `gpui::hsla(h, s, l, a)`.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub(crate) struct HslaPref {
+    pub h: f32,
+    pub s: f32,
+    pub l: f32,
+    pub a: f32,
+}
+
+impl From<gpui::Hsla> for HslaPref {
+    fn from(c: gpui::Hsla) -> Self {
+        Self {
+            h: c.h,
+            s: c.s,
+            l: c.l,
+            a: c.a,
+        }
+    }
+}
+
+impl HslaPref {
+    pub fn into_hsla(self) -> gpui::Hsla {
+        gpui::hsla(self.h, self.s, self.l, self.a)
+    }
 }
 
 /// Restored chart prefs after parsing from persisted PanelInfo. Render-mode
@@ -174,6 +250,9 @@ struct ChartRestored {
     cluster: chart::FootprintParams,
     profile: chart::FootprintParams,
     volume_unit: crate::persistence::VolumeUnit,
+    /// May be empty — older blobs without the field deserialize to `[]`,
+    /// and that's also the intentional fresh-chart default now.
+    indicators: Vec<IndicatorPrefs>,
 }
 
 fn parse_volume_unit(s: &str) -> Option<crate::persistence::VolumeUnit> {
@@ -220,6 +299,7 @@ fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
         cluster,
         profile,
         volume_unit,
+        indicators: prefs.indicators,
     })
 }
 
@@ -329,7 +409,7 @@ fn default_symbol(cx: &App) -> SharedString {
 pub struct DockAreaHandle(pub WeakEntity<DockArea>);
 impl Global for DockAreaHandle {}
 
-fn request_layout_save(cx: &mut Context<ContentPanel>) {
+pub(crate) fn request_layout_save(cx: &mut Context<ContentPanel>) {
     let dock = cx
         .try_global::<DockAreaHandle>()
         .and_then(|h| h.0.upgrade());
@@ -414,7 +494,7 @@ impl ContentPanel {
         let focus_handle = cx.focus_handle();
         let mut chart_handles: Vec<crate::services::market_data::SubscriptionHandle> = Vec::new();
         let chart_state = matches!(kind, Kind::Chart).then(|| {
-            let (symbol, tf, render_seed) = match &chart_prefs {
+            let (symbol, tf, render_seed, indicator_seed) = match &chart_prefs {
                 Some(restored) => (
                     restored.symbol.clone(),
                     restored.tf,
@@ -424,6 +504,7 @@ impl ContentPanel {
                         restored.profile,
                         restored.volume_unit,
                     )),
+                    restored.indicators.clone(),
                 ),
                 None => {
                     let default_tf = chart::ChartState::default_timeframe();
@@ -435,7 +516,7 @@ impl ContentPanel {
                         .unwrap_or_else(|| {
                             SharedString::from(chart::ChartState::default_symbol())
                         });
-                    (default_symbol, default_tf, None)
+                    (default_symbol, default_tf, None, Vec::new())
                 }
             };
             chart_handles = vec![ensure_chart_sub(symbol.as_ref(), tf, cx)];
@@ -444,10 +525,14 @@ impl ContentPanel {
             if let Some((kind, cluster, profile, volume_unit)) = render_seed {
                 state.seed_render(kind, cluster, profile);
                 state.set_volume_unit(volume_unit);
-                // Re-run indicator math with the persisted unit so the chart
-                // doesn't show one frame of Coin numbers before settling.
-                state.recompute_indicators();
             }
+            if !indicator_seed.is_empty() {
+                state.restore_indicators(indicator_seed);
+            }
+            // Re-run indicator math against the (possibly) restored volume
+            // unit + indicator list so the chart doesn't show one stale frame
+            // before settling.
+            state.recompute_indicators();
             state
         });
         let watchlist_handles = if matches!(kind, Kind::Watchlist) {
@@ -1030,6 +1115,7 @@ impl ContentPanel {
         };
         state.add_indicator(kind);
         cx.notify();
+        request_layout_save(cx);
     }
 
     pub fn switch_chart_symbol(&mut self, target: &str, cx: &mut Context<Self>) {
@@ -1328,6 +1414,7 @@ impl ContentPanel {
         if let Some(chart) = self.chart_state.as_mut() {
             chart.move_indicator_pane(action.0, -1);
             cx.notify();
+            request_layout_save(cx);
         }
     }
 
@@ -1340,6 +1427,7 @@ impl ContentPanel {
         if let Some(chart) = self.chart_state.as_mut() {
             chart.move_indicator_pane(action.0, 1);
             cx.notify();
+            request_layout_save(cx);
         }
     }
 
@@ -1358,6 +1446,7 @@ impl ContentPanel {
                 .unwrap_or(false);
             chart.set_indicator_hidden(action.0, !was_hidden);
             cx.notify();
+            request_layout_save(cx);
         }
     }
 
@@ -1370,6 +1459,7 @@ impl ContentPanel {
         if let Some(chart) = self.chart_state.as_mut() {
             chart.remove_indicator(action.0);
             cx.notify();
+            request_layout_save(cx);
         }
     }
 
@@ -1490,6 +1580,18 @@ impl Panel for ContentPanel {
     fn dump(&self, _cx: &App) -> PanelState {
         let mut state = PanelState::new(self);
         if let Some(chart) = &self.chart_state {
+            let indicators = chart
+                .indicators()
+                .iter()
+                .map(|inst| IndicatorPrefs {
+                    kind_id: inst.kind_id.to_string(),
+                    params: inst.kind.params_json(),
+                    placement: inst.placement.into(),
+                    pane_height: inst.pane_height,
+                    colors: inst.colors.iter().copied().map(HslaPref::from).collect(),
+                    hidden: inst.hidden,
+                })
+                .collect();
             if let Ok(value) = serde_json::to_value(ChartPrefs {
                 symbol: chart.symbol().to_string(),
                 tf: chart.timeframe().as_str().to_string(),
@@ -1497,6 +1599,7 @@ impl Panel for ContentPanel {
                 cluster: Some(*chart.cluster_params()),
                 profile: Some(*chart.profile_params()),
                 volume_unit: Some(volume_unit_id(chart.volume_unit()).to_string()),
+                indicators,
             }) {
                 state.info = PanelInfo::panel(value);
             }

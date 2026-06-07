@@ -636,9 +636,9 @@ fn adjust_chart(cx: &mut gpui::App, mutate: impl FnOnce(&mut ChartPrefs)) {
 fn truncate_footprint_decimals_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
     let enabled = cx.global::<ChartPrefsGlobal>().0.truncate_footprint_decimals;
     setting_row(
-        "Truncate footprint decimals",
-        "Drop the fractional digits on footprint cell volumes — cells render as whole numbers (K / M suffixes preserved).",
-        Switch::new("truncate-footprint-decimals-toggle")
+        "Truncate cell decimals",
+        "Drop the fractional digits on footprint cells and Bar Stats rows — values render as whole numbers (K / M / B suffixes preserved).",
+        Switch::new("truncate-cell-decimals-toggle")
             .checked(enabled)
             .label(if enabled { "On" } else { "Off" })
             .on_click(|checked, _window, cx| {

@@ -145,6 +145,9 @@ pub fn default_pane_height(kind_id: &str) -> f32 {
         "volume" => 90.0,
         "trades" => 90.0,
         "volume_delta" => 120.0,
+        // Two stacked text rows + a sliver of padding. The pane has no
+        // y-axis (paint owns layout), so we don't need height for ticks.
+        "bar_stat" => 48.0,
         _ => 140.0,
     }
 }

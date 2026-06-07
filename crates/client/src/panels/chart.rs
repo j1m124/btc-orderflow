@@ -42,7 +42,7 @@ use crate::drawings::service::{DrawingId, DrawingServiceHandle};
 use crate::drawings::tool::Tool;
 use crate::indicators::{
     ComputeCtx, IndicatorInstance, IndicatorKind, IndicatorOutput, InstanceId, Placement,
-    ValueReadout, VolumeParams, palette_color_for,
+    ValueReadout, palette_color_for,
 };
 use crate::persistence::VolumeUnit;
 use crate::panels::LastFocusedChart;
@@ -1249,6 +1249,49 @@ impl ChartState {
         self.recompute_indicators();
     }
 
+    /// Restore indicators from persisted prefs. Each entry is rebuilt via
+    /// `indicators::build_kind(kind_id, &params)`; entries whose kind_id is
+    /// unknown (legacy kinds, or forward-compat blobs from a newer build)
+    /// are silently dropped. Placement, pane_height, colors, and hidden
+    /// are overlaid onto the freshly-spawned instance. Caller is expected
+    /// to follow with `recompute_indicators()` (the panel restore path
+    /// already does).
+    pub(crate) fn restore_indicators(&mut self, prefs: Vec<crate::panels::IndicatorPrefs>) {
+        self.indicators.clear();
+        self.indicator_outputs.clear();
+        for pref in prefs {
+            let Some(kind) = crate::indicators::build_kind(&pref.kind_id, &pref.params) else {
+                continue;
+            };
+            // Primary colour seeds palette derivation for any extra slots;
+            // the persisted Vec then overrides slot-by-slot below.
+            let primary = pref
+                .colors
+                .first()
+                .copied()
+                .map(|c| c.into_hsla())
+                .unwrap_or_else(|| palette_color_for(0));
+            let mut inst = IndicatorInstance::new(kind, primary);
+            inst.placement = pref.placement.into_placement();
+            inst.pane_height = pref.pane_height;
+            inst.hidden = pref.hidden;
+            // Override the auto-derived per-slot colors with the saved
+            // ones where available, but keep the IndicatorInstance's slot
+            // count (which tracks the live `kind.color_slots()` length) —
+            // a kind that grew/shrunk its slot count between saves is
+            // handled gracefully.
+            for (slot, c) in pref.colors.iter().enumerate() {
+                if slot < inst.colors.len() {
+                    inst.colors[slot] = c.into_hsla();
+                }
+            }
+            self.indicators.push(inst);
+        }
+        // Outputs are sized in lockstep with `indicators` by
+        // `recompute_indicators`; leave empty here so the caller's
+        // recompute call does the real work.
+    }
+
     /// Full recompute over the current `candles`. Cheap by v1 specs (~5
     /// indicators × ~1000 bars × sub-µs per op). Called after every tick,
     /// fabrication, snapshot, prepend, or instance edit.
@@ -1306,7 +1349,7 @@ impl ChartState {
         } else {
             0.0
         };
-        let mut state = Self {
+        let state = Self {
             symbol: SharedString::from(symbol.to_string()),
             timeframe,
             candles,
@@ -1339,10 +1382,9 @@ impl ChartState {
             footprint_cells: Vec::new(),
             volume_unit: VolumeUnit::default(),
         };
-        // Every fresh chart is born with a Volume overlay. `switch_*`
-        // callers preserve the user's indicator list, so this seeding only
-        // takes effect on truly-new ChartStates.
-        state.add_indicator(Box::new(VolumeParams::default()));
+        // No default indicator. Fresh charts are born empty; the user
+        // adds indicators via the picker and persistence carries them
+        // across reloads.
         state
     }
 
@@ -4378,6 +4420,9 @@ pub fn render(
         ..theme_border
     };
     let pane_label_color = theme_muted_foreground;
+    // Full-contrast text for sub-pane cells whose label sits on top of a
+    // coloured fill (e.g. BarStat). Mirrors the main chart's `cell_text`.
+    let pane_cell_text_color = theme_foreground;
     let pane_bullish = theme_chart_bullish;
     let pane_bearish = theme_chart_bearish;
     // Pull these out once so the per-iter closure construction below doesn't
@@ -4555,6 +4600,7 @@ pub fn render(
                                 pane_bearish,
                                 pane_grid_color,
                                 pane_label_color,
+                                pane_cell_text_color,
                                 pane_cross_x,
                                 pane_hovered_y,
                                 window,
@@ -4620,6 +4666,11 @@ pub fn render(
                 };
                 if state.splitter_drag.take().is_some() {
                     cx.notify();
+                    // Persist the new pane height once on release rather than
+                    // on every move event — the dock's save is already
+                    // debounced 500ms but emitting LayoutChanged hundreds of
+                    // times per drag is still wasted work.
+                    crate::panels::request_layout_save(cx);
                 }
             }),
         )

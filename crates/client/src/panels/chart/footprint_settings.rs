@@ -200,13 +200,19 @@ fn bucket_row(input: Entity<InputState>, muted: Hsla) -> gpui::AnyElement {
     h_flex()
         .gap_3()
         .items_center()
-        .child(div().w(px(90.)).text_sm().text_color(muted).child("Bucket"))
+        .child(
+            div()
+                .w(px(90.))
+                .text_sm()
+                .text_color(muted)
+                .child("Bucket (ticks)"),
+        )
         .child(div().w(px(120.)).child(Input::new(&input).small()))
         .child(
             div()
                 .text_xs()
                 .text_color(muted)
-                .child(SharedString::from("Enter to commit")),
+                .child(SharedString::from("1 tick = $0.10. Enter to commit")),
         )
         .into_any_element()
 }
@@ -251,7 +257,7 @@ fn render_metric_row(
     for (value, label) in [
         (RenderMetric::Volume, "Volume"),
         (RenderMetric::Delta, "Delta"),
-        (RenderMetric::BidAsk, "Bid/Ask"),
+        (RenderMetric::BidAsk, "Sell | Buy"),
     ] {
         let target = target.clone();
         let is_active = value == current;
@@ -285,7 +291,7 @@ fn text_metric_row(
     for (value, label) in [
         (TextMetric::Volume, "Volume"),
         (TextMetric::Delta, "Delta"),
-        (TextMetric::BidAsk, "Bid/Ask"),
+        (TextMetric::BidAsk, "Sell | Buy"),
         (TextMetric::None, "None"),
     ] {
         let target = target.clone();
@@ -358,10 +364,10 @@ fn build_bucket_input(
 ) -> (Entity<InputState>, Option<Subscription>) {
     let current = read_active_bucket(target, cx);
     let seed: SharedString = match current {
-        Some(v) => SharedString::from(format_bucket(v)),
+        Some(v) => SharedString::from(format_bucket_ticks(v)),
         None => SharedString::default(),
     };
-    let state = cx.new(|cx| InputState::new(window, cx).placeholder("Bucket"));
+    let state = cx.new(|cx| InputState::new(window, cx).placeholder("Ticks"));
     if !seed.is_empty() {
         state.update(cx, |s, cx| s.set_value(seed, window, cx));
     }
@@ -401,16 +407,15 @@ fn active_render_kind(target: &WeakEntity<ContentPanel>, cx: &App) -> RenderKind
         .unwrap_or(RenderKind::Candlestick)
 }
 
-/// Round-trip a bucket value through the input's display format. Trailing
-/// `.0` stays so the user sees `10.0` rather than `10`, matching what the
-/// settings UI accepts as input.
-fn format_bucket(v: f64) -> String {
-    // Strip trailing zeros past one decimal place; keep at least one
-    // decimal so the user can see they're editing a float.
-    if (v - v.trunc()).abs() < 1e-9 {
-        format!("{:.1}", v)
+/// Format the stored quote-currency bucket as an integer multiple of the
+/// symbol's tick size. Non-integer multiples render with one decimal so a
+/// user-typed `2.5` (= $0.25 on BTCUSDT) round-trips cleanly.
+fn format_bucket_ticks(v: f64) -> String {
+    let ticks = v / super::footprint::BTCUSDT_TICK_SIZE;
+    if (ticks - ticks.round()).abs() < 1e-6 {
+        format!("{}", ticks.round() as i64)
     } else {
-        format!("{}", v)
+        format!("{:.1}", ticks)
     }
 }
 
@@ -419,9 +424,16 @@ fn commit_bucket(
     text: &str,
     cx: &mut Context<ChartRenderSettingsView>,
 ) {
-    let Ok(parsed) = text.trim().parse::<f64>() else {
+    // User enters tick count; storage is the equivalent quote-currency
+    // bucket (ticks × tick_size). Reject non-positive or non-finite ticks
+    // up front so the f64 conversion can't produce a zero bucket.
+    let Ok(ticks) = text.trim().parse::<f64>() else {
         return;
     };
+    if !ticks.is_finite() || ticks <= 0.0 {
+        return;
+    }
+    let parsed = ticks * super::footprint::BTCUSDT_TICK_SIZE;
     if !FootprintParams::bucket_is_valid(parsed) {
         return;
     }

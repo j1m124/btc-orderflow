@@ -179,6 +179,20 @@ impl OrderbookBucket {
             OrderbookBucket::Dollar25 => Some(25.0),
         }
     }
+
+    /// Format a ladder/spread price for this bucket. Tick mode (BTCUSDT-perp
+    /// tick size = $0.10) shows one decimal — anything finer would be all
+    /// trailing zeros. Dollar buckets show no decimals — the bucket is
+    /// already integer-aligned in dollars.
+    pub fn format_price(self, v: f64) -> String {
+        match self {
+            OrderbookBucket::Tick => format!("{:.1}", v),
+            OrderbookBucket::Dollar1
+            | OrderbookBucket::Dollar5
+            | OrderbookBucket::Dollar10
+            | OrderbookBucket::Dollar25 => format!("{:.0}", v),
+        }
+    }
 }
 
 /// One displayed row. `key` is the bucket's `(price / w).floor() * w` (or
@@ -345,7 +359,10 @@ pub fn render(
             let is_buy = !t.is_buyer_maker;
             let glyph = if is_buy { "\u{25b2}" } else { "\u{25bc}" };
             let color = if is_buy { bullish } else { bearish };
-            (SharedString::from(format!("{} {:.2}", glyph, t.price)), color)
+            (
+                SharedString::from(format!("{} {}", glyph, state.bucket.format_price(t.price))),
+                color,
+            )
         }
         None => (SharedString::from("\u{2014}"), fg),
     };
@@ -442,13 +459,14 @@ pub fn render(
         .child(div().w(px(80.)).text_right().child(sum_label));
 
     let render_items = items_rc.clone();
+    let render_bucket = state.bucket;
     let ladder = v_virtual_list(
         cx.entity(),
         SharedString::from("ob-virtual"),
         item_sizes_rc,
         move |_panel, range, _window, _cx| {
             range
-                .map(|i| render_item(&render_items[i], fg, border, size_mode))
+                .map(|i| render_item(&render_items[i], fg, border, size_mode, render_bucket))
                 .collect::<Vec<_>>()
         },
     )
@@ -505,6 +523,7 @@ fn render_item(
     fg: Hsla,
     border: Hsla,
     size_mode: OrderbookSizeMode,
+    bucket: OrderbookBucket,
 ) -> gpui::AnyElement {
     match item {
         RowItem::Row {
@@ -514,7 +533,9 @@ fn render_item(
             max_qty,
             max_cum,
             tint,
-        } => render_row(*key, *qty, *cum, *max_qty, *max_cum, *tint, fg, border, size_mode),
+        } => render_row(
+            *key, *qty, *cum, *max_qty, *max_cum, *tint, fg, border, size_mode, bucket,
+        ),
         RowItem::LastStrip { text, color, bg } => h_flex()
             .w_full()
             .px_2()
@@ -547,6 +568,7 @@ fn render_row(
     fg: Hsla,
     border: Hsla,
     size_mode: OrderbookSizeMode,
+    bucket: OrderbookBucket,
 ) -> gpui::AnyElement {
     let qty_frac = if max_qty > 0.0 {
         ((qty / max_qty) as f32).clamp(0.0, 1.0)
@@ -561,7 +583,7 @@ fn render_row(
     let bar_color = tint;
     let cum_color = Hsla { a: 0.22, ..tint };
 
-    let price_text = SharedString::from(format!("{:.2}", key));
+    let price_text = SharedString::from(bucket.format_price(key));
     let (qty_text, cum_text) = match size_mode {
         OrderbookSizeMode::Coin => (
             SharedString::from(format_qty(qty)),

@@ -1339,17 +1339,17 @@ fn format_cell_text(c: &FootprintCell, metric: TextMetric, bucket: f64, unit: Vo
 
 /// In-cell label for footprint volumes. When the user toggles "Truncate
 /// footprint decimals" on, fractional digits are dropped (cells render as
-/// whole numbers; K/M suffix preserved). Otherwise the standard
+/// whole numbers, rounded up; K/M suffix preserved). Otherwise the standard
 /// `K`/`M` shorthand at 1dp with a 2dp tail for sub-10 values.
 fn format_short(v: f64) -> String {
     let abs = v.abs();
     if crate::prefs::footprint_truncate_decimals() {
         if abs >= 1_000_000.0 {
-            return format!("{:.0}M", (v / 1_000_000.0).trunc());
+            return format!("{:.0}M", (v / 1_000_000.0).ceil());
         } else if abs >= 1_000.0 {
-            return format!("{:.0}K", (v / 1_000.0).trunc());
+            return format!("{:.0}K", (v / 1_000.0).ceil());
         }
-        return format!("{:.0}", v.trunc());
+        return format!("{:.0}", v.ceil());
     }
     if abs >= 1_000_000.0 {
         format!("{:.1}M", v / 1_000_000.0)
@@ -2088,9 +2088,9 @@ pub(super) fn paint_overlay_indicators(
                     }
                 }
             }
-            IndicatorOutput::Macd { .. } => {
-                // MACD is pane-only; ignore here. The multi-pane restructure
-                // (T13) routes it to its own canvas.
+            IndicatorOutput::Macd { .. } | IndicatorOutput::BarStat { .. } => {
+                // MACD and BarStat are pane-only; ignore here. Pane render
+                // routes them to their own canvases in `paint_sub_pane`.
             }
         }
     }
@@ -2231,6 +2231,7 @@ pub(super) fn paint_sub_pane(
     bearish: Hsla,
     grid: Hsla,
     label_color: Hsla,
+    cell_text_color: Hsla,
     cursor_x: Option<f32>,
     hovered_y: Option<f32>,
     window: &mut Window,
@@ -2250,6 +2251,62 @@ pub(super) fn paint_sub_pane(
     let origin = bounds.origin;
     let visible_end = start_idx.saturating_add(visible_count);
     let (y_lo, y_hi) = (item.y_lo, item.y_hi);
+
+    // BarStat owns its layout entirely (text cells, no scalar axis). Skip
+    // the grid + y-axis tick computation + value pill — those would draw
+    // meaningless 0.00/0.50/1.00 ticks against the dummy y_range. Crosshair
+    // vertical guide still useful for time alignment with neighbouring panes.
+    if let IndicatorOutput::BarStat {
+        grade,
+        volume,
+        delta,
+        daily_max_vol,
+        daily_max_delta,
+    } = &item.output
+    {
+        let slot_w = (chart_w / view_size.max(1.0)).max(0.5);
+        paint_bar_stat_pane(
+            start_idx,
+            visible_end,
+            view_start,
+            view_size,
+            canvas_w,
+            y_axis_gap,
+            chart_w,
+            chart_top,
+            chart_bottom,
+            slot_w,
+            *grade,
+            volume,
+            delta,
+            daily_max_vol,
+            daily_max_delta,
+            bullish,
+            bearish,
+            cell_text_color,
+            origin,
+            window,
+            cx,
+        );
+        if let Some(cx_local) = cursor_x {
+            if cx_local >= 0.0 && cx_local <= chart_w {
+                let cross_color = Hsla {
+                    a: 0.55,
+                    ..label_color
+                };
+                fill_rect(
+                    window,
+                    origin,
+                    cx_local,
+                    1.0,
+                    chart_top,
+                    chart_bottom - chart_top,
+                    cross_color,
+                );
+            }
+        }
+        return;
+    }
 
     // -- y-axis ticks --
     let target_y_count = ((chart_bottom - chart_top) / 36.0).floor().max(2.0) as usize;
@@ -2398,9 +2455,12 @@ pub(super) fn paint_sub_pane(
                 );
             }
         }
-        IndicatorOutput::Bands { .. } | IndicatorOutput::Lines(_) => {
+        IndicatorOutput::Bands { .. }
+        | IndicatorOutput::Lines(_)
+        | IndicatorOutput::BarStat { .. } => {
             // Bands (BB) and Lines (MA Suite) are overlay-only by kind
-            // contract; no-op here for safety.
+            // contract; no-op here for safety. BarStat is handled up
+            // front (before the grid pass) since it owns its own layout.
         }
     }
 
@@ -2513,6 +2573,225 @@ pub(super) fn paint_sub_pane(
                 cx,
             );
         }
+    }
+}
+
+/// Paint the BarStat pane: one cell per visible bar, two text rows
+/// (volume on top, signed delta below), optional heatmap fill keyed by
+/// `grade`. Cell width follows the candle gap policy so the cells line up
+/// with their candles on the main pane.
+#[allow(clippy::too_many_arguments)]
+fn paint_bar_stat_pane(
+    start_idx: usize,
+    visible_end: usize,
+    view_start: f32,
+    view_size: f32,
+    canvas_w: f32,
+    y_axis_gap: f32,
+    chart_w: f32,
+    chart_top: f32,
+    chart_bottom: f32,
+    slot_w: f32,
+    grade: crate::indicators::BarStatGrade,
+    volume: &[Option<f64>],
+    delta: &[Option<f64>],
+    daily_max_vol: &[Option<f64>],
+    daily_max_delta: &[Option<f64>],
+    bullish: Hsla,
+    bearish: Hsla,
+    text_color: Hsla,
+    origin: Point<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use crate::indicators::BarStatGrade;
+
+    let pane_h = (chart_bottom - chart_top).max(1.0);
+    let row_h = pane_h * 0.5;
+    let vol_y_top = chart_top;
+    let delta_y_top = chart_top + row_h;
+    // Cell fill width — fill the full slot so adjacent heatmap cells touch
+    // (no gap stripe between bars in the pane). Text still centres in the
+    // slot so it aligns with the candle above.
+    let cell_w = slot_w.max(1.0);
+
+    // VisibleRange mode normalises to the max absolute value across the
+    // visible bar slice. Computed once up front so the per-bar loop is
+    // a single division.
+    let visible_max_vol = if matches!(grade, BarStatGrade::VisibleRange) {
+        slice_max_abs(volume, start_idx, visible_end)
+    } else {
+        0.0
+    };
+    let visible_max_delta = if matches!(grade, BarStatGrade::VisibleRange) {
+        slice_max_abs(delta, start_idx, visible_end)
+    } else {
+        0.0
+    };
+
+    // Fixed blue base for the volume row — keeps the volume cell visually
+    // distinct from the bull/bear-tinted delta cell so the eye can read
+    // the two rows as separate metrics rather than a single coloured bar.
+    let volume_base = gpui::hsla(0.61, 0.80, 0.55, 1.0);
+
+    // Auto-hide threshold for the per-cell text: when bars get narrower
+    // than ~24px the K/M-formatted values stop being readable, so we drop
+    // the label and just paint the heatmap fill. Keeps the pane useful
+    // when zoomed all the way out.
+    const TEXT_MIN_CELL_W: f32 = 24.0;
+    let show_text = cell_w >= TEXT_MIN_CELL_W;
+
+    for i in start_idx..visible_end.min(volume.len()) {
+        let cx_px = index_to_screen(view_start, view_size, i as f32, canvas_w, y_axis_gap);
+        if cx_px < -cell_w || cx_px > chart_w + cell_w {
+            continue;
+        }
+        let cell_x = cx_px - cell_w * 0.5;
+        let vol_v = volume.get(i).copied().flatten();
+        let delta_v = delta.get(i).copied().flatten();
+
+        // -- volume cell (top row) --
+        if let Some(v) = vol_v {
+            let intensity = match grade {
+                BarStatGrade::Off => 0.0,
+                BarStatGrade::Bar => 1.0,
+                BarStatGrade::VisibleRange => {
+                    if visible_max_vol > 0.0 {
+                        (v.abs() / visible_max_vol) as f32
+                    } else {
+                        0.0
+                    }
+                }
+                BarStatGrade::Daily => match daily_max_vol.get(i).copied().flatten() {
+                    Some(mx) if mx > 0.0 => (v.abs() / mx) as f32,
+                    _ => 0.0,
+                },
+            };
+            if intensity > 0.0 {
+                let color = grade_color(volume_base, intensity);
+                fill_rect(window, origin, cell_x, cell_w, vol_y_top, row_h, color);
+            }
+            if show_text {
+                paint_centred_text(
+                    window,
+                    cx,
+                    origin,
+                    cell_x,
+                    cell_w,
+                    vol_y_top,
+                    row_h,
+                    text_color,
+                    &format_compact(v),
+                );
+            }
+        }
+
+        // -- delta cell (bottom row) --
+        if let Some(v) = delta_v {
+            let intensity = match grade {
+                BarStatGrade::Off => 0.0,
+                BarStatGrade::Bar => 1.0,
+                BarStatGrade::VisibleRange => {
+                    if visible_max_delta > 0.0 {
+                        (v.abs() / visible_max_delta) as f32
+                    } else {
+                        0.0
+                    }
+                }
+                BarStatGrade::Daily => match daily_max_delta.get(i).copied().flatten() {
+                    Some(mx) if mx > 0.0 => (v.abs() / mx) as f32,
+                    _ => 0.0,
+                },
+            };
+            // Delta tint follows the sign of the delta itself, not the
+            // candle. A bull candle with a sell-side delta still paints
+            // bearish here — that disagreement is the signal.
+            if intensity > 0.0 {
+                let base = if v >= 0.0 { bullish } else { bearish };
+                let color = grade_color(base, intensity);
+                fill_rect(window, origin, cell_x, cell_w, delta_y_top, row_h, color);
+            }
+            if show_text {
+                paint_centred_text(
+                    window,
+                    cx,
+                    origin,
+                    cell_x,
+                    cell_w,
+                    delta_y_top,
+                    row_h,
+                    text_color,
+                    &format_signed_compact(v),
+                );
+            }
+        }
+    }
+}
+
+/// Max abs value over a contiguous slice of an `Option<f64>` series,
+/// clamped to the actual series length. Returns 0.0 when the slice is
+/// all-None.
+fn slice_max_abs(series: &[Option<f64>], start: usize, end: usize) -> f64 {
+    let lo = start.min(series.len());
+    let hi = end.min(series.len());
+    let mut mx = 0.0_f64;
+    for v in series[lo..hi].iter().filter_map(|v| *v) {
+        let av = v.abs();
+        if av > mx {
+            mx = av;
+        }
+    }
+    mx
+}
+
+/// Map a 0..1 intensity to a tinted background. Starts at no tint
+/// (alpha 0 when intensity is 0) so the lowest cells fade into the
+/// pane background; ceiling at ~0.65 so the cell text stays readable
+/// against the fill.
+fn grade_color(base: Hsla, intensity: f32) -> Hsla {
+    let t = intensity.clamp(0.0, 1.0);
+    let alpha = 0.65 * t;
+    Hsla { a: alpha, ..base }
+}
+
+/// Compact unsigned formatter used for the BarStat volume row. Mirrors
+/// the K/M/B convention used by the volume axis labels so the two panes
+/// read consistently. Honours the same "truncate cell decimals" global
+/// flag as the footprint cell formatter — when on, fractional digits are
+/// dropped (K/M/B suffix preserved).
+fn format_compact(v: f64) -> String {
+    let abs = v.abs();
+    if crate::prefs::footprint_truncate_decimals() {
+        if abs >= 1_000_000_000.0 {
+            return format!("{:.0}B", (v / 1_000_000_000.0).ceil());
+        } else if abs >= 1_000_000.0 {
+            return format!("{:.0}M", (v / 1_000_000.0).ceil());
+        } else if abs >= 1_000.0 {
+            return format!("{:.0}K", (v / 1_000.0).ceil());
+        }
+        return format!("{:.0}", v.ceil());
+    }
+    if abs >= 1_000_000_000.0 {
+        format!("{:.2}B", v / 1_000_000_000.0)
+    } else if abs >= 1_000_000.0 {
+        format!("{:.2}M", v / 1_000_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.1}K", v / 1_000.0)
+    } else if abs >= 10.0 {
+        format!("{:.0}", v)
+    } else {
+        format!("{:.2}", v)
+    }
+}
+
+/// Signed variant — emits a leading `-` for negative values; positives
+/// render bare (the heatmap fill already encodes sign via bull/bear tint).
+fn format_signed_compact(v: f64) -> String {
+    let body = format_compact(v.abs());
+    if v < 0.0 {
+        format!("-{body}")
+    } else {
+        body
     }
 }
 

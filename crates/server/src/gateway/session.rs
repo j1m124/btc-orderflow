@@ -31,7 +31,10 @@ use protocol::{
 };
 use futures::{SinkExt, StreamExt};
 use sqlx::PgPool;
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tokio::{
     sync::{broadcast, mpsc},
     task::AbortHandle,
@@ -719,13 +722,22 @@ fn level_from_pair(p: (f64, f64)) -> BookLevel {
 // --- Footprint forwarder ---------------------------------------------------
 
 /// Footprint-channel forwarder. Snapshot bucketed via `time_bucket` over
-/// the trades table. Live updates: server holds per-bar rolling cell state,
-/// folds incoming aggTrades into it, and emits a `FootprintUpdate` frame
-/// every 100ms containing only cells touched in that window — the client
-/// overwrites by `(open_time, price_bucket_low)` so partial updates compose.
+/// the trades table. Live updates: server holds per-bar **cumulative** cell
+/// state (sticky across emit windows; only cleared on bar rollover), folds
+/// incoming aggTrades into it, and every 100ms emits a `FootprintUpdate`
+/// frame containing the running totals for every bucket touched in that
+/// window. Cells are absolute, not deltas — the client overwrites by
+/// `(open_time, price_bucket_low)` to compose snapshot + updates.
 ///
-/// On bar rollover we emit a final FootprintUpdate for the closing bar
-/// before resetting state.
+/// Snapshot/live merge correctness:
+///   * **Tail-bar seed**: `bar_totals` is pre-populated from snapshot cells
+///     at `snapshot_tail_open_time` so the very first live trade in that
+///     bar accumulates on top of the (already-counted) DB rows, instead of
+///     resetting the cumulative to ~zero.
+///   * **agg_id watermark**: any broadcast trade whose `agg_id` is at or
+///     below `snapshot_max_agg_id` was already summed into the snapshot;
+///     dropping it on the live path closes the double-count race between
+///     the broadcast-subscribe and snapshot-query.
 async fn run_footprint_subscription(
     id: SubId,
     symbol: String,
@@ -735,16 +747,30 @@ async fn run_footprint_subscription(
     pool: PgPool,
     write_tx: mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
-    let snapshot =
+    let (snapshot, snapshot_max_agg_id) =
         db::fetch_footprint_snapshot(&pool, &symbol, tf, price_bucket, FOOTPRINT_SNAPSHOT_BARS)
             .await?;
     let snapshot_tail_open_time = snapshot.iter().map(|c| c.open_time).max();
+
+    // Cumulative per-bar bucket totals, sticky across emit windows. Cleared
+    // entries-by-entry on bar rollover (anything older than the new bar is
+    // gone — Binance aggTrades are strictly monotonic per symbol, so a
+    // closed bar will never receive another trade).
+    let mut bar_totals: HashMap<(i64, i64), (f64, f64)> = HashMap::new();
+    if let Some(tail) = snapshot_tail_open_time {
+        for cell in snapshot.iter().filter(|c| c.open_time == tail) {
+            let bucket_idx = (cell.price_bucket_low / price_bucket).round() as i64;
+            bar_totals.insert((tail, bucket_idx), (cell.bid_vol, cell.ask_vol));
+        }
+    }
 
     debug!(
         ?id,
         tf = tf.as_str(),
         bucket = price_bucket,
         cells = snapshot.len(),
+        seeded = bar_totals.len(),
+        snapshot_max_agg_id,
         "sending footprint snapshot"
     );
     let mut server_v: u64 = 0;
@@ -758,9 +784,10 @@ async fn run_footprint_subscription(
     )
     .await;
 
-    // Per-subscription rolling state: cells touched since the last emit,
-    // keyed by (open_time, bucket_low). Emitted as a batch every 100ms.
-    let mut dirty: HashMap<(i64, i64), (f64, f64)> = HashMap::new();
+    // Keys touched since the last emit. The emit reads `bar_totals[key]`
+    // for each touched key — so emitted cells carry the bar-cumulative
+    // value, not a per-window delta. Cleared on every emit.
+    let mut touched: HashSet<(i64, i64)> = HashSet::new();
     let mut current_bar_open: Option<i64> = snapshot_tail_open_time;
     let bar_ms = tf.duration_ms();
     let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
@@ -778,6 +805,13 @@ async fn run_footprint_subscription(
                         if tick.symbol != symbol {
                             continue;
                         }
+                        // Watermark: this trade was already summed into the
+                        // snapshot — skip to avoid double-counting.
+                        if let Some(max) = snapshot_max_agg_id {
+                            if tick.trade.agg_id <= max {
+                                continue;
+                            }
+                        }
                         let ts_ms = tick.trade.ts.timestamp_millis();
                         let bar_open = (ts_ms / bar_ms) * bar_ms;
                         // Skip events already covered by the snapshot —
@@ -787,24 +821,21 @@ async fn run_footprint_subscription(
                                 continue;
                             }
                         }
-                        // On bar rollover, flush the closing bar's dirty
-                        // cells before starting fresh.
+                        // On bar rollover, retire totals for any bar older
+                        // than the new one. The closing bar's final value
+                        // was already published by the most recent batch
+                        // tick (or will be by the touched flush below if
+                        // any cells are still pending).
                         match current_bar_open {
                             Some(prev) if prev != bar_open => {
-                                emit_dirty(
-                                    &write_tx,
-                                    id,
-                                    price_bucket,
-                                    &mut dirty,
-                                    &mut server_v,
-                                ).await;
+                                bar_totals.retain(|(t, _), _| *t >= bar_open);
                                 current_bar_open = Some(bar_open);
                             }
                             None => current_bar_open = Some(bar_open),
                             _ => {}
                         }
                         let bucket_idx = (tick.trade.price / price_bucket).floor() as i64;
-                        let entry = dirty
+                        let entry = bar_totals
                             .entry((bar_open, bucket_idx))
                             .or_insert((0.0, 0.0));
                         if tick.trade.is_buyer_maker {
@@ -812,6 +843,7 @@ async fn run_footprint_subscription(
                         } else {
                             entry.1 += tick.trade.qty;
                         }
+                        touched.insert((bar_open, bucket_idx));
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(?id, skipped = n, "footprint sub lagged; sending resnap");
@@ -825,31 +857,47 @@ async fn run_footprint_subscription(
                 }
             }
             _ = batch_timer.tick() => {
-                emit_dirty(&write_tx, id, price_bucket, &mut dirty, &mut server_v).await;
+                emit_touched(
+                    &write_tx,
+                    id,
+                    price_bucket,
+                    &bar_totals,
+                    &mut touched,
+                    &mut server_v,
+                ).await;
             }
         }
     }
 }
 
-async fn emit_dirty(
+async fn emit_touched(
     write_tx: &mpsc::Sender<Message>,
     id: SubId,
     price_bucket: f64,
-    dirty: &mut HashMap<(i64, i64), (f64, f64)>,
+    bar_totals: &HashMap<(i64, i64), (f64, f64)>,
+    touched: &mut HashSet<(i64, i64)>,
     server_v: &mut u64,
 ) {
-    if dirty.is_empty() {
+    if touched.is_empty() {
         return;
     }
-    let cells: Vec<FootprintCell> = dirty
+    let cells: Vec<FootprintCell> = touched
         .drain()
-        .map(|((open_time, bucket_idx), (bid_vol, ask_vol))| FootprintCell {
-            open_time,
-            price_bucket_low: bucket_idx as f64 * price_bucket,
-            bid_vol,
-            ask_vol,
+        .filter_map(|key| {
+            let (open_time, bucket_idx) = key;
+            bar_totals
+                .get(&key)
+                .map(|(bid_vol, ask_vol)| FootprintCell {
+                    open_time,
+                    price_bucket_low: bucket_idx as f64 * price_bucket,
+                    bid_vol: *bid_vol,
+                    ask_vol: *ask_vol,
+                })
         })
         .collect();
+    if cells.is_empty() {
+        return;
+    }
     *server_v += 1;
     let frame = ServerFrame::FootprintUpdate {
         id,
