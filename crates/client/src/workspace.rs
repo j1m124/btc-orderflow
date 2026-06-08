@@ -46,6 +46,7 @@ pub struct TerminalWorkspace {
     indicator_settings: Option<FloatingIndicatorSettingsSlot>,
     chart_render_settings: Option<FloatingChartRenderSettingsSlot>,
     floating_code_editor: Option<FloatingCodeEditorSlot>,
+    drawing_settings: Option<FloatingDrawingSettingsSlot>,
     drawing_strip: Entity<FloatingStrip>,
     /// Kept alive on the workspace so the subscription wiring in
     /// `new` can call `cx.notify` on it from outside the strip itself.
@@ -69,6 +70,11 @@ struct FloatingChartRenderSettingsSlot {
     /// instead of opening a second one (matches the indicator-settings
     /// singleton semantics).
     view: Entity<ChartRenderSettingsView>,
+}
+
+struct FloatingDrawingSettingsSlot {
+    window: Entity<FloatingWindow>,
+    view: Entity<crate::drawings::settings_view::DrawingSettingsView>,
 }
 
 impl TerminalWorkspace {
@@ -148,6 +154,32 @@ impl TerminalWorkspace {
         })
         .detach();
 
+        // Strip content emits `GearClicked` for the user's currently-selected
+        // drawing. Forward to the workspace-level action so the open handler
+        // can do the retarget-or-spawn dance like the indicator-settings
+        // path does.
+        cx.subscribe_in(
+            &drawing_strip_content,
+            window,
+            |_this, _content, ev: &crate::drawings::strip_content::StripContentEvent, window, cx| {
+                match ev {
+                    crate::drawings::strip_content::StripContentEvent::GearClicked {
+                        symbol,
+                        id,
+                    } => {
+                        window.dispatch_action(
+                            Box::new(crate::drawings::actions::OpenDrawingSettings {
+                                symbol: symbol.clone(),
+                                id: *id,
+                            }),
+                            cx,
+                        );
+                    }
+                }
+            },
+        )
+        .detach();
+
         // Mirror the global drawing-selection state into the strip's
         // visibility. SelectionChanged also fires on programmatic deselect
         // (TF-mismatch, ESC, etc.) so the strip naturally hides.
@@ -201,6 +233,7 @@ impl TerminalWorkspace {
             indicator_settings: None,
             chart_render_settings: None,
             floating_code_editor: None,
+            drawing_settings: None,
             drawing_strip,
             drawing_strip_content,
         }
@@ -561,6 +594,41 @@ impl TerminalWorkspace {
         .detach();
         self.chart_render_settings =
             Some(FloatingChartRenderSettingsSlot { window: win, view });
+    }
+
+    fn on_open_drawing_settings(
+        &mut self,
+        action: &crate::drawings::actions::OpenDrawingSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        if let Some(slot) = self.drawing_settings.as_ref() {
+            let view = slot.view.clone();
+            view.update(cx, |v, cx| v.retarget(symbol, id, window, cx));
+            return;
+        }
+        let view = cx.new(|cx| {
+            crate::drawings::settings_view::DrawingSettingsView::new(symbol, id, window, cx)
+        });
+        let content: AnyView = view.clone().into();
+        let win = cx.new(|cx| FloatingWindow::new("Drawing Settings", content, window, cx));
+        cx.subscribe_in(&win, window, |this, _w, _ev: &DismissEvent, _window, cx| {
+            // Defer the drop: see `on_open_indicator_settings` for the
+            // gpui_web RefCell-borrow panic this works around.
+            let weak = cx.weak_entity();
+            cx.defer(move |cx| {
+                if let Some(ws) = weak.upgrade() {
+                    ws.update(cx, |ws, _cx| {
+                        ws.drawing_settings = None;
+                    });
+                }
+            });
+            let _ = this;
+        })
+        .detach();
+        self.drawing_settings = Some(FloatingDrawingSettingsSlot { window: win, view });
     }
 
     fn on_toggle_floating_code_editor(
@@ -989,6 +1057,7 @@ impl Render for TerminalWorkspace {
             .on_action(cx.listener(Self::on_toggle_drawing_locked))
             .on_action(cx.listener(Self::on_deselect_drawing))
             .on_action(cx.listener(Self::on_edit_drawing_label))
+            .on_action(cx.listener(Self::on_open_drawing_settings))
             .relative()
             .size_full()
             .flex()
@@ -1017,6 +1086,11 @@ impl Render for TerminalWorkspace {
                     )
                     .children(
                         self.chart_render_settings
+                            .as_ref()
+                            .map(|slot| slot.window.clone()),
+                    )
+                    .children(
+                        self.drawing_settings
                             .as_ref()
                             .map(|slot| slot.window.clone()),
                     )

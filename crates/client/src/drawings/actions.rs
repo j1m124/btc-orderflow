@@ -104,6 +104,16 @@ pub struct EditDrawingLabel {
     pub id: u64,
 }
 
+/// Open the floating per-drawing settings window. Dispatched from the
+/// gear button on the floating settings strip. Singleton — a re-dispatch
+/// with a different `(symbol, id)` retargets the existing window.
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct OpenDrawingSettings {
+    pub symbol: SharedString,
+    pub id: u64,
+}
+
 /// Drop the global drawing selection (closes the floating settings strip).
 /// Dispatched from ESC, empty-canvas clicks, and TF-mismatch auto-deselect.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]

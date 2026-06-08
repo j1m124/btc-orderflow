@@ -11,6 +11,7 @@ use gpui::{App, Global, SharedString};
 
 pub mod actions;
 pub mod service;
+pub mod settings_view;
 pub mod shapes;
 pub mod strip_content;
 pub mod tool;
