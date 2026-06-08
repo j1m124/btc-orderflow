@@ -94,6 +94,16 @@ pub struct ToggleDrawingLocked {
     pub id: u64,
 }
 
+/// Open a dialog to edit the per-shape secondary label. Routes to the
+/// shape's `label`/`text` field via `DrawingService::set_label`; no-op for
+/// `Text` shapes (whose text content IS the label).
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct EditDrawingLabel {
+    pub symbol: SharedString,
+    pub id: u64,
+}
+
 /// Drop the global drawing selection (closes the floating settings strip).
 /// Dispatched from ESC, empty-canvas clicks, and TF-mismatch auto-deselect.
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]

@@ -845,6 +845,91 @@ impl TerminalWorkspace {
         };
         handle.0.update(cx, |s, cx| s.clear_selection(cx));
     }
+
+    fn on_edit_drawing_label(
+        &mut self,
+        action: &crate::drawings::actions::EditDrawingLabel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::{
+            WindowExt as _,
+            dialog::{DialogButtonProps, DialogFooter, DialogHeader, DialogTitle},
+            input::{Input, InputState},
+            v_flex,
+        };
+
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        let existing = {
+            use crate::drawings::shapes::DrawingShape;
+            let svc_read = svc.read(cx);
+            svc_read
+                .for_symbol(symbol.as_ref())
+                .iter()
+                .find(|d| d.id == id)
+                .and_then(|d| match &d.shape {
+                    DrawingShape::Line(s)
+                    | DrawingShape::Rect(s)
+                    | DrawingShape::Arrow(s)
+                    | DrawingShape::Fibonacci(s) => s.label.clone(),
+                    DrawingShape::HorizontalRay(s) => s.text.clone(),
+                    DrawingShape::AnchoredVwap(s) => s.label.clone(),
+                    DrawingShape::Long(p) | DrawingShape::Short(p) => p.label.clone(),
+                    DrawingShape::Text(_) => None,
+                })
+        };
+
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("Label…");
+            if let Some(t) = existing {
+                state = state.default_value(t);
+            }
+            state
+        });
+
+        let input_for_dialog = input.clone();
+        let svc_for_dialog = svc.clone();
+        let symbol_for_dialog = symbol.clone();
+
+        window.open_dialog(cx, move |dialog, _w, _cx| {
+            let input_for_ok = input_for_dialog.clone();
+            let svc_for_ok = svc_for_dialog.clone();
+            let symbol_for_ok = symbol_for_dialog.clone();
+            dialog
+                .max_w(px(360.))
+                .button_props(DialogButtonProps::default().ok_text("Save").on_ok(
+                    move |_ev, _w, cx| {
+                        let value = input_for_ok.read(cx).value().trim().to_string();
+                        let new_text = if value.is_empty() { None } else { Some(value) };
+                        svc_for_ok.update(cx, |s, cx| {
+                            s.set_label(symbol_for_ok.as_ref(), id, new_text, cx)
+                        });
+                        true
+                    },
+                ))
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .child(
+                            DialogHeader::new()
+                                .px_4()
+                                .pt_4()
+                                .child(DialogTitle::new().child("Edit label")),
+                        )
+                        .child(
+                            div()
+                                .px_4()
+                                .child(Input::new(&input_for_dialog).cleanable(true)),
+                        )
+                        .child(DialogFooter::new().px_4().pb_2()),
+                )
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -903,6 +988,7 @@ impl Render for TerminalWorkspace {
             .on_action(cx.listener(Self::on_edit_horizontal_ray_text))
             .on_action(cx.listener(Self::on_toggle_drawing_locked))
             .on_action(cx.listener(Self::on_deselect_drawing))
+            .on_action(cx.listener(Self::on_edit_drawing_label))
             .relative()
             .size_full()
             .flex()
