@@ -649,6 +649,64 @@ impl DrawingService {
         self.persist();
     }
 
+    /// Flip the `extend_left` flag on a horizontal ray. No-op for any
+    /// other shape kind (caller is responsible for routing, but a stray
+    /// dispatch from the wrong selection shouldn't crash).
+    pub fn toggle_ray_extend_left(
+        &mut self,
+        symbol: &str,
+        id: DrawingId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list) = self.by_symbol.get_mut(symbol) else {
+            return;
+        };
+        let Some(d) = list.iter_mut().find(|d| d.id == id) else {
+            return;
+        };
+        let DrawingShape::HorizontalRay(r) = &mut d.shape else {
+            return;
+        };
+        r.extend_left = !r.extend_left;
+        self.persist();
+        cx.emit(DrawingEvent::Changed {
+            symbol: SharedString::from(symbol.to_string()),
+        });
+        cx.notify();
+    }
+
+    /// Set the per-shape font-size on a Text drawing. Clamps `size_px`
+    /// into a sane range so a malformed action can't render a wall of
+    /// 100-point text (or a zero-height glyph). No-op for any other
+    /// shape kind.
+    pub fn set_text_font_size(
+        &mut self,
+        symbol: &str,
+        id: DrawingId,
+        size_px: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list) = self.by_symbol.get_mut(symbol) else {
+            return;
+        };
+        let Some(d) = list.iter_mut().find(|d| d.id == id) else {
+            return;
+        };
+        let DrawingShape::Text(t) = &mut d.shape else {
+            return;
+        };
+        let clamped = size_px.clamp(6.0, 72.0);
+        if (t.font_size - clamped).abs() < f32::EPSILON {
+            return;
+        }
+        t.font_size = clamped;
+        self.persist();
+        cx.emit(DrawingEvent::Changed {
+            symbol: SharedString::from(symbol.to_string()),
+        });
+        cx.notify();
+    }
+
     /// Update the optional label on a horizontal-ray drawing. No-op if the
     /// drawing isn't a horizontal ray (caller is responsible for routing).
     pub fn update_ray_text(

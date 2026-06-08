@@ -217,12 +217,14 @@ pub fn shape_to_view(
             id: service.id,
             anchor: (t2i(r.anchor_time), r.anchor_price),
             text: r.text.clone(),
+            extend_left: r.extend_left,
         },
         DrawingShape::Text(s) => ViewDrawing::Text {
             id: service.id,
             anchor: (t2i(s.anchor_time), s.anchor_price),
             width: s.width,
             text: s.text.clone(),
+            font_size: s.font_size,
         },
         DrawingShape::Long(p) => ViewDrawing::Long {
             id: service.id,
@@ -336,17 +338,26 @@ pub fn view_to_shape(
             }
             DrawingShape::Rect(s)
         }
-        ViewDrawing::HorizontalRay { anchor, text, .. } => {
+        ViewDrawing::HorizontalRay {
+            anchor,
+            text,
+            extend_left,
+            ..
+        } => {
             let mut s = HorizontalRayShape {
                 anchor_time: i2t(anchor.0),
                 anchor_price: anchor.1,
                 text: text.clone(),
                 color: None,
                 width: 2.0,
+                extend_left: *extend_left,
             };
             if let Some(DrawingShape::HorizontalRay(b)) = baseline {
                 s.color = b.color;
                 s.width = b.width;
+                // Round-trip the persisted extend_left across edits so a
+                // drag doesn't reset the flag back to the view default.
+                s.extend_left = b.extend_left;
             }
             DrawingShape::HorizontalRay(s)
         }
@@ -354,6 +365,7 @@ pub fn view_to_shape(
             anchor,
             width,
             text,
+            font_size,
             ..
         } => {
             let mut s = TextShape {
@@ -362,9 +374,11 @@ pub fn view_to_shape(
                 width: *width,
                 text: text.clone(),
                 color: None,
+                font_size: *font_size,
             };
             if let Some(DrawingShape::Text(b)) = baseline {
                 s.color = b.color;
+                s.font_size = b.font_size;
             }
             DrawingShape::Text(s)
         }

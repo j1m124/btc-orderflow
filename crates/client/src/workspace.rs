@@ -914,6 +914,37 @@ impl TerminalWorkspace {
         handle.0.update(cx, |s, cx| s.clear_selection(cx));
     }
 
+    fn on_toggle_ray_extend_left(
+        &mut self,
+        action: &crate::drawings::actions::ToggleRayExtendLeft,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| s.toggle_ray_extend_left(symbol.as_ref(), id, cx));
+    }
+
+    fn on_set_text_font_size(
+        &mut self,
+        action: &crate::drawings::actions::SetTextFontSize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let size_px = action.size_px();
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        svc.update(cx, |s, cx| s.set_text_font_size(symbol.as_ref(), id, size_px, cx));
+    }
+
     fn on_edit_drawing_label(
         &mut self,
         action: &crate::drawings::actions::EditDrawingLabel,
@@ -1058,6 +1089,8 @@ impl Render for TerminalWorkspace {
             .on_action(cx.listener(Self::on_deselect_drawing))
             .on_action(cx.listener(Self::on_edit_drawing_label))
             .on_action(cx.listener(Self::on_open_drawing_settings))
+            .on_action(cx.listener(Self::on_toggle_ray_extend_left))
+            .on_action(cx.listener(Self::on_set_text_font_size))
             .relative()
             .size_full()
             .flex()

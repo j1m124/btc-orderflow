@@ -119,3 +119,42 @@ pub struct OpenDrawingSettings {
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = client, no_json)]
 pub struct DeselectDrawing;
+
+/// Toggle the `extend_left` flag on a horizontal ray. `(symbol, id)`.
+/// Dispatched from the settings window's per-Ray toggle.
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct ToggleRayExtendLeft {
+    pub symbol: SharedString,
+    pub id: u64,
+}
+
+/// Set the font-size on a Text drawing. Dispatched from the settings
+/// window's font-size chips. Size is in px; clamped server-side so a
+/// stray dispatch with a wild value can't crash the renderer.
+///
+/// `size` is serialized as a fixed-point integer (px × 100) inside the
+/// action — `f32` doesn't implement `Eq` / `Hash` needed by the `Action`
+/// derive. Callers should construct the action with [`Self::with_px`].
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct SetTextFontSize {
+    pub symbol: SharedString,
+    pub id: u64,
+    /// Font-size in centi-pixels (`px * 100`), so the action stays `Eq`.
+    pub size_cpx: u32,
+}
+
+impl SetTextFontSize {
+    pub fn with_px(symbol: SharedString, id: u64, size_px: f32) -> Self {
+        Self {
+            symbol,
+            id,
+            size_cpx: (size_px * 100.0).round().max(0.0) as u32,
+        }
+    }
+
+    pub fn size_px(&self) -> f32 {
+        self.size_cpx as f32 / 100.0
+    }
+}

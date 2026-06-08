@@ -23,9 +23,12 @@ use gpui_component::{
 
 use crate::services::market_data::Timeframe;
 
-use super::actions::{ResetDrawingTfFilter, ToggleDrawingHidden, ToggleDrawingTfFilter};
+use super::actions::{
+    ResetDrawingTfFilter, SetTextFontSize, ToggleDrawingHidden, ToggleDrawingTfFilter,
+    ToggleRayExtendLeft,
+};
 use super::service::{DrawingId, DrawingServiceHandle};
-use super::shapes::{Drawing, DrawingOrigin};
+use super::shapes::{Drawing, DrawingOrigin, DrawingShape};
 
 /// Per-drawing settings window content. Owns nothing the strip already
 /// owns — colour / width / label / lock / delete live there. This view
@@ -200,6 +203,66 @@ impl Render for DrawingSettingsView {
         }
         root = root.child(tf_section);
 
+        // ── Ray-only: extend-left toggle ────────────────────────────────
+        if let Some(extend_left) = snap.ray_extend_left {
+            let sym_for_ray = symbol.clone();
+            let toggle_label: SharedString = if extend_left {
+                "Extend left: on".into()
+            } else {
+                "Extend left: off".into()
+            };
+            let mut toggle_btn = Button::new(("drawing-settings-extend-left", id as usize))
+                .small()
+                .label(toggle_label)
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(ToggleRayExtendLeft {
+                            symbol: sym_for_ray.clone(),
+                            id,
+                        }),
+                        cx,
+                    );
+                });
+            toggle_btn = if extend_left { toggle_btn.primary() } else { toggle_btn.ghost() };
+            root = root.child(
+                v_flex()
+                    .gap_2()
+                    .child(section_label("Horizontal ray", muted))
+                    .child(toggle_btn),
+            );
+        }
+
+        // ── Text-only: font-size chips ──────────────────────────────────
+        if let Some(font_size) = snap.text_font_size {
+            const FONT_SIZE_CHOICES: &[f32] = &[10.0, 12.0, 14.0, 16.0, 20.0, 24.0];
+            let sym_for_font = symbol.clone();
+            let mut chips = h_flex().gap_1().flex_wrap();
+            for &size in FONT_SIZE_CHOICES {
+                let active = (font_size - size).abs() < 0.01;
+                let sym_for_chip = sym_for_font.clone();
+                let mut chip = Button::new(SharedString::from(format!(
+                    "drawing-settings-fontsize-{}-{}",
+                    id, size as u32
+                )))
+                .xsmall()
+                .label(SharedString::from(format!("{}px", size as u32)));
+                chip = if active { chip.primary() } else { chip.ghost() };
+                chip = chip.on_click(move |_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(SetTextFontSize::with_px(sym_for_chip.clone(), id, size)),
+                        cx,
+                    );
+                });
+                chips = chips.child(chip);
+            }
+            root = root.child(
+                v_flex()
+                    .gap_2()
+                    .child(section_label("Font size", muted))
+                    .child(chips),
+            );
+        }
+
         root.into_any_element()
     }
 }
@@ -227,6 +290,11 @@ struct DrawingSnapshot {
     hidden: bool,
     tf_filter: Option<BTreeSet<String>>,
     origin: DrawingOrigin,
+    /// Per-shape extras that drive the variant-specific sections of the
+    /// settings window. `None` when the selected shape doesn't expose
+    /// that knob.
+    ray_extend_left: Option<bool>,
+    text_font_size: Option<f32>,
 }
 
 trait DrawingRefProxy {
@@ -241,11 +309,21 @@ impl DrawingRefProxy for &Drawing {
 
 impl From<&Drawing> for DrawingSnapshot {
     fn from(d: &Drawing) -> Self {
+        let ray_extend_left = match &d.shape {
+            DrawingShape::HorizontalRay(r) => Some(r.extend_left),
+            _ => None,
+        };
+        let text_font_size = match &d.shape {
+            DrawingShape::Text(t) => Some(t.font_size),
+            _ => None,
+        };
         Self {
             label: d.label(),
             hidden: d.hidden,
             tf_filter: d.tf_filter.clone(),
             origin: d.created_by,
+            ray_extend_left,
+            text_font_size,
         }
     }
 }

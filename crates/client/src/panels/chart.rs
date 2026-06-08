@@ -218,6 +218,8 @@ pub enum Drawing {
         /// wouldn't work because text uses pixel-based font sizing.
         width: f32,
         text: String,
+        /// Font-size in pixels. Default 12. Edited via the settings window.
+        font_size: f32,
     },
     Long {
         id: DrawingId,
@@ -243,6 +245,12 @@ pub enum Drawing {
         /// Optional label rendered at the top-right of the ray. Edited via
         /// the chart's right-click menu.
         text: Option<String>,
+        /// When true, the stroke also extends left from the anchor to the
+        /// chart's left edge — turning the ray into a full horizontal
+        /// line. Drives both the Ray tool's "Extend left" toggle and the
+        /// dedicated HorizontalLine tool (which creates a ray with this
+        /// flag on).
+        extend_left: bool,
     },
     Arrow {
         id: DrawingId,
@@ -339,8 +347,12 @@ enum CreatingDrawing {
     /// One-click horizontal ray. The mouse-down handler commits it
     /// immediately; this variant only exists for symmetry with the other
     /// in-flight states (e.g. so a tool switch mid-creation can drop it).
+    /// `extend_left` carries through to the committed shape — true for
+    /// drawings created via the HorizontalLine tool, false for the regular
+    /// Ray tool.
     HorizontalRay {
         anchor: (f32, f64),
+        extend_left: bool,
     },
     /// One-click Anchored VWAP. Same shape as `HorizontalRay`: the mouse-down
     /// handler commits the drawing with this anchor immediately; the line
@@ -363,7 +375,14 @@ impl CreatingDrawing {
             Tool::Arrow => Some(CreatingDrawing::Arrow { a: pt, b: pt }),
             Tool::Rectangle => Some(CreatingDrawing::Rect { a: pt, b: pt }),
             Tool::Fibonacci => Some(CreatingDrawing::Fibonacci { a: pt, b: pt }),
-            Tool::HorizontalRay => Some(CreatingDrawing::HorizontalRay { anchor: pt }),
+            Tool::HorizontalRay => Some(CreatingDrawing::HorizontalRay {
+                anchor: pt,
+                extend_left: false,
+            }),
+            Tool::HorizontalLine => Some(CreatingDrawing::HorizontalRay {
+                anchor: pt,
+                extend_left: true,
+            }),
             Tool::AnchoredVwap => Some(CreatingDrawing::AnchoredVwap { anchor: pt }),
             Tool::Long => Some(CreatingDrawing::Long {
                 entry: pt,
@@ -410,7 +429,7 @@ impl CreatingDrawing {
                 entry.0 += n;
                 tp.0 += n;
             }
-            CreatingDrawing::HorizontalRay { anchor } => {
+            CreatingDrawing::HorizontalRay { anchor, .. } => {
                 anchor.0 += n;
             }
             CreatingDrawing::AnchoredVwap { anchor } => {
@@ -425,10 +444,11 @@ impl CreatingDrawing {
             CreatingDrawing::Arrow { a, b } => Drawing::Arrow { id, a, b },
             CreatingDrawing::Rect { a, b } => Drawing::Rect { id, a, b },
             CreatingDrawing::Fibonacci { a, b } => Drawing::Fibonacci { id, a, b },
-            CreatingDrawing::HorizontalRay { anchor } => Drawing::HorizontalRay {
+            CreatingDrawing::HorizontalRay { anchor, extend_left } => Drawing::HorizontalRay {
                 id,
                 anchor,
                 text: None,
+                extend_left,
             },
             CreatingDrawing::AnchoredVwap { anchor } => Drawing::AnchoredVwap { id, anchor },
             CreatingDrawing::Long { entry, tp } => {
@@ -2000,21 +2020,21 @@ fn snap_t(t: f32) -> f32 {
 /// `width` containing `text`. Matches the visual extent of the
 /// `text_xs() / px_1p5() / py_0p5() / border_1` div used in the render path
 /// so hit-test bounds line up with what the user sees.
-fn estimate_text_box_height(text: &str, width: f32) -> f32 {
-    // text_xs: ~12px font, ~18px line height. Padding totals ~4px vertical
+fn estimate_text_box_height(text: &str, width: f32, font_size: f32) -> f32 {
+    // Line height ≈ 1.5× font-size (matches gpui's default leading for the
+    // proportional fonts we ship). Padding totals ~4px vertical
     // (py_0p5 each side = 2px) + ~2px for the 1px border each side.
-    const LINE_HEIGHT: f32 = 18.0;
+    let line_height = (font_size * 1.5).max(font_size + 2.0);
     const VERTICAL_PADDING_AND_BORDER: f32 = 6.0;
     // Horizontal padding (px_1p5 = 6px each side = 12px) eats into the
     // content width.
     const HORIZONTAL_PADDING: f32 = 12.0;
-    // Approximate proportional char width at 12px font; this is a soft
-    // estimate, so erring slightly large is preferable — undershooting
-    // makes the hit area smaller than the visible text.
-    const AVG_CHAR_WIDTH: f32 = 6.5;
+    // Approximate proportional char width — scales with font-size so a
+    // 24 px text box doesn't dramatically over-wrap.
+    let avg_char_width = (font_size * 0.55).max(3.0);
 
-    let content_w = (width - HORIZONTAL_PADDING).max(AVG_CHAR_WIDTH);
-    let chars_per_line = (content_w / AVG_CHAR_WIDTH).floor().max(1.0);
+    let content_w = (width - HORIZONTAL_PADDING).max(avg_char_width);
+    let chars_per_line = (content_w / avg_char_width).floor().max(1.0);
     // Count wrapped lines per paragraph (split by '\n') so multi-line text
     // doesn't under-report when the user typed explicit breaks.
     let mut total_lines = 0.0f32;
@@ -2028,7 +2048,7 @@ fn estimate_text_box_height(text: &str, width: f32) -> f32 {
     if !had_content {
         total_lines = 1.0;
     }
-    total_lines * LINE_HEIGHT + VERTICAL_PADDING_AND_BORDER
+    total_lines * line_height + VERTICAL_PADDING_AND_BORDER
 }
 
 /// Round every time-anchor in a view-coord [`Drawing`] to the nearest integer
@@ -2321,10 +2341,11 @@ fn hit_test_drawings(
                 anchor,
                 width,
                 text,
+                font_size,
                 ..
             } => {
                 // Box height is estimated to match the rendered div, which
-                // uses `text_xs` (≈12px font, ≈18px line height) inside
+                // uses `text_size(font_size)` and `~1.5×` line-height inside
                 // `px_1p5().py_0p5()` padding (12px horizontal, 4px vertical
                 // total). Count explicit newlines AND wrap each paragraph
                 // against `content_width = width - 12`, then total
@@ -2332,7 +2353,7 @@ fn hit_test_drawings(
                 // behaviour of the rendered div so the hit area expands with
                 // visible text rather than under-estimating long content.
                 let (ax, ay) = to_screen(*anchor);
-                let h_est = estimate_text_box_height(text, *width);
+                let h_est = estimate_text_box_height(text, *width, *font_size);
                 // Right-edge resize handle: within `DRAWING_HANDLE_HIT_PX`
                 // of the right edge, anywhere within the box's vertical
                 // extent.
@@ -2954,7 +2975,7 @@ pub fn render(
     let candles_for_overlay = state.candles.clone();
     let drawings_overlay = render_drawings_overlay(
         drawings_snapshot.clone(),
-        styles_snapshot,
+        styles_snapshot.clone(),
         creating_preview,
         selected_for_overlay,
         state.view_start,
@@ -3337,6 +3358,7 @@ pub fn render(
                 anchor,
                 width,
                 text,
+                font_size,
             } = d
             else {
                 continue;
@@ -3354,6 +3376,13 @@ pub fn render(
             let sy = price_to_screen(y_lo_for_overlay, y_hi_for_overlay, anchor.1, canvas_h);
             let selected = selected_for_overlay == Some(*id);
             let border = if selected { theme_ring } else { theme_border };
+            // Per-shape colour override pulled from the styles snapshot built
+            // upstream alongside the drawings list. Falls back to the theme
+            // foreground when the user hasn't customised the colour.
+            let text_color = styles_snapshot
+                .get(id)
+                .and_then(|s| s.color)
+                .unwrap_or(theme_foreground);
             out.push(
                 div()
                     .absolute()
@@ -3366,8 +3395,8 @@ pub fn render(
                     .w(px(*width))
                     .px_1p5()
                     .py_0p5()
-                    .text_xs()
-                    .text_color(theme_foreground)
+                    .text_size(px(*font_size))
+                    .text_color(text_color)
                     .border_1()
                     .border_color(border)
                     .rounded(px(3.))
@@ -3632,6 +3661,7 @@ pub fn render(
                                     anchor: editing.anchor,
                                     width: editing.width,
                                     text: trimmed.to_string(),
+                                    font_size: crate::drawings::shapes::default_font_size(),
                                 };
                                 let shape = drawings_view::view_to_shape(
                                     &view,
@@ -3678,14 +3708,19 @@ pub fn render(
                     .tool();
 
                 match active_tool {
-                    Tool::HorizontalRay => {
-                        // One-click commit: a horizontal ray is defined by a
-                        // single (time, price) anchor — no trailing endpoint
-                        // to drag — so just write it through immediately.
+                    Tool::HorizontalRay | Tool::HorizontalLine => {
+                        // One-click commit: a horizontal ray (and the line
+                        // variant) is defined by a single (time, price)
+                        // anchor — no trailing endpoint to drag — so just
+                        // write it through immediately. The HorizontalLine
+                        // tool sets `extend_left=true` so the stroke spans
+                        // the full chart width.
+                        let extend_left = matches!(active_tool, Tool::HorizontalLine);
                         let drawing = Drawing::HorizontalRay {
                             id: 0,
                             anchor: (world_t, world_p),
                             text: None,
+                            extend_left,
                         };
                         let shape = drawings_view::view_to_shape(
                             &drawing,
@@ -4303,18 +4338,21 @@ pub fn render(
                 // doc-comment above.
                 .context_menu({
                     let focus = focus.clone();
-                    move |menu, window, cx| {
+                    move |menu, _window, cx| {
                         let mut menu = menu.action_context(focus.clone());
                         let target = cx
                             .try_global::<crate::drawings::LastChartRightClick>()
                             .and_then(|g| g.0.borrow().clone());
                         if let Some(target) = target {
                             if let Some(drawing_id) = target.drawing_id {
-                                // Snapshot the drawing's `hidden`, `tf_filter`, and
-                                // shape kind so the submenu builders don't re-borrow
-                                // the service. `is_ray` gates the "Edit label" item
-                                // since only horizontal rays carry a text label.
-                                let (hidden, tf_filter, is_ray) = {
+                                // Snapshot the drawing's `hidden` flag + shape
+                                // kind so the menu builder doesn't re-borrow
+                                // the service. `is_ray` gates the "Edit label"
+                                // item since only horizontal rays carry a text
+                                // label. Per-TF visibility lives on the
+                                // floating settings window only (cleaner
+                                // affordance than a deep submenu).
+                                let (hidden, is_ray) = {
                                     let svc = cx
                                         .global::<crate::drawings::service::DrawingServiceHandle>()
                                         .0
@@ -4326,12 +4364,12 @@ pub fn render(
                                         .find(|d| d.id == drawing_id)
                                         .map(|d| {
                                             let is_ray = matches!(
-                                        &d.shape,
-                                        crate::drawings::shapes::DrawingShape::HorizontalRay(_)
-                                    );
-                                            (d.hidden, d.tf_filter.clone(), is_ray)
+                                                &d.shape,
+                                                crate::drawings::shapes::DrawingShape::HorizontalRay(_)
+                                            );
+                                            (d.hidden, is_ray)
                                         })
-                                        .unwrap_or((false, None, false))
+                                        .unwrap_or((false, false))
                                 };
                                 let sym_select = target.symbol.clone();
                                 menu = menu.menu(
@@ -4359,41 +4397,6 @@ pub fn render(
                                         id: drawing_id,
                                     }),
                                 );
-                                // Per-drawing "Visible on" submenu (5 TF checkboxes).
-                                let sym_for_sub = target.symbol.clone();
-                                menu =
-                                    menu.submenu("Visible on", window, cx, move |vis, _w, _cx| {
-                                        let mut vis = vis;
-                                        for tf in crate::services::market_data::Timeframe::ALL {
-                                            let checked = match &tf_filter {
-                                                None => true,
-                                                Some(set) => set.contains(tf.as_str()),
-                                            };
-                                            let prefix = if checked { "✓ " } else { "  " };
-                                            let label = SharedString::from(format!(
-                                                "{}{}",
-                                                prefix,
-                                                tf.as_str()
-                                            ));
-                                            vis = vis.menu(
-                                    label,
-                                    Box::new(crate::drawings::actions::ToggleDrawingTfFilter {
-                                        symbol: sym_for_sub.clone(),
-                                        id: drawing_id,
-                                        tf: SharedString::from(tf.as_str()),
-                                    }),
-                                );
-                                        }
-                                        vis.separator().menu(
-                                            "Visible on all",
-                                            Box::new(
-                                                crate::drawings::actions::ResetDrawingTfFilter {
-                                                    symbol: sym_for_sub.clone(),
-                                                    id: drawing_id,
-                                                },
-                                            ),
-                                        )
-                                    });
                                 let sym_del = target.symbol.clone();
                                 menu = menu.menu(
                                     "Delete",

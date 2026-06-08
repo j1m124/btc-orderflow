@@ -104,6 +104,11 @@ pub struct LineRectShape {
 /// `text` is an optional label rendered at the top-right of the ray — kept
 /// as `text` (not `label`) for backwards compat with persisted blobs that
 /// already use this name.
+///
+/// `extend_left = true` turns the ray into a full horizontal line — the
+/// stroke also extends from the anchor back to the chart's left edge.
+/// Used by both the Ray tool (toggled via the settings window) and the
+/// dedicated HorizontalLine tool (which creates a Ray with this flag on).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HorizontalRayShape {
     pub anchor_time: i64,
@@ -114,6 +119,8 @@ pub struct HorizontalRayShape {
     pub color: Option<DrawingColor>,
     #[serde(default = "default_width", skip_serializing_if = "is_default_width")]
     pub width: f32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub extend_left: bool,
 }
 
 /// Anchored VWAP: a single time anchor; the line is computed from the chart's
@@ -135,7 +142,8 @@ pub struct AnchoredVwapShape {
 /// pixel-based font sizing, so a world-coord width wouldn't make sense). The
 /// text content IS the visible label — there's no separate `label` field; the
 /// strip suppresses the label slot for Text. `color` overrides the theme
-/// foreground; line-width isn't meaningful for Text.
+/// foreground; line-width isn't meaningful for Text. `font_size` defaults
+/// to 12 px and is editable from the settings window.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextShape {
     pub anchor_time: i64,
@@ -144,6 +152,18 @@ pub struct TextShape {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<DrawingColor>,
+    #[serde(default = "default_font_size", skip_serializing_if = "is_default_font_size")]
+    pub font_size: f32,
+}
+
+/// Default font size for a Text drawing (px). Older blobs that lack the
+/// field load with this value; freshly-created Text shapes also start here.
+pub(crate) fn default_font_size() -> f32 {
+    12.0
+}
+
+pub(crate) fn is_default_font_size(v: &f32) -> bool {
+    (*v - 12.0).abs() < f32::EPSILON
 }
 
 /// Long / short position zone — entry, take-profit, stop-loss prices over a

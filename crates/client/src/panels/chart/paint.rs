@@ -1702,15 +1702,26 @@ fn paint_drawings_overlay(
                     paint_handle(window, bx, by_screen);
                 }
             }
-            Drawing::HorizontalRay { anchor, text, .. } => {
+            Drawing::HorizontalRay {
+                anchor,
+                text,
+                extend_left,
+                ..
+            } => {
                 // Horizontal ray: line from the anchor x to the right edge
                 // of the overlay at the anchor's y. Anchors past the right
                 // edge collapse to a dot at the edge so the user can still
-                // find them.
+                // find them. When `extend_left` is set, the stroke also
+                // reaches back to the overlay's left edge — turning the
+                // ray into a full horizontal line.
                 let (ax, ay) = to_screen(*anchor);
                 let right_edge = bounds.size.width.as_f32();
                 let overlay_h = bounds.size.height.as_f32();
-                let start_x = ax.max(0.0).min(right_edge);
+                let start_x = if *extend_left {
+                    0.0
+                } else {
+                    ax.max(0.0).min(right_edge)
+                };
                 // Skip painting entirely when the ray's y sits outside the
                 // overlay — text isn't clipped by the overlay's bounds, so
                 // without this guard the label would float in the axis
@@ -1885,19 +1896,22 @@ fn paint_drawings_overlay(
             Some(s) if !s.is_empty() => s,
             _ => return,
         };
-        // (label_anchor_x, label_anchor_y, inside_rect)
-        //  - inside_rect=true → label is right-aligned inside the rect's
-        //    right edge (Rect only); the anchor_x carries `xmax`.
-        //  - inside_rect=false → label paints to the right of anchor_x at
-        //    `anchor_x + 4`; anchor_y is the y of the label's top edge.
-        let (label_anchor_x, label_anchor_y, inside_rect) = match d {
+        // (label_anchor_x, label_anchor_y, right_align)
+        //  - right_align=true → text is right-aligned to anchor_x (the
+        //    label's right edge lands at anchor_x). Used by Rect so the
+        //    label sits above the rect's right edge.
+        //  - right_align=false → text is left-aligned at `anchor_x + 4`;
+        //    anchor_y is the y of the label's top edge.
+        let (label_anchor_x, label_anchor_y, right_align) = match d {
             Drawing::Rect { a, b, .. } => {
                 let (ax, ay) = to_screen(*a);
                 let (bx, by) = to_screen(*b);
                 let xmax = ax.max(bx);
                 let ymin = ay.min(by);
-                // Right-aligned inside, with a small inset from the top edge.
-                (xmax, ymin + 2.0, true)
+                // Above the rect's top edge, right-aligned to the rect's
+                // right edge — sits cleanly above the corner without
+                // overlapping the stroke.
+                (xmax, ymin - 16.0, true)
             }
             Drawing::Fibonacci { a, b, .. } => {
                 let (ax, ay) = to_screen(*a);
@@ -1928,11 +1942,11 @@ fn paint_drawings_overlay(
                 let (_, y_entry) = to_screen((*t0, *entry));
                 let (_, y_tp) = to_screen((*t0, *take_profit));
                 let (_, y_sl) = to_screen((*t0, *stop_loss));
-                // Align with the E / TP / SL chips at the right edge — those
-                // sit at `top(y - 7)`. Anchor to the top-most price line so
-                // the label sits beside (not above) the topmost chip.
+                // The E / TP / SL chips render at `top(y - 7)` and are
+                // ~12 px tall. Drop the user label clearly above the
+                // top-most chip so the chip background doesn't hide it.
                 let ytop = y_entry.min(y_tp).min(y_sl);
-                (x0.max(x1), ytop - 7.0, false)
+                (x0.max(x1), ytop - 22.0, false)
             }
             // HorizontalRay paints its own inline label; Text's content IS
             // the label; Line / Arrow / AnchoredVwap intentionally suppress.
@@ -1951,10 +1965,10 @@ fn paint_drawings_overlay(
         let line = window
             .text_system()
             .shape_line(label_owned, px(11.0), &[run], None);
-        let (paint_x, paint_y) = if inside_rect {
+        let (paint_x, paint_y) = if right_align {
             let text_w = line.width().as_f32();
-            // Pin to the rect's right edge inside, with a 4px gutter.
-            (label_anchor_x - text_w - 4.0, label_anchor_y)
+            // Right edge of the text lands on label_anchor_x.
+            (label_anchor_x - text_w, label_anchor_y)
         } else {
             (label_anchor_x + 4.0, label_anchor_y)
         };
