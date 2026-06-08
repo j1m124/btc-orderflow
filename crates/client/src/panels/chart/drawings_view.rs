@@ -26,7 +26,7 @@ use super::Drawing as ViewDrawing;
 /// All fields are optional / defaulted; paint applies them as overrides
 /// over the theme defaults, so absent values reproduce the pre-Phase-7
 /// visual exactly.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DrawingStyle {
     /// Primary stroke / fill color override. `None` → keep theme default.
     /// For position shapes this is unused (they consume `profit_color` /
@@ -40,6 +40,11 @@ pub struct DrawingStyle {
     /// in-flight create previews that don't have a style record still
     /// paint with their original 1.5px).
     pub width: f32,
+    /// Optional secondary label to render at the drawing's top-right
+    /// corner. `HorizontalRay` reads its own `text` field — paint does
+    /// not consume `label` for that variant (the ray's existing label
+    /// pipeline owns it).
+    pub label: Option<String>,
 }
 
 /// Project the per-shape style fields into the parallel style record.
@@ -53,14 +58,20 @@ pub fn style_from_shape(shape: &DrawingShape) -> DrawingStyle {
         Line(d) | Rect(d) | Arrow(d) | Fibonacci(d) => {
             s.color = d.color.map(|c| c.into_hsla());
             s.width = d.width;
+            s.label = d.label.clone();
         }
         HorizontalRay(d) => {
             s.color = d.color.map(|c| c.into_hsla());
             s.width = d.width;
+            // `text` is the ray's own label; the paint pipeline reads it
+            // directly from the ViewDrawing variant, not from this style
+            // record. Leaving `s.label = None` keeps the generic top-right
+            // label painter from double-drawing it.
         }
         AnchoredVwap(d) => {
             s.color = d.color.map(|c| c.into_hsla());
             s.width = d.width;
+            s.label = d.label.clone();
         }
         Text(d) => {
             s.color = d.color.map(|c| c.into_hsla());
@@ -69,6 +80,7 @@ pub fn style_from_shape(shape: &DrawingShape) -> DrawingStyle {
             s.profit_color = p.profit_color.map(|c| c.into_hsla());
             s.loss_color = p.loss_color.map(|c| c.into_hsla());
             s.width = p.width;
+            s.label = p.label.clone();
         }
     }
     s

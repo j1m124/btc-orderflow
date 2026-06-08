@@ -1554,19 +1554,13 @@ fn paint_drawings_overlay(
                 ..loss_base
             },
         );
-        // Three horizontal lines. Entry stays muted (not user-recolourable —
-        // it's a structural marker); TP/SL line colours track the zone tints
-        // with the user override applied above.
-        let entry_color = if is_selected {
-            colors.ring
-        } else {
-            colors.muted
-        };
-        let tp_color = if is_selected { colors.ring } else { profit_base };
-        let sl_color = if is_selected { colors.ring } else { loss_base };
-        paint_line(window, xmin, y_entry, xmax, y_entry, entry_color, width);
-        paint_line(window, xmin, y_tp, xmax, y_tp, tp_color, width);
-        paint_line(window, xmin, y_sl, xmax, y_sl, sl_color, width);
+        // Three horizontal lines. Entry stays muted (structural marker, not
+        // user-recolourable); TP/SL track the zone tints with the user
+        // override applied above. Selection no longer flips these to the ring
+        // colour — endpoint handles mark selection on their own.
+        paint_line(window, xmin, y_entry, xmax, y_entry, colors.muted, width);
+        paint_line(window, xmin, y_tp, xmax, y_tp, profit_base, width);
+        paint_line(window, xmin, y_sl, xmax, y_sl, loss_base, width);
 
         if is_selected {
             // Price handles: dots at the horizontal middle of each price
@@ -1593,13 +1587,14 @@ fn paint_drawings_overlay(
         // Preview drawings carry no style record (they live on the chart's
         // `creating` state, not the service). Lookup returns the default
         // style → paint falls back to the theme + the legacy 1.5 px stroke.
-        let style = styles.get(&d.id()).copied().unwrap_or_default();
+        let style = styles.get(&d.id()).cloned().unwrap_or_default();
         let custom_stroke = style.color;
-        // Selection / preview always paints in the ring color so the affordance
-        // stays visible regardless of the user's custom stroke choice. Handles
-        // already mark selection separately; the colour flip is the cue while
-        // the cursor is mid-drag (no handles painted yet for a preview).
-        let stroke = if is_selected || is_preview {
+        // In-flight previews flip to the ring colour so the user can see
+        // what they're drawing against the theme stroke. Selection no longer
+        // recolours the stroke — endpoint handles are the selection cue and
+        // the user's custom colour should stay visible while it's the active
+        // drawing.
+        let stroke = if is_preview {
             colors.ring
         } else {
             custom_stroke.unwrap_or(colors.line)
@@ -1664,7 +1659,7 @@ fn paint_drawings_overlay(
                 let (ax, _ay) = to_screen(*a);
                 let (bx, _by) = to_screen(*b);
                 let (xmin, xmax) = (ax.min(bx), ax.max(bx));
-                let level_color = if is_selected || is_preview {
+                let level_color = if is_preview {
                     colors.ring
                 } else {
                     custom_stroke.unwrap_or(colors.line)
@@ -1887,6 +1882,89 @@ fn paint_drawings_overlay(
             // Text painted as a positioned div outside the overlay.
             _ => {}
         }
+
+        // Optional top-right label. Each non-Text / non-Ray shape may carry
+        // a short user-supplied label rendered just above-right of its
+        // bounding box. Skipped for previews (no style record), and skipped
+        // for HorizontalRay (which paints its own label inside the arm).
+        if is_preview {
+            return;
+        }
+        let label_str = match style.label.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => return,
+        };
+        let label_pos = match d {
+            Drawing::Line { a, b, .. }
+            | Drawing::Arrow { a, b, .. }
+            | Drawing::Rect { a, b, .. }
+            | Drawing::Fibonacci { a, b, .. } => {
+                let (ax, ay) = to_screen(*a);
+                let (bx, by) = to_screen(*b);
+                Some((ax.max(bx), ay.min(by)))
+            }
+            Drawing::Long {
+                t0,
+                t1,
+                entry,
+                take_profit,
+                stop_loss,
+                ..
+            }
+            | Drawing::Short {
+                t0,
+                t1,
+                entry,
+                take_profit,
+                stop_loss,
+                ..
+            } => {
+                let (x0, _) = to_screen((*t0, *entry));
+                let (x1, _) = to_screen((*t1, *entry));
+                let (_, y_entry) = to_screen((*t0, *entry));
+                let (_, y_tp) = to_screen((*t0, *take_profit));
+                let (_, y_sl) = to_screen((*t0, *stop_loss));
+                Some((x0.max(x1), y_entry.min(y_tp).min(y_sl)))
+            }
+            Drawing::AnchoredVwap { anchor, .. } => {
+                // Pin to the anchor's x at the top of the overlay — the
+                // line's actual top-right depends on accumulated VWAP we'd
+                // have to recompute, and the anchor x is a stable visual
+                // tie back to the line's origin.
+                let sx = index_to_screen(
+                    view_start,
+                    view_size,
+                    anchor.0,
+                    chart_w_for_x,
+                    y_axis_gap,
+                );
+                Some((sx, 0.0))
+            }
+            // HorizontalRay paints its own label; Text's text IS the label.
+            _ => None,
+        };
+        let Some((lx, ly)) = label_pos else { return };
+        let label_owned = SharedString::from(label_str.to_string());
+        let label_len = label_owned.len();
+        let run = TextRun {
+            len: label_len,
+            font: window.text_style().font(),
+            color: stroke,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window
+            .text_system()
+            .shape_line(label_owned, px(11.0), &[run], None);
+        let _ = line.paint(
+            point(px(lx + 4.0) + origin.x, px(ly - 14.0) + origin.y),
+            px(11.0),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
     };
 
     for d in drawings {
