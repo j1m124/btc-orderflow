@@ -29,6 +29,13 @@ use super::actions::{
 };
 use super::service::{DrawingId, DrawingServiceHandle};
 use super::shapes::{Drawing, DrawingOrigin, DrawingShape};
+use crate::volume_profile::{
+    AnchorEdge, VolumeProfileParams, VpDeltaScale, VpRenderMode,
+    params::{
+        BTCUSDT_TICK_SIZE, BUCKET_TICKS_MAX, BUCKET_TICKS_MIN, VA_PERCENT_MAX, VA_PERCENT_MIN,
+        WIDTH_PCT_MAX, WIDTH_PCT_MIN,
+    },
+};
 
 /// Per-drawing settings window content. Owns nothing the strip already
 /// owns — colour / width / label / lock / delete live there. This view
@@ -232,6 +239,16 @@ impl Render for DrawingSettingsView {
             );
         }
 
+        // ── FRVP-only: full VolumeProfile form ──────────────────────────
+        // Mirrors the VRVP form in `indicator_settings.rs::render_vrvp` but
+        // writes through `DrawingService::set_vp_params` instead of going
+        // through the indicator path. Colour editing is deferred to
+        // Phase 15 polish; mode / scaling / bucket / VA / show toggles
+        // are all live.
+        if let Some(params) = snap.frvp_params.clone() {
+            root = root.child(frvp_section(symbol.clone(), id, &params, muted, border));
+        }
+
         // ── Text-only: font-size chips ──────────────────────────────────
         if let Some(font_size) = snap.text_font_size {
             const FONT_SIZE_CHOICES: &[f32] = &[10.0, 12.0, 14.0, 16.0, 20.0, 24.0];
@@ -274,6 +291,354 @@ fn section_label(text: &'static str, color: Hsla) -> impl IntoElement {
         .child(SharedString::from(text))
 }
 
+/// Mutate the FRVP's persisted params and push the result through
+/// `set_vp_params`. Read-modify-write each click — drawings change at
+/// human pace, so the extra read is cheap and the mutation closure stays
+/// trivial. No-op if the drawing has been deleted between snapshot and
+/// click.
+fn mutate_frvp_params(
+    symbol: SharedString,
+    id: DrawingId,
+    cx: &mut App,
+    mutator: impl FnOnce(&mut VolumeProfileParams),
+) {
+    let Some(handle) = cx.try_global::<DrawingServiceHandle>().cloned() else {
+        return;
+    };
+    let mut params = {
+        let svc = handle.0.read(cx);
+        let Some(d) = svc
+            .for_symbol(symbol.as_ref())
+            .iter()
+            .find(|d| d.id == id)
+        else {
+            return;
+        };
+        let DrawingShape::Frvp(f) = &d.shape else {
+            return;
+        };
+        f.params.clone()
+    };
+    mutator(&mut params);
+    if !params.is_valid() {
+        return;
+    }
+    handle.0.update(cx, |s, cx| {
+        s.set_vp_params(symbol.as_ref(), id, params, cx);
+    });
+}
+
+/// The FRVP settings block — Layout / Reference levels / Reset.
+/// Static (no listener state); the only mutation is via the per-button
+/// click handlers, which read the latest params from the service on
+/// every fire.
+fn frvp_section(
+    symbol: SharedString,
+    id: DrawingId,
+    params: &VolumeProfileParams,
+    muted: Hsla,
+    border: Hsla,
+) -> impl IntoElement {
+    let layout = v_flex()
+        .gap_2()
+        .child(section_label("Layout", muted))
+        .child(frvp_bucket_row(symbol.clone(), id, params, muted))
+        .child(frvp_mode_row(symbol.clone(), id, params.render_mode, muted));
+    let layout = if matches!(params.render_mode, VpRenderMode::Delta) {
+        layout.child(frvp_delta_scale_row(
+            symbol.clone(),
+            id,
+            params.delta_scale,
+            muted,
+        ))
+    } else {
+        layout
+    };
+    let layout = layout
+        .child(frvp_width_row(symbol.clone(), id, params, muted))
+        .child(frvp_anchor_row(symbol.clone(), id, params.anchor, muted));
+
+    let levels = v_flex()
+        .gap_2()
+        .child(section_label("Reference levels", muted))
+        .child(frvp_toggle_row("POC line", params.show_poc, symbol.clone(), id, muted, "poc",
+            |p, v| p.show_poc = v))
+        .child(frvp_toggle_row("VA lines", params.show_va, symbol.clone(), id, muted, "va",
+            |p, v| p.show_va = v))
+        .child(frvp_toggle_row("VA highlight", params.show_va_highlight, symbol.clone(), id, muted, "vah",
+            |p, v| p.show_va_highlight = v))
+        .child(frvp_toggle_row("Labels", params.show_labels, symbol.clone(), id, muted, "lbl",
+            |p, v| p.show_labels = v))
+        .child(frvp_va_pct_row(symbol.clone(), id, params, muted));
+
+    let symbol_for_reset = symbol.clone();
+    let reset_btn = Button::new(SharedString::from(format!("frvp-reset-{}", id)))
+        .label(SharedString::from("Reset style"))
+        .small()
+        .ghost()
+        .on_click(move |_, _, cx| {
+            let sym = symbol_for_reset.clone();
+            mutate_frvp_params(sym, id, cx, |p| p.reset_styles());
+        });
+
+    v_flex()
+        .gap_3()
+        .child(div().h(px(1.)).bg(border))
+        .child(section_label("Volume Profile", muted))
+        .child(layout)
+        .child(div().h(px(1.)).bg(border))
+        .child(levels)
+        .child(reset_btn)
+}
+
+fn frvp_bucket_row(
+    symbol: SharedString,
+    id: DrawingId,
+    params: &VolumeProfileParams,
+    muted: Hsla,
+) -> impl IntoElement {
+    let ticks = params.bucket_ticks;
+    let dollars = ticks as f64 * BTCUSDT_TICK_SIZE;
+    let readout = SharedString::from(format!("{} ticks (${:.2})", ticks, dollars));
+    let sym_dec = symbol.clone();
+    let sym_inc = symbol.clone();
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("Bucket"))
+        .child(
+            Button::new(SharedString::from(format!("frvp-bkt-dec-{}", id)))
+                .label(SharedString::from("\u{2212}"))
+                .xsmall()
+                .ghost()
+                .on_click(move |_, _, cx| {
+                    let sym = sym_dec.clone();
+                    mutate_frvp_params(sym, id, cx, |p| {
+                        let nxt = (p.bucket_ticks as i64 - 10)
+                            .clamp(BUCKET_TICKS_MIN as i64, BUCKET_TICKS_MAX as i64);
+                        p.bucket_ticks = nxt as u32;
+                    });
+                }),
+        )
+        .child(div().w(px(110.)).text_sm().child(readout))
+        .child(
+            Button::new(SharedString::from(format!("frvp-bkt-inc-{}", id)))
+                .label(SharedString::from("+"))
+                .xsmall()
+                .ghost()
+                .on_click(move |_, _, cx| {
+                    let sym = sym_inc.clone();
+                    mutate_frvp_params(sym, id, cx, |p| {
+                        let nxt = (p.bucket_ticks as i64 + 10)
+                            .clamp(BUCKET_TICKS_MIN as i64, BUCKET_TICKS_MAX as i64);
+                        p.bucket_ticks = nxt as u32;
+                    });
+                }),
+        )
+}
+
+fn frvp_mode_row(
+    symbol: SharedString,
+    id: DrawingId,
+    current: VpRenderMode,
+    muted: Hsla,
+) -> impl IntoElement {
+    let mut buttons = h_flex().gap_1();
+    for m in VpRenderMode::ALL {
+        let mode = *m;
+        let is_active = mode == current;
+        let sym = symbol.clone();
+        let btn_id = SharedString::from(format!("frvp-mode-{}-{}", id, mode.label()));
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(mode.label()))
+            .xsmall();
+        btn = if is_active { btn.primary() } else { btn.ghost() };
+        btn = btn.on_click(move |_, _, cx| {
+            let sym = sym.clone();
+            mutate_frvp_params(sym, id, cx, |p| p.render_mode = mode);
+        });
+        buttons = buttons.child(btn);
+    }
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("Mode"))
+        .child(buttons)
+}
+
+fn frvp_delta_scale_row(
+    symbol: SharedString,
+    id: DrawingId,
+    current: VpDeltaScale,
+    muted: Hsla,
+) -> impl IntoElement {
+    let mut buttons = h_flex().gap_1();
+    for s in VpDeltaScale::ALL {
+        let scale = *s;
+        let is_active = scale == current;
+        let sym = symbol.clone();
+        let btn_id = SharedString::from(format!("frvp-scale-{}-{}", id, scale.label()));
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(scale.label()))
+            .xsmall();
+        btn = if is_active { btn.primary() } else { btn.ghost() };
+        btn = btn.on_click(move |_, _, cx| {
+            let sym = sym.clone();
+            mutate_frvp_params(sym, id, cx, |p| p.delta_scale = scale);
+        });
+        buttons = buttons.child(btn);
+    }
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("Scaling"))
+        .child(buttons)
+}
+
+fn frvp_width_row(
+    symbol: SharedString,
+    id: DrawingId,
+    params: &VolumeProfileParams,
+    muted: Hsla,
+) -> impl IntoElement {
+    let readout = SharedString::from(format!("{}%", params.width_pct));
+    let sym_dec = symbol.clone();
+    let sym_inc = symbol.clone();
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("Width"))
+        .child(
+            Button::new(SharedString::from(format!("frvp-w-dec-{}", id)))
+                .label(SharedString::from("\u{2212}"))
+                .xsmall()
+                .ghost()
+                .on_click(move |_, _, cx| {
+                    let sym = sym_dec.clone();
+                    mutate_frvp_params(sym, id, cx, |p| {
+                        let nxt = (p.width_pct as i32 - 5)
+                            .clamp(WIDTH_PCT_MIN as i32, WIDTH_PCT_MAX as i32);
+                        p.width_pct = nxt as u8;
+                    });
+                }),
+        )
+        .child(div().w(px(60.)).text_sm().child(readout))
+        .child(
+            Button::new(SharedString::from(format!("frvp-w-inc-{}", id)))
+                .label(SharedString::from("+"))
+                .xsmall()
+                .ghost()
+                .on_click(move |_, _, cx| {
+                    let sym = sym_inc.clone();
+                    mutate_frvp_params(sym, id, cx, |p| {
+                        let nxt = (p.width_pct as i32 + 5)
+                            .clamp(WIDTH_PCT_MIN as i32, WIDTH_PCT_MAX as i32);
+                        p.width_pct = nxt as u8;
+                    });
+                }),
+        )
+}
+
+fn frvp_anchor_row(
+    symbol: SharedString,
+    id: DrawingId,
+    current: AnchorEdge,
+    muted: Hsla,
+) -> impl IntoElement {
+    let mut buttons = h_flex().gap_1();
+    for a in AnchorEdge::ALL {
+        let anchor = *a;
+        let is_active = anchor == current;
+        let sym = symbol.clone();
+        let btn_id = SharedString::from(format!("frvp-anchor-{}-{}", id, anchor.label()));
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(anchor.label()))
+            .xsmall();
+        btn = if is_active { btn.primary() } else { btn.ghost() };
+        btn = btn.on_click(move |_, _, cx| {
+            let sym = sym.clone();
+            mutate_frvp_params(sym, id, cx, |p| p.anchor = anchor);
+        });
+        buttons = buttons.child(btn);
+    }
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("Anchor"))
+        .child(buttons)
+}
+
+fn frvp_toggle_row(
+    label: &'static str,
+    current: bool,
+    symbol: SharedString,
+    id: DrawingId,
+    muted: Hsla,
+    slot: &'static str,
+    write: fn(&mut VolumeProfileParams, bool),
+) -> impl IntoElement {
+    let btn_id = SharedString::from(format!("frvp-tog-{}-{}", id, slot));
+    let next = !current;
+    let mut btn = Button::new(btn_id)
+        .label(SharedString::from(if current { "On" } else { "Off" }))
+        .xsmall();
+    btn = if current { btn.primary() } else { btn.ghost() };
+    let sym = symbol.clone();
+    let btn = btn.on_click(move |_, _, cx| {
+        let sym = sym.clone();
+        mutate_frvp_params(sym, id, cx, |p| write(p, next));
+    });
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child(label))
+        .child(btn)
+}
+
+fn frvp_va_pct_row(
+    symbol: SharedString,
+    id: DrawingId,
+    params: &VolumeProfileParams,
+    muted: Hsla,
+) -> impl IntoElement {
+    let readout = SharedString::from(format!("{}%", params.va_percent));
+    let sym_dec = symbol.clone();
+    let sym_inc = symbol.clone();
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("VA %"))
+        .child(
+            Button::new(SharedString::from(format!("frvp-va-dec-{}", id)))
+                .label(SharedString::from("\u{2212}"))
+                .xsmall()
+                .ghost()
+                .on_click(move |_, _, cx| {
+                    let sym = sym_dec.clone();
+                    mutate_frvp_params(sym, id, cx, |p| {
+                        let nxt = (p.va_percent as i32 - 5)
+                            .clamp(VA_PERCENT_MIN as i32, VA_PERCENT_MAX as i32);
+                        p.va_percent = nxt as u8;
+                    });
+                }),
+        )
+        .child(div().w(px(60.)).text_sm().child(readout))
+        .child(
+            Button::new(SharedString::from(format!("frvp-va-inc-{}", id)))
+                .label(SharedString::from("+"))
+                .xsmall()
+                .ghost()
+                .on_click(move |_, _, cx| {
+                    let sym = sym_inc.clone();
+                    mutate_frvp_params(sym, id, cx, |p| {
+                        let nxt = (p.va_percent as i32 + 5)
+                            .clamp(VA_PERCENT_MIN as i32, VA_PERCENT_MAX as i32);
+                        p.va_percent = nxt as u8;
+                    });
+                }),
+        )
+}
+
 fn missing_body(msg: &'static str, color: Hsla) -> impl IntoElement {
     div()
         .p_4()
@@ -295,6 +660,10 @@ struct DrawingSnapshot {
     /// that knob.
     ray_extend_left: Option<bool>,
     text_font_size: Option<f32>,
+    /// FRVP-only: a clone of the persisted params. The settings window's
+    /// controls read defaults from here on every render and write back
+    /// through `DrawingService::set_vp_params`.
+    frvp_params: Option<VolumeProfileParams>,
 }
 
 trait DrawingRefProxy {
@@ -317,6 +686,10 @@ impl From<&Drawing> for DrawingSnapshot {
             DrawingShape::Text(t) => Some(t.font_size),
             _ => None,
         };
+        let frvp_params = match &d.shape {
+            DrawingShape::Frvp(f) => Some(f.params.clone()),
+            _ => None,
+        };
         Self {
             label: d.label(),
             hidden: d.hidden,
@@ -324,6 +697,7 @@ impl From<&Drawing> for DrawingSnapshot {
             origin: d.created_by,
             ray_extend_left,
             text_font_size,
+            frvp_params,
         }
     }
 }

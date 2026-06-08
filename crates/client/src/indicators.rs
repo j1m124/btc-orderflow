@@ -99,8 +99,8 @@ pub fn kind_entries() -> Vec<KindEntry> {
         },
         KindEntry {
             kind_id: "vrvp",
-            name: "Visible Range Volume Profile".into(),
-            description: "Per-price-bucket volume/delta histogram across the visible bar range".into(),
+            name: "VRVP".into(),
+            description: "Visible Range Volume Profile — per-price-bucket volume/delta histogram across the visible bar range".into(),
             category: Category::Volume,
             spawn: || Box::new(VrvpParams::default()),
         },

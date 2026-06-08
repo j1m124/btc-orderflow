@@ -56,7 +56,7 @@ impl Tool {
             Tool::Rectangle => "Rectangle",
             Tool::Fibonacci => "Fibonacci",
             Tool::AnchoredVwap => "Anchored VWAP",
-            Tool::FixedRangeVolumeProfile => "Fixed Range Volume Profile",
+            Tool::FixedRangeVolumeProfile => "FRVP",
             Tool::Text => "Text",
             Tool::Long => "Long",
             Tool::Short => "Short",
