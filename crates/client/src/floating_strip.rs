@@ -19,7 +19,11 @@ use gpui_component::{ActiveTheme as _, ElementExt as _, h_flex, v_flex};
 const GRIP_WIDTH: Pixels = px(14.);
 const STRIP_HEIGHT: Pixels = px(36.);
 const DEFAULT_WIDTH: Pixels = px(280.);
-const TOP_MARGIN: Pixels = px(8.);
+/// Default top inset for the strip when no persisted position is loaded.
+/// Sized to clear a standard chart panel tab/title bar (~32 px) plus a
+/// small breathing margin, so a fresh user sees the strip sit just below
+/// the panel header rather than overlapping it.
+const TOP_MARGIN: Pixels = px(44.);
 
 /// Emitted whenever the user finishes dragging the strip — workspace
 /// subscribes so it can persist the new origin to local storage. Not
@@ -107,7 +111,20 @@ impl FloatingStrip {
     }
 
     pub fn set_origin(&mut self, origin: Point<Pixels>, cx: &mut Context<Self>) {
-        self.origin = Some(self.clamp_origin(origin));
+        // Workspace setup calls this before the first layout, when
+        // `container_bounds` is still `Bounds::default()` (zero-size).
+        // Pre-clamping against a zero container collapses every position
+        // to (0, 0), which then gets re-persisted on the next drag and
+        // permanently strands the strip in the top-left corner. Defer
+        // clamping until layout — `on_container_layout` re-clamps any
+        // stored origin once real bounds arrive.
+        self.origin = Some(if self.container_bounds.size.width > px(0.)
+            && self.container_bounds.size.height > px(0.)
+        {
+            self.clamp_origin(origin)
+        } else {
+            origin
+        });
         cx.notify();
     }
 
@@ -117,7 +134,13 @@ impl FloatingStrip {
     pub fn set_default_origin(&mut self, origin: Point<Pixels>, cx: &mut Context<Self>) {
         self.default_origin = Some(origin);
         if self.origin.is_none() {
-            self.origin = Some(self.clamp_origin(origin));
+            self.origin = Some(if self.container_bounds.size.width > px(0.)
+                && self.container_bounds.size.height > px(0.)
+            {
+                self.clamp_origin(origin)
+            } else {
+                origin
+            });
             cx.notify();
         }
     }

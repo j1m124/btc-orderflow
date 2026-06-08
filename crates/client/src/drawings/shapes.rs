@@ -166,20 +166,29 @@ pub(crate) fn is_default_font_size(v: &f32) -> bool {
     (*v - 12.0).abs() < f32::EPSILON
 }
 
-/// Fixed Range Volume Profile (FRVP). User click-drags two time anchors;
-/// the painter aggregates per-price-bucket bid/ask volume across the
-/// `[a_time, b_time]` range and renders the profile inside that rect.
+/// Fixed Range Volume Profile (FRVP). User click-drags two corners; the
+/// painter aggregates per-price-bucket bid/ask volume across the
+/// `[a_time, b_time]` range and renders the profile.
 ///
-/// Geometry is time-only — no price endpoints. The profile spans the full
-/// vertical extent of the chart at paint time; the y axis follows the
-/// chart's price range, not a per-drawing locked range. Styling + bucket
-/// + mode all live inside `params` (shared with the VRVP indicator), so
-/// there are no top-level `color`/`width`/`label` fields — the strip
-/// suppresses those slots for this shape.
+/// The profile compute is time-only — only `a_time` / `b_time` feed the
+/// aggregator. `a_price` / `b_price` are *visual* anchors (the rectangle
+/// outline + corner resize handles) and do not clip the profile bars,
+/// which still span the chart's full vertical extent. Both prices are
+/// `Option` for backwards compatibility: legacy FRVPs persisted before
+/// price anchors existed load with `None`, and the painter falls back to
+/// the chart's edges for the bracket geometry.
+///
+/// Styling + bucket + mode all live inside `params` (shared with the VRVP
+/// indicator), so there are no top-level `color`/`width`/`label` fields —
+/// the strip suppresses those slots for this shape.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FrvpShape {
     pub a_time: i64,
     pub b_time: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b_price: Option<f64>,
     #[serde(default)]
     pub params: crate::volume_profile::VolumeProfileParams,
 }

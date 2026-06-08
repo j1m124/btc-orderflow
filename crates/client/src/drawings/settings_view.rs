@@ -12,12 +12,14 @@
 use std::collections::BTreeSet;
 
 use gpui::{
-    App, Context, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled as _, Window, div, px,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable as _,
     button::{Button, ButtonVariants as _},
+    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     h_flex, v_flex,
 };
 
@@ -43,19 +45,88 @@ use crate::volume_profile::{
 pub struct DrawingSettingsView {
     target: (SharedString, DrawingId),
     focus: FocusHandle,
+    /// FRVP-only colour pickers. Five slots in the canonical order
+    /// `(Volume, Bull, Bear, POC, VA)` — mirrors `VolumeProfileParams`'s
+    /// `color_*` fields. Rebuilt on `retarget` so flipping from an FRVP
+    /// to a non-FRVP drops the states cleanly; rebuilt to a fresh set
+    /// when switching between two FRVPs so each picker's popover state
+    /// starts from the new instance's persisted colour.
+    frvp_color_states: Vec<Entity<ColorPickerState>>,
+    /// Subscriptions parallel to `frvp_color_states`. Each closure
+    /// dispatches a `set_vp_params` write that flips just the
+    /// corresponding `color_*` field on the latest persisted params.
+    _frvp_color_subs: Vec<Subscription>,
+}
+
+/// Canonical slot ordering for FRVP colours. Keeps the picker → param
+/// field mapping unambiguous and lets `rebuild_frvp_color_states` loop
+/// once instead of per-slot.
+#[derive(Clone, Copy, Debug)]
+enum FrvpColorSlot {
+    Volume,
+    Bull,
+    Bear,
+    Poc,
+    Va,
+}
+
+impl FrvpColorSlot {
+    const ALL: &'static [FrvpColorSlot] = &[
+        FrvpColorSlot::Volume,
+        FrvpColorSlot::Bull,
+        FrvpColorSlot::Bear,
+        FrvpColorSlot::Poc,
+        FrvpColorSlot::Va,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            FrvpColorSlot::Volume => "Volume",
+            FrvpColorSlot::Bull => "Bull",
+            FrvpColorSlot::Bear => "Bear",
+            FrvpColorSlot::Poc => "POC",
+            FrvpColorSlot::Va => "VA",
+        }
+    }
+
+    fn read(self, p: &VolumeProfileParams) -> Hsla {
+        match self {
+            FrvpColorSlot::Volume => p.color_volume.into_hsla(),
+            FrvpColorSlot::Bull => p.color_bull.into_hsla(),
+            FrvpColorSlot::Bear => p.color_bear.into_hsla(),
+            FrvpColorSlot::Poc => p.color_poc.into_hsla(),
+            FrvpColorSlot::Va => p.color_va.into_hsla(),
+        }
+    }
+
+    fn write(self, p: &mut VolumeProfileParams, c: Hsla) {
+        use crate::volume_profile::params::ColorBlob;
+        let blob = ColorBlob::from_hsla(c);
+        match self {
+            FrvpColorSlot::Volume => p.color_volume = blob,
+            FrvpColorSlot::Bull => p.color_bull = blob,
+            FrvpColorSlot::Bear => p.color_bear = blob,
+            FrvpColorSlot::Poc => p.color_poc = blob,
+            FrvpColorSlot::Va => p.color_va = blob,
+        }
+    }
 }
 
 impl DrawingSettingsView {
     pub fn new(
         symbol: SharedString,
         id: DrawingId,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self {
+        let mut this = Self {
             target: (symbol, id),
             focus: cx.focus_handle(),
-        }
+            frvp_color_states: Vec::new(),
+            _frvp_color_subs: Vec::new(),
+        };
+        this.rebuild_frvp_color_states(window, cx);
+        this
     }
 
     /// Re-point the window at a different drawing. Used when the user
@@ -65,15 +136,62 @@ impl DrawingSettingsView {
         &mut self,
         symbol: SharedString,
         id: DrawingId,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.target = (symbol, id);
+        self.rebuild_frvp_color_states(window, cx);
         cx.notify();
     }
 
     pub fn current_target(&self) -> &(SharedString, DrawingId) {
         &self.target
+    }
+
+    /// (Re)build the FRVP color picker states for the current target.
+    /// Drops everything when the target isn't an FRVP — keeps the
+    /// non-FRVP render path free of stale subscriptions firing into a
+    /// shape that wouldn't accept the colour write anyway.
+    fn rebuild_frvp_color_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.frvp_color_states.clear();
+        self._frvp_color_subs.clear();
+        let (symbol, id) = self.target.clone();
+        let Some(handle) = cx.try_global::<DrawingServiceHandle>().cloned() else {
+            return;
+        };
+        let params = {
+            let svc = handle.0.read(cx);
+            let Some(d) = svc.for_symbol(symbol.as_ref()).iter().find(|d| d.id == id) else {
+                return;
+            };
+            match &d.shape {
+                DrawingShape::Frvp(f) => f.params.clone(),
+                _ => return,
+            }
+        };
+        for slot in FrvpColorSlot::ALL.iter().copied() {
+            let initial = slot.read(&params);
+            let state =
+                cx.new(|cx| ColorPickerState::new(window, cx).default_value(initial));
+            let sym = symbol.clone();
+            let sub = cx.subscribe(&state, move |_this, _state, ev: &ColorPickerEvent, cx| {
+                let ColorPickerEvent::Change(color) = ev;
+                let Some(c) = color else {
+                    // Clearing the picker resets the slot to the default
+                    // colour. Read the default from a fresh `Default`
+                    // params struct so future palette tweaks track
+                    // automatically.
+                    let defaults = VolumeProfileParams::default();
+                    let reset_color = slot.read(&defaults);
+                    mutate_frvp_params(sym.clone(), id, cx, |p| slot.write(p, reset_color));
+                    return;
+                };
+                let c = *c;
+                mutate_frvp_params(sym.clone(), id, cx, |p| slot.write(p, c));
+            });
+            self.frvp_color_states.push(state);
+            self._frvp_color_subs.push(sub);
+        }
     }
 }
 
@@ -109,9 +227,12 @@ impl Render for DrawingSettingsView {
             DrawingOrigin::Ai => "AI-drawn",
         };
 
+        // Body content is accumulated separately and then wrapped in a
+        // scrollable div, so windows whose content exceeds the FloatingWindow
+        // height stay usable. Inner uses `.w_full()` (not `.size_full()`)
+        // per the CLAUDE.md scroll gotcha.
         let mut root = v_flex()
-            .id(SharedString::from(format!("drawing-settings-{}", id)))
-            .size_full()
+            .w_full()
             .p_4()
             .gap_4()
             .child(
@@ -242,11 +363,18 @@ impl Render for DrawingSettingsView {
         // ── FRVP-only: full VolumeProfile form ──────────────────────────
         // Mirrors the VRVP form in `indicator_settings.rs::render_vrvp` but
         // writes through `DrawingService::set_vp_params` instead of going
-        // through the indicator path. Colour editing is deferred to
-        // Phase 15 polish; mode / scaling / bucket / VA / show toggles
-        // are all live.
+        // through the indicator path. Colour pickers are mode-aware: the
+        // Bull/Bear slots only render in Delta / Volume+Delta modes
+        // because they're only consumed there.
         if let Some(params) = snap.frvp_params.clone() {
-            root = root.child(frvp_section(symbol.clone(), id, &params, muted, border));
+            root = root.child(frvp_section(
+                symbol.clone(),
+                id,
+                &params,
+                &self.frvp_color_states,
+                muted,
+                border,
+            ));
         }
 
         // ── Text-only: font-size chips ──────────────────────────────────
@@ -280,7 +408,19 @@ impl Render for DrawingSettingsView {
             );
         }
 
-        root.into_any_element()
+        v_flex()
+            .id(SharedString::from(format!("drawing-settings-{}", id)))
+            .size_full()
+            .child(
+                div()
+                    .id(SharedString::from(format!("drawing-settings-scroll-{}", id)))
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(root),
+            )
+            .into_any_element()
     }
 }
 
@@ -336,6 +476,7 @@ fn frvp_section(
     symbol: SharedString,
     id: DrawingId,
     params: &VolumeProfileParams,
+    color_states: &[Entity<ColorPickerState>],
     muted: Hsla,
     border: Hsla,
 ) -> impl IntoElement {
@@ -381,6 +522,30 @@ fn frvp_section(
             mutate_frvp_params(sym, id, cx, |p| p.reset_styles());
         });
 
+    // Colour pickers — mode-conditional. Volume is always relevant;
+    // Bull/Bear only matter for Delta + Volume+Delta-outline; POC/VA
+    // are tied to the reference-level toggles below them but render
+    // unconditionally for consistency (toggling the line off still
+    // leaves the slot meaningful for re-enabling later).
+    let mut colors = v_flex().gap_2().child(section_label("Colors", muted));
+    let mode = params.render_mode;
+    let show_bull_bear = matches!(mode, VpRenderMode::Delta | VpRenderMode::VolDeltaOutline);
+    let show_volume = !matches!(mode, VpRenderMode::Delta);
+    for (idx, slot) in FrvpColorSlot::ALL.iter().copied().enumerate() {
+        let visible = match slot {
+            FrvpColorSlot::Volume => show_volume,
+            FrvpColorSlot::Bull | FrvpColorSlot::Bear => show_bull_bear,
+            FrvpColorSlot::Poc | FrvpColorSlot::Va => true,
+        };
+        if !visible {
+            continue;
+        }
+        let Some(state) = color_states.get(idx) else {
+            continue;
+        };
+        colors = colors.child(frvp_color_row(slot.label(), state, muted));
+    }
+
     v_flex()
         .gap_3()
         .child(div().h(px(1.)).bg(border))
@@ -388,7 +553,21 @@ fn frvp_section(
         .child(layout)
         .child(div().h(px(1.)).bg(border))
         .child(levels)
+        .child(div().h(px(1.)).bg(border))
+        .child(colors)
         .child(reset_btn)
+}
+
+fn frvp_color_row(
+    label: &'static str,
+    state: &Entity<ColorPickerState>,
+    muted: Hsla,
+) -> impl IntoElement {
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child(label))
+        .child(ColorPicker::new(state).small())
 }
 
 fn frvp_bucket_row(

@@ -257,6 +257,12 @@ pub fn shape_to_view(
             id: service.id,
             t0: t2i(f.a_time),
             t1: t2i(f.b_time),
+            // Visual price anchors round-trip directly — None for legacy
+            // shapes (which the painter falls back to chart-edge bracket
+            // geometry for), Some for shapes created since the price
+            // anchors landed.
+            p0: f.a_price,
+            p1: f.b_price,
             // Clone params so the paint closure (which is `'static`) doesn't
             // need to borrow back into the service. Cheap — a small struct
             // of primitives + 5 colour blobs.
@@ -468,17 +474,23 @@ pub fn view_to_shape(
             }
             DrawingShape::AnchoredVwap(s)
         }
-        ViewDrawing::Frvp { t0, t1, params, output: _, .. } => {
+        ViewDrawing::Frvp { t0, t1, p0, p1, params, output: _, .. } => {
             use crate::drawings::shapes::FrvpShape;
-            // Persisted range is normalized so `a_time <= b_time` regardless
-            // of which order the user dragged the bracket. The painter
-            // doesn't care about ordering but keeping it normalized makes
-            // the JSON easier to reason about + future hit-tests simpler.
-            let (a, b) = (i2t(*t0), i2t(*t1));
-            let (a_time, b_time) = if a <= b { (a, b) } else { (b, a) };
+            // Persisted range is normalized so `a_time <= b_time`. The
+            // price anchors travel with their corresponding time anchor
+            // so the (a, b) pairing stays consistent — a body drag that
+            // moves the rectangle right shouldn't flip which corner is
+            // "A" just because (t0, t1) crossed.
+            let (a_t, a_p, b_t, b_p) = if *t0 <= *t1 {
+                (i2t(*t0), *p0, i2t(*t1), *p1)
+            } else {
+                (i2t(*t1), *p1, i2t(*t0), *p0)
+            };
             let mut s = FrvpShape {
-                a_time,
-                b_time,
+                a_time: a_t,
+                b_time: b_t,
+                a_price: a_p,
+                b_price: b_p,
                 params: params.clone(),
             };
             if let Some(DrawingShape::Frvp(prev)) = baseline {

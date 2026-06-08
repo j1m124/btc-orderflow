@@ -26,6 +26,63 @@ use super::params::{AnchorEdge, VolumeProfileParams, VpDeltaScale, VpRenderMode}
 /// the tail-end of the snapshot.
 const COVERAGE_THRESHOLD: f32 = 0.95;
 
+/// Alpha multiplier applied to per-bucket bar colours that fall OUTSIDE the
+/// value area when the "highlight VA" toggle is on. The VA bars keep their
+/// configured alpha; the rest dim down so the value-area pocket pops without
+/// painting a backdrop tint. 0.30 picked empirically — low enough to read as
+/// "muted" against most themes, high enough that the bucket geometry is
+/// still legible.
+const NON_VA_DIM_ALPHA: f32 = 0.30;
+
+/// True iff `bucket`'s price span overlaps the value-area band `[val, vah]`.
+/// Half-open / inclusive both ends — a bucket whose edge touches `val` or
+/// `vah` is treated as inside so the boundary buckets don't flicker between
+/// dim and bright depending on float rounding.
+#[inline]
+fn bucket_in_va(b: &VpBucket, vah: f64, val: f64) -> bool {
+    b.price_low <= vah && b.price_high >= val
+}
+
+/// Pre-resolved VA dimming context. `None` → no dimming this paint pass
+/// (toggle off, coverage too low, or VA bounds not materialized). Carried
+/// through to the per-bucket loop so the inner test is a single bounds
+/// check rather than re-evaluating params + output every iteration.
+#[derive(Clone, Copy)]
+struct DimCtx {
+    vah: f64,
+    val: f64,
+}
+
+fn dim_ctx(params: &VolumeProfileParams, output: &VolumeProfileOutput) -> Option<DimCtx> {
+    // Note: only `show_va_highlight` gates the dimming. `show_va` controls
+    // the VAH / VAL reference *lines* — turning those off should not also
+    // turn off the bucket dim, which is a separate visual layer the user
+    // may want even when the lines themselves are noise.
+    if !params.show_va_highlight {
+        return None;
+    }
+    if output.coverage_pct < COVERAGE_THRESHOLD {
+        return None;
+    }
+    match (output.vah_price, output.val_price) {
+        (Some(vah), Some(val)) => Some(DimCtx { vah, val }),
+        _ => None,
+    }
+}
+
+/// Apply non-VA dimming to `base` when `dim` is set and the bucket sits
+/// outside the value area. Otherwise returns `base` unchanged.
+#[inline]
+fn bucket_color(base: Hsla, b: &VpBucket, dim: Option<DimCtx>) -> Hsla {
+    match dim {
+        Some(d) if !bucket_in_va(b, d.vah, d.val) => Hsla {
+            a: base.a * NON_VA_DIM_ALPHA,
+            ..base
+        },
+        _ => base,
+    }
+}
+
 /// Paint the volume profile inside the price pane spanning
 /// `chart_top..chart_bottom` vertically and `chart_left..chart_left + chart_w`
 /// horizontally. All inputs are canvas-relative `f32`s (the same convention
@@ -69,28 +126,25 @@ pub fn paint_volume_profile(
         chart_top + t * pane_h
     };
 
-    // VA highlight goes first so the per-bucket bars (which follow) paint
-    // on top of the highlight band — preserves the cleaner bar outline.
     let render_levels = output.coverage_pct >= COVERAGE_THRESHOLD;
-    if render_levels && params.show_va_highlight && params.show_va {
-        paint_va_highlight(
-            window, origin, chart_left, chart_w, params, output, &price_to_y, chart_top,
-            chart_bottom,
-        );
-    }
+    // Non-VA dimming is the inverse of the old "highlight VA buckets" filled
+    // band: instead of tinting the VA region, attenuate the bars outside it
+    // so the value-area pocket stands out by *contrast*. Predicate is hoisted
+    // once and reused inside the per-mode loops below.
+    let dim = dim_ctx(params, output);
 
     match params.render_mode {
         VpRenderMode::Volume => paint_volume_mode(
             window, origin, anchor_x, band_w, params, output, &price_to_y, chart_top,
-            chart_bottom,
+            chart_bottom, dim,
         ),
         VpRenderMode::Delta => paint_delta_mode(
             window, origin, anchor_x, band_w, params, output, &price_to_y, chart_top,
-            chart_bottom,
+            chart_bottom, dim,
         ),
         VpRenderMode::VolDeltaOutline => paint_vol_delta_outline_mode(
             window, origin, anchor_x, band_w, params, output, &price_to_y, chart_top,
-            chart_bottom,
+            chart_bottom, dim,
         ),
     }
 
@@ -119,6 +173,7 @@ fn paint_volume_mode(
     price_to_y: &dyn Fn(f64) -> f32,
     chart_top: f32,
     chart_bottom: f32,
+    dim: Option<DimCtx>,
 ) {
     let max_total = output
         .buckets
@@ -128,7 +183,7 @@ fn paint_volume_mode(
     if max_total <= 0.0 {
         return;
     }
-    let color = params.color_volume.into_hsla();
+    let base_color = params.color_volume.into_hsla();
     for b in &output.buckets {
         // Buckets are sorted ascending by `price_low`; the *top* of a row
         // in screen space corresponds to its *high* edge.
@@ -148,6 +203,7 @@ fn paint_volume_mode(
             AnchorEdge::Right => anchor_x - bar_w,
             AnchorEdge::Left => anchor_x,
         };
+        let color = bucket_color(base_color, b, dim);
         fill_rect(window, origin, x, bar_w, y_top_c, h, color);
     }
 }
@@ -169,6 +225,7 @@ fn paint_delta_mode(
     price_to_y: &dyn Fn(f64) -> f32,
     chart_top: f32,
     chart_bottom: f32,
+    dim: Option<DimCtx>,
 ) {
     // `WholeProfile` needs a global denominator — compute once.
     let global_max_abs_delta = output
@@ -200,13 +257,14 @@ fn paint_delta_mode(
             AnchorEdge::Right => anchor_x - bar_w,
             AnchorEdge::Left => anchor_x,
         };
-        let color = if b.delta > 0.0 {
+        let base = if b.delta > 0.0 {
             bull
         } else if b.delta < 0.0 {
             bear
         } else {
             neutral
         };
+        let color = bucket_color(base, b, dim);
         fill_rect(window, origin, x, bar_w, y_top_c, h, color);
     }
 }
@@ -228,6 +286,7 @@ fn paint_vol_delta_outline_mode(
     price_to_y: &dyn Fn(f64) -> f32,
     chart_top: f32,
     chart_bottom: f32,
+    dim: Option<DimCtx>,
 ) {
     let max_total = output
         .buckets
@@ -237,7 +296,7 @@ fn paint_vol_delta_outline_mode(
     if max_total <= 0.0 {
         return;
     }
-    let outline = params.color_volume.into_hsla();
+    let outline_base = params.color_volume.into_hsla();
     let bull = params.color_bull.into_hsla();
     let bear = params.color_bear.into_hsla();
     for b in &output.buckets {
@@ -255,6 +314,7 @@ fn paint_vol_delta_outline_mode(
             AnchorEdge::Right => anchor_x - outer_w,
             AnchorEdge::Left => anchor_x,
         };
+        let outline = bucket_color(outline_base, b, dim);
         stroke_rect(window, origin, outer_x, outer_w, y_top_c, h, outline, 1.0);
         // Inner (delta) bar — anchored to the same edge as the outer; per-row
         // scaling so `inner_w <= outer_w` always.
@@ -267,7 +327,8 @@ fn paint_vol_delta_outline_mode(
             AnchorEdge::Right => anchor_x - inner_w,
             AnchorEdge::Left => anchor_x,
         };
-        let inner_color = if b.delta > 0.0 { bull } else { bear };
+        let inner_base = if b.delta > 0.0 { bull } else { bear };
+        let inner_color = bucket_color(inner_base, b, dim);
         fill_rect(window, origin, inner_x, inner_w, y_top_c, h, inner_color);
     }
 }
@@ -320,41 +381,6 @@ fn fill_rect(
         border_color: gpui::transparent_black(),
         border_style: BorderStyle::default(),
     });
-}
-
-/// Paint the value-area highlight band — a low-alpha tint covering the
-/// full pane width from VAL to VAH. Sits *below* the per-bucket bars so
-/// the bars remain crisp. No-op if VA bounds aren't materialized yet.
-fn paint_va_highlight(
-    window: &mut Window,
-    origin: Point<Pixels>,
-    chart_left: f32,
-    chart_w: f32,
-    params: &VolumeProfileParams,
-    output: &VolumeProfileOutput,
-    price_to_y: &dyn Fn(f64) -> f32,
-    chart_top: f32,
-    chart_bottom: f32,
-) {
-    let (Some(vah), Some(val)) = (output.vah_price, output.val_price) else {
-        return;
-    };
-    // y_top = price_to_y(vah), y_bot = price_to_y(val) — VAH is the upper
-    // price so it maps to smaller y; VAL to larger y.
-    let y_top = price_to_y(vah).max(chart_top);
-    let y_bot = price_to_y(val).min(chart_bottom);
-    let h = (y_bot - y_top).max(0.0);
-    if h <= 0.0 {
-        return;
-    }
-    // Soft tint — the configured `color_va` (alpha 0.6 by default) gets
-    // further attenuated so the highlight reads as a backdrop, not a fill.
-    let base = params.color_va.into_hsla();
-    let tint = Hsla {
-        a: base.a * 0.20,
-        ..base
-    };
-    fill_rect(window, origin, chart_left, chart_w, y_top, h, tint);
 }
 
 /// Paint POC / VAH / VAL reference lines + optional right-edge labels.

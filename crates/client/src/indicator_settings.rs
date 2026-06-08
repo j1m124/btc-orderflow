@@ -16,8 +16,8 @@
 
 use gpui::{
     Action, App, AppContext as _, Context, Entity, FocusHandle, Focusable, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
-    Subscription, WeakEntity, Window, div, px,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable as _,
@@ -196,9 +196,13 @@ impl Render for IndicatorSettingsView {
             .collect();
         let has_color_section = !color_rows.is_empty();
 
-        let mut root = v_flex()
-            .id(SharedString::from(format!("indicator-settings-{}", id)))
-            .size_full()
+        // Form body lives inside a scrollable container so windows whose
+        // content exceeds the FloatingWindow's height stay usable. Per the
+        // CLAUDE.md gotcha, the inner content uses `.w_full()` (not
+        // `.size_full()`) so the outer `overflow_y_scroll` actually has
+        // something to scroll against.
+        let mut body = v_flex()
+            .w_full()
             .p_4()
             .gap_3()
             .child(
@@ -210,11 +214,23 @@ impl Render for IndicatorSettingsView {
             .child(div().h(px(1.)).bg(cx.theme().border))
             .child(kind_body);
         if has_color_section {
-            root = root
+            body = body
                 .child(div().h(px(1.)).bg(cx.theme().border))
                 .child(v_flex().gap_2().children(color_rows));
         }
-        root.into_any_element()
+        v_flex()
+            .id(SharedString::from(format!("indicator-settings-{}", id)))
+            .size_full()
+            .child(
+                div()
+                    .id(SharedString::from(format!("indicator-settings-scroll-{}", id)))
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .into_any_element()
     }
 }
 

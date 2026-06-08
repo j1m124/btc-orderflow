@@ -274,7 +274,18 @@ pub struct DrawingStripPosition {
 }
 
 pub fn load_drawing_strip_position() -> Option<DrawingStripPosition> {
-    load_json_opt(DRAWING_STRIP_POS_KEY)
+    // A historical clamp-before-layout bug in `FloatingStrip::set_origin`
+    // (now fixed) silently rewrote every persisted position to (0, 0)
+    // on load and re-saved it on the next move. Treat a stored (0, 0)
+    // as "no usable position" so users who got bitten fall back to the
+    // current default origin instead of staying stranded in the
+    // top-left corner. The strip can never be legitimately stored at
+    // (0, 0) anyway — its sensible default is below the chart header.
+    let pos = load_json_opt::<DrawingStripPosition>(DRAWING_STRIP_POS_KEY)?;
+    if pos.x.abs() < f32::EPSILON && pos.y.abs() < f32::EPSILON {
+        return None;
+    }
+    Some(pos)
 }
 
 pub fn save_drawing_strip_position(pos: DrawingStripPosition) -> Result<()> {

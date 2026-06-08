@@ -274,17 +274,25 @@ pub enum Drawing {
     /// Fixed-Range Volume Profile. `t0` / `t1` are fractional bar
     /// indices; the painter aggregates per-bucket bid/ask volume over
     /// the corresponding wall-clock time range and renders the profile
-    /// inside the bracket. `params` is a snapshot of the persisted
-    /// `VolumeProfileParams` so paint doesn't have to re-read the
-    /// service inside its `'static` closure. `output` is the precomputed
-    /// per-bucket aggregate — built at chart-render time using the
-    /// chart's footprint cell cache. `None` when cells for the
-    /// instance's bucket haven't loaded yet (paint then draws just the
-    /// bracket so the user sees the geometry while waiting).
+    /// inside the bracket. `p0` / `p1` are the visual price anchors —
+    /// they paint a rectangle outline + give the user 2 corner handles
+    /// for resize, but do NOT clip the profile bars (which always span
+    /// the chart's full vertical extent). `None` on legacy FRVPs that
+    /// predated price anchors; paint then falls back to the chart edges
+    /// and the rectangle reduces to two vertical hairlines.
+    /// `params` is a snapshot of the persisted `VolumeProfileParams` so
+    /// paint doesn't have to re-read the service inside its `'static`
+    /// closure. `output` is the precomputed per-bucket aggregate —
+    /// built at chart-render time using the chart's footprint cell
+    /// cache. `None` when cells for the instance's bucket haven't
+    /// loaded yet (paint then draws just the bracket so the user sees
+    /// the geometry while waiting).
     Frvp {
         id: DrawingId,
         t0: f32,
         t1: f32,
+        p0: Option<f64>,
+        p1: Option<f64>,
         params: crate::volume_profile::VolumeProfileParams,
         output: Option<crate::volume_profile::VolumeProfileOutput>,
     },
@@ -519,14 +527,23 @@ impl CreatingDrawing {
                 }
             }
             CreatingDrawing::Frvp { a, b } => {
-                // Order anchors so `t0 <= t1` — the persisted shape gets
-                // re-normalized in `view_to_shape` regardless, but this
-                // keeps the preview consistent with the eventual paint.
-                let (t0, t1) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
+                // Order time anchors so `t0 <= t1`. Price anchors are kept
+                // paired with their respective time corner so the diagonal
+                // of the drag (which way the user moved) is preserved on
+                // commit — the persisted shape stores `(a_time, a_price)`
+                // as the start of the drag and `(b_time, b_price)` as the
+                // end, regardless of which order the user dragged.
+                let ((t0, p0), (t1, p1)) = if a.0 <= b.0 {
+                    ((a.0, a.1), (b.0, b.1))
+                } else {
+                    ((b.0, b.1), (a.0, a.1))
+                };
                 Drawing::Frvp {
                     id,
                     t0,
                     t1,
+                    p0: Some(p0),
+                    p1: Some(p1),
                     params: crate::volume_profile::VolumeProfileParams {
                         // FRVP defaults to a Left anchor — matches the
                         // design call from the grilling that VRVP is
@@ -2061,13 +2078,13 @@ fn render_synthetic_render_chip(
     chip.into_any_element()
 }
 
-/// Render the main-pane vertical indicator list — a header chip
-/// `Indicators (N) ▼/▶` that toggles `state.indicators_collapsed`, plus a
-/// stack of overlay-indicator chips below it when expanded. The synthetic
-/// render chip (Candlestick / Cluster / Profile) is pinned at the top of
-/// the chip stack — always visible regardless of `indicators_collapsed`,
-/// since the render kind is the chart's primary mode rather than an
-/// optional overlay.
+/// Render the main-pane vertical indicator list — the synthetic render
+/// chip (Candlestick / Cluster / Profile) on top, the per-overlay chips
+/// below it, and a chevron-only collapse button pinned at the bottom of
+/// the stack. Collapsing hides the render chip + overlay chips alike,
+/// leaving only the chevron visible — pointed by the design ask to keep
+/// the canvas as uncluttered as possible until the user explicitly
+/// expands.
 ///
 /// Pane-placed indicators are NOT included here; they each get their own
 /// chip rendered at the top-left of their sub-pane (`render_sub_pane_chip`).
@@ -2078,13 +2095,21 @@ fn render_main_indicator_list(
     cx: &mut Context<super::ContentPanel>,
 ) -> gpui::AnyElement {
     let collapsed = state.indicators_collapsed;
+    let chevron = if collapsed { "\u{25BC}" } else { "\u{25B2}" }; // ▼ / ▲
+    // Count of *overlay* indicators only (the things actually hidden by
+    // collapse — the render chip's mode is shown in the gear-window
+    // chrome regardless). Shown next to the chevron when collapsed so
+    // the user knows at a glance whether expanding will reveal anything.
     let overlay_count = state
         .indicators()
         .iter()
         .filter(|i| i.placement == Placement::Overlay)
         .count();
-    let chevron = if collapsed { "\u{25B6}" } else { "\u{25BC}" }; // ▶ / ▼
-    let header_label = SharedString::from(format!("Indicators ({}) {}", overlay_count, chevron));
+    let toggle_label = if collapsed {
+        SharedString::from(format!("{} {}", overlay_count, chevron))
+    } else {
+        SharedString::from(chevron)
+    };
     let (theme_border, theme_muted_fg, theme_bg, hover_bg) = {
         let theme = cx.theme();
         (
@@ -2097,12 +2122,15 @@ fn render_main_indicator_list(
             },
         )
     };
-    let header = h_flex()
-        .id(SharedString::from("indicator-list-header"))
-        .gap_1()
-        .px_2()
-        .py(px(2.))
+    // Chevron-only toggle. Compact (one glyph, tight padding) so it reads
+    // as a control rather than a chip — there's no label text per the
+    // design ask.
+    let toggle = h_flex()
+        .id(SharedString::from("indicator-list-toggle"))
+        .px(px(6.))
+        .py(px(1.))
         .items_center()
+        .justify_center()
         .rounded(px(4.))
         .border_1()
         .border_color(theme_border)
@@ -2120,29 +2148,26 @@ fn render_main_indicator_list(
                 }
             }),
         )
-        .child(div().child(header_label));
-    let chips = if collapsed {
-        Vec::new()
-    } else {
-        render_indicator_chips_filtered(state, cx, |i| i.placement == Placement::Overlay)
-    };
-    let render_chip = render_synthetic_render_chip(state, cx);
+        .child(div().child(toggle_label));
     // Absolute-anchored at the main canvas's top-left (mirrors the
     // pre-move OHLC pill's `top(8) left(8)`). `items_start` so each chip
     // auto-sizes to its content rather than stretching to fill the longest.
-    // Render chip pinned above the header so it stays visible when the
-    // user collapses the indicator list — render kind is the chart's
-    // primary mode, not an optional overlay.
-    v_flex()
+    // When collapsed, only the chevron toggle is rendered — the render
+    // chip and overlay chips are both hidden so the canvas stays clear.
+    let mut stack = v_flex()
         .absolute()
         .top(px(8.0))
         .left(px(8.0))
         .gap_1()
-        .items_start()
-        .child(render_chip)
-        .child(header)
-        .children(chips)
-        .into_any_element()
+        .items_start();
+    if !collapsed {
+        let render_chip = render_synthetic_render_chip(state, cx);
+        let chips = render_indicator_chips_filtered(state, cx, |i| {
+            i.placement == Placement::Overlay
+        });
+        stack = stack.child(render_chip).children(chips);
+    }
+    stack.child(toggle).into_any_element()
 }
 
 /// Format an indicator's `ValueReadout` for the chip label. `None` slots
@@ -2335,12 +2360,19 @@ impl Drawing {
                 *take_profit += dp;
                 *stop_loss += dp;
             }
-            // FRVP geometry is time-only — vertical drag is meaningless
-            // (the profile spans the full pane regardless), so only the
-            // time component shifts.
-            Drawing::Frvp { t0, t1, .. } => {
+            // FRVP — time anchors always shift. Price anchors shift only
+            // when present (legacy FRVPs that never had price anchors
+            // stay None, so their bracket continues to span the chart's
+            // full vertical extent on every paint).
+            Drawing::Frvp { t0, t1, p0, p1, .. } => {
                 *t0 += dt;
                 *t1 += dt;
+                if let Some(p) = p0 {
+                    *p += dp;
+                }
+                if let Some(p) = p1 {
+                    *p += dp;
+                }
             }
         }
     }
@@ -2355,6 +2387,13 @@ impl Drawing {
                 | Drawing::Arrow { a, .. }
                 | Drawing::Fibonacci { a, .. } => *a = pt,
                 Drawing::HorizontalRay { anchor, .. } => *anchor = pt,
+                // FRVP A-corner: (t0, p0). Price is wrapped so legacy
+                // shapes that never had a price anchor materialize one
+                // the first time the user drags a corner.
+                Drawing::Frvp { t0, p0, .. } => {
+                    *t0 = pt.0;
+                    *p0 = Some(pt.1);
+                }
                 _ => {}
             },
             EditHandle::EndpointB => match self {
@@ -2362,6 +2401,10 @@ impl Drawing {
                 | Drawing::Rect { b, .. }
                 | Drawing::Arrow { b, .. }
                 | Drawing::Fibonacci { b, .. } => *b = pt,
+                Drawing::Frvp { t1, p1, .. } => {
+                    *t1 = pt.0;
+                    *p1 = Some(pt.1);
+                }
                 _ => {}
             },
             // Body + position handles handled outside (translate / apply_edit
@@ -2385,6 +2428,21 @@ impl Drawing {
             Drawing::HorizontalRay { anchor, .. } => {
                 vec![(EditHandle::EndpointA, *anchor)]
             }
+            // FRVP exposes opposite-corner handles only when both price
+            // anchors are present (i.e. NOT a legacy time-only shape).
+            // Legacy shapes have no resizable handles — body drag still
+            // works, and editing prices via the gear window would be a
+            // follow-up if anyone needs to upgrade old shapes in place.
+            Drawing::Frvp {
+                t0,
+                t1,
+                p0: Some(p0),
+                p1: Some(p1),
+                ..
+            } => vec![
+                (EditHandle::EndpointA, (*t0, *p0)),
+                (EditHandle::EndpointB, (*t1, *p1)),
+            ],
             _ => Vec::new(),
         }
     }
@@ -2412,6 +2470,16 @@ fn apply_edit(out: &mut Drawing, baseline: &Drawing, handle: EditHandle, dt: f32
                 }
                 // Horizontal ray only has the A anchor; B doesn't apply.
                 Drawing::HorizontalRay { anchor, .. } if handle == EditHandle::EndpointA => *anchor,
+                // FRVP — corner drag against the matching (t, p) anchor.
+                // Only fires for shapes that surfaced handles in the
+                // first place, so price unwrap is safe.
+                Drawing::Frvp { t0, t1, p0: Some(p0), p1: Some(p1), .. } => {
+                    if handle == EditHandle::EndpointA {
+                        (*t0, *p0)
+                    } else {
+                        (*t1, *p1)
+                    }
+                }
                 _ => return,
             };
             out.set_endpoint(handle, (baseline_pt.0 + dt, baseline_pt.1 + dp));
@@ -2642,22 +2710,40 @@ fn hit_test_drawings(
                     return Some((d.id(), EditHandle::Body));
                 }
             }
-            Drawing::Frvp { t0, t1, .. } => {
-                // FRVP body hit: cursor inside the time bracket at any
-                // y. The bracket spans the full chart height visually, so
-                // a single y-range test isn't needed — only the x range
-                // is meaningful. Adds a small horizontal margin so the
-                // user can grab the bracket edges, not just the
-                // (potentially empty) interior.
+            Drawing::Frvp { t0, t1, p0, p1, .. } => {
+                // FRVP body hit. Two shapes:
+                //  - Modern (both prices Some): rectangle hit-test like
+                //    Rect — pt inside (xmin..xmax × ymin..ymax). Lets the
+                //    user click anywhere inside the painted rect to drag
+                //    it without snagging the underlying chart.
+                //  - Legacy (price None): the original full-canvas-height
+                //    bracket test — only x range matters because the
+                //    bracket renders edge-to-edge vertically.
                 let (x0, _) = to_screen((*t0, 0.0));
                 let (x1, _) = to_screen((*t1, 0.0));
                 let (xmin, xmax) = (x0.min(x1), x0.max(x1));
-                if pt_x >= xmin - DRAWING_STROKE_HIT_PX
-                    && pt_x <= xmax + DRAWING_STROKE_HIT_PX
-                    && pt_y >= 0.0
-                    && pt_y <= canvas_h
-                {
-                    return Some((d.id(), EditHandle::Body));
+                match (p0, p1) {
+                    (Some(a_price), Some(b_price)) => {
+                        let (_, y0) = to_screen((*t0, *a_price));
+                        let (_, y1) = to_screen((*t1, *b_price));
+                        let (ymin, ymax) = (y0.min(y1), y0.max(y1));
+                        if pt_x >= xmin - DRAWING_STROKE_HIT_PX
+                            && pt_x <= xmax + DRAWING_STROKE_HIT_PX
+                            && pt_y >= ymin - DRAWING_STROKE_HIT_PX
+                            && pt_y <= ymax + DRAWING_STROKE_HIT_PX
+                        {
+                            return Some((d.id(), EditHandle::Body));
+                        }
+                    }
+                    _ => {
+                        if pt_x >= xmin - DRAWING_STROKE_HIT_PX
+                            && pt_x <= xmax + DRAWING_STROKE_HIT_PX
+                            && pt_y >= 0.0
+                            && pt_y <= canvas_h
+                        {
+                            return Some((d.id(), EditHandle::Body));
+                        }
+                    }
                 }
             }
         }
