@@ -87,6 +87,11 @@ pub struct FloatingWindow {
     show_close: bool,
     show_resize: bool,
     min_size: Size<Pixels>,
+    /// When true, a mouse-down on the overlay layer *outside* the card
+    /// emits [`DismissEvent`]. The card itself stops propagation on
+    /// mouse-down, so clicks inside (including title-bar drag, resize
+    /// handle, and content) never reach this handler.
+    dismiss_on_outside_click: bool,
 }
 
 impl FloatingWindow {
@@ -112,6 +117,7 @@ impl FloatingWindow {
             show_close: true,
             show_resize: true,
             min_size: MIN_SIZE,
+            dismiss_on_outside_click: false,
         }
     }
 
@@ -137,6 +143,14 @@ impl FloatingWindow {
     /// (320 × 200).
     pub fn with_min_size(mut self, min: Size<Pixels>) -> Self {
         self.min_size = min;
+        self
+    }
+
+    /// Dismiss the window when the user clicks anywhere outside the card.
+    /// Off by default — opt in for transient settings popovers where the
+    /// outside-click gesture is the expected close affordance.
+    pub fn with_dismiss_on_outside_click(mut self, dismiss: bool) -> Self {
+        self.dismiss_on_outside_click = dismiss;
         self
     }
 
@@ -353,6 +367,18 @@ impl Render for FloatingWindow {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, w, cx| this.on_mouse_up(w, cx)),
             );
+
+        if self.dismiss_on_outside_click {
+            // Card stops propagation on its own mouse_down, so this only
+            // fires for clicks outside the card. We intentionally do NOT
+            // stop_propagation here — the click should still reach whatever
+            // is under the layer (e.g. the chart canvas) so the same click
+            // that dismisses can also act on the target below.
+            layer = layer.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _w, cx| this.close(cx)),
+            );
+        }
 
         if placed {
             let mut card = v_flex()

@@ -523,8 +523,10 @@ impl TerminalWorkspace {
         }
         let view = cx.new(|cx| IndicatorSettingsView::new(target, instance_id, window, cx));
         let content: AnyView = view.clone().into();
-        let win =
-            cx.new(|cx| FloatingWindow::new("Indicator Settings", content, window, cx));
+        let win = cx.new(|cx| {
+            FloatingWindow::new("Indicator Settings", content, window, cx)
+                .with_dismiss_on_outside_click(true)
+        });
         cx.subscribe_in(&win, window, |this, _w, _ev: &DismissEvent, _window, cx| {
             // Defer the drop: gpui_web's pointer dispatcher still holds
             // `WebWindowCallbacks` when DismissEvent fires from a click on the
@@ -613,7 +615,10 @@ impl TerminalWorkspace {
             crate::drawings::settings_view::DrawingSettingsView::new(symbol, id, window, cx)
         });
         let content: AnyView = view.clone().into();
-        let win = cx.new(|cx| FloatingWindow::new("Drawing Settings", content, window, cx));
+        let win = cx.new(|cx| {
+            FloatingWindow::new("Drawing Settings", content, window, cx)
+                .with_dismiss_on_outside_click(true)
+        });
         cx.subscribe_in(&win, window, |this, _w, _ev: &DismissEvent, _window, cx| {
             // Defer the drop: see `on_open_indicator_settings` for the
             // gpui_web RefCell-borrow panic this works around.
