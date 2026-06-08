@@ -29,9 +29,14 @@ use serde::Deserialize;
 
 use crate::indicators::{
     BarStatGrade, BarStatParams, BbParams, COLOR_PALETTE_SIZE, InstanceId, Placement, Source,
-    VolumeDeltaMode, VolumeDeltaParams, palette_color_for,
+    VolumeDeltaMode, VolumeDeltaParams, VrvpParams, palette_color_for,
 };
 use crate::panels::ContentPanel;
+use crate::volume_profile::{AnchorEdge, VpDeltaScale, VpRenderMode};
+use crate::volume_profile::params::{
+    BTCUSDT_TICK_SIZE, BUCKET_TICKS_MAX, BUCKET_TICKS_MIN, VA_PERCENT_MAX, VA_PERCENT_MIN,
+    WIDTH_PCT_MAX, WIDTH_PCT_MIN,
+};
 
 /// Open the settings panel for an indicator on the currently-focused chart.
 /// Carries the instance id; the workspace resolves the target chart via
@@ -173,7 +178,7 @@ impl Render for IndicatorSettingsView {
             "volume" => render_volume(&snapshot, target.clone(), id, cx),
             "volume_delta" => render_volume_delta(&snapshot, target.clone(), id, cx),
             "bar_stat" => render_bar_stat(&snapshot, target.clone(), id, cx),
-            "vrvp" => render_vrvp(&snapshot, muted),
+            "vrvp" => render_vrvp(&snapshot, target.clone(), id, cx),
             _ => div()
                 .text_color(muted)
                 .child("Unknown indicator kind")
@@ -334,35 +339,388 @@ fn render_volume(
         .into_any_element()
 }
 
-/// VRVP form — Phase 5 stub. Real layout (4-section: Layout / Reference
-/// levels / Colors / Reset, mode-conditional fields, bucket-size stepper
-/// with live $-readout) lands in Phase 10 via the shared
-/// `VolumeProfileSettingsView`. Until then, surface the current bucket
-/// size so the user gets feedback that the instance exists.
-fn render_vrvp(snap: &InstanceSnapshot, muted: Hsla) -> gpui::AnyElement {
-    let bucket_ticks = snap
+/// VRVP form — three sections (Layout / Reference levels / Reset). All
+/// mutations route through `chart.update_indicator(id, |k| mutate::<VrvpParams>(k, ...))`,
+/// which re-runs compute + recompute → repaint pipeline in one place.
+///
+/// Color editing isn't surfaced here in v1: `VolumeProfileParams` exposes
+/// 5 color slots (volume / bull / bear / poc / va) that the painter reads
+/// directly, but the per-color picker UI is deferred to Phase 15 polish
+/// alongside theme-derived default re-tinting. Sensible defaults from
+/// `VolumeProfileParams::default()` ship in the meantime.
+fn render_vrvp(
+    snap: &InstanceSnapshot,
+    target: WeakEntity<ContentPanel>,
+    id: InstanceId,
+    cx: &mut Context<IndicatorSettingsView>,
+) -> gpui::AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let ticks = snap
         .params
         .pointer("/params/bucket_ticks")
         .and_then(|v| v.as_u64())
-        .unwrap_or(100);
+        .unwrap_or(100) as u32;
+    let render_mode = read_vp_render_mode(&snap.params).unwrap_or_default();
+    let delta_scale = read_vp_delta_scale(&snap.params).unwrap_or_default();
+    let width_pct = snap
+        .params
+        .pointer("/params/width_pct")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30) as u8;
+    let anchor = read_vp_anchor(&snap.params).unwrap_or(AnchorEdge::Right);
+    let va_percent = snap
+        .params
+        .pointer("/params/va_percent")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(70) as u8;
+    let show_poc = snap.params.pointer("/params/show_poc").and_then(|v| v.as_bool()).unwrap_or(true);
+    let show_va = snap.params.pointer("/params/show_va").and_then(|v| v.as_bool()).unwrap_or(true);
+    let show_va_highlight = snap
+        .params
+        .pointer("/params/show_va_highlight")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let show_labels = snap.params.pointer("/params/show_labels").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let bucket_dollars = ticks as f64 * BTCUSDT_TICK_SIZE;
+
+    // ── Layout ──
+    let mut layout = v_flex().gap_2();
+    layout = layout.child(label_row("Layout"));
+    layout = layout.child(stepper_row(
+        "Bucket",
+        format!("{} ticks (${:.2})", ticks, bucket_dollars),
+        target.clone(),
+        id,
+        step_vrvp_bucket_ticks,
+        cx,
+    ));
+    layout = layout.child(vrvp_mode_row(render_mode, target.clone(), id, cx));
+    if matches!(render_mode, VpRenderMode::Delta) {
+        layout = layout.child(vrvp_delta_scale_row(delta_scale, target.clone(), id, cx));
+    }
+    layout = layout.child(stepper_row(
+        "Width",
+        format!("{}%", width_pct),
+        target.clone(),
+        id,
+        step_vrvp_width_pct,
+        cx,
+    ));
+    layout = layout.child(vrvp_anchor_row(anchor, target.clone(), id, cx));
+
+    // ── Reference levels ──
+    let mut levels = v_flex().gap_2();
+    levels = levels.child(label_row("Reference levels"));
+    levels = levels.child(vrvp_toggle_row(
+        "POC line",
+        show_poc,
+        target.clone(),
+        id,
+        |k, v| mutate::<VrvpParams>(k, |x| x.params.show_poc = v),
+        cx,
+    ));
+    levels = levels.child(vrvp_toggle_row(
+        "VA lines",
+        show_va,
+        target.clone(),
+        id,
+        |k, v| mutate::<VrvpParams>(k, |x| x.params.show_va = v),
+        cx,
+    ));
+    levels = levels.child(vrvp_toggle_row(
+        "VA highlight",
+        show_va_highlight,
+        target.clone(),
+        id,
+        |k, v| mutate::<VrvpParams>(k, |x| x.params.show_va_highlight = v),
+        cx,
+    ));
+    levels = levels.child(vrvp_toggle_row(
+        "Labels",
+        show_labels,
+        target.clone(),
+        id,
+        |k, v| mutate::<VrvpParams>(k, |x| x.params.show_labels = v),
+        cx,
+    ));
+    levels = levels.child(stepper_row(
+        "VA %",
+        format!("{}%", va_percent),
+        target.clone(),
+        id,
+        step_vrvp_va_percent,
+        cx,
+    ));
+
+    // ── Reset ──
+    let target_reset = target.clone();
+    let reset_btn = Button::new(SharedString::from(format!("vrvp-reset-{}", id)))
+        .label(SharedString::from("Reset style"))
+        .small()
+        .ghost()
+        .on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target_reset.upgrade() else {
+                return;
+            };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<VrvpParams>(kind, |x| x.params.reset_styles());
+                    });
+                }
+                p.refresh_chart_footprint_sub(cx);
+                cx.notify();
+                crate::panels::request_layout_save(cx);
+            });
+        }));
+
     v_flex()
-        .gap_2()
-        .child(
-            div()
-                .text_sm()
-                .text_color(muted)
-                .child(SharedString::from(format!(
-                    "Bucket size: {} ticks",
-                    bucket_ticks
-                ))),
-        )
+        .gap_3()
+        .child(layout)
+        .child(div().h(px(1.)).bg(cx.theme().border))
+        .child(levels)
+        .child(div().h(px(1.)).bg(cx.theme().border))
         .child(
             div()
                 .text_xs()
                 .text_color(muted)
-                .child("Settings form lands in Phase 10."),
+                .child("Color editing arrives in a follow-up polish pass."),
         )
+        .child(reset_btn)
         .into_any_element()
+}
+
+fn read_vp_render_mode(params: &serde_json::Value) -> Option<VpRenderMode> {
+    let s = params.pointer("/params/render_mode")?.as_str()?;
+    Some(match s {
+        "volume" => VpRenderMode::Volume,
+        "delta" => VpRenderMode::Delta,
+        "vol_delta_outline" => VpRenderMode::VolDeltaOutline,
+        _ => return None,
+    })
+}
+
+fn read_vp_delta_scale(params: &serde_json::Value) -> Option<VpDeltaScale> {
+    let s = params.pointer("/params/delta_scale")?.as_str()?;
+    Some(match s {
+        "per_row" => VpDeltaScale::PerRow,
+        "whole_profile" => VpDeltaScale::WholeProfile,
+        _ => return None,
+    })
+}
+
+fn read_vp_anchor(params: &serde_json::Value) -> Option<AnchorEdge> {
+    let s = params.pointer("/params/anchor")?.as_str()?;
+    Some(match s {
+        "right" => AnchorEdge::Right,
+        "left" => AnchorEdge::Left,
+        _ => return None,
+    })
+}
+
+/// Render-mode picker row — three buttons (Volume / Delta / Volume+Delta).
+/// Mode change re-runs compute, so the new render-mode bars (or empty
+/// output, if cells aren't loaded yet) show up next paint.
+fn vrvp_mode_row(
+    current: VpRenderMode,
+    target: WeakEntity<ContentPanel>,
+    id: InstanceId,
+    cx: &mut Context<IndicatorSettingsView>,
+) -> gpui::AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let mut buttons = h_flex().gap_1();
+    for m in VpRenderMode::ALL {
+        let target = target.clone();
+        let mode = *m;
+        let is_active = mode == current;
+        let btn_id = SharedString::from(format!("vrvp-mode-{}-{}", id, mode.label()));
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(mode.label()))
+            .xsmall();
+        btn = if is_active { btn.primary() } else { btn.ghost() };
+        btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target.upgrade() else {
+                return;
+            };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<VrvpParams>(kind, |x| x.params.render_mode = mode);
+                    });
+                }
+                p.refresh_chart_footprint_sub(cx);
+                cx.notify();
+                crate::panels::request_layout_save(cx);
+            });
+        }));
+        buttons = buttons.child(btn);
+    }
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("Mode"))
+        .child(buttons)
+        .into_any_element()
+}
+
+fn vrvp_delta_scale_row(
+    current: VpDeltaScale,
+    target: WeakEntity<ContentPanel>,
+    id: InstanceId,
+    cx: &mut Context<IndicatorSettingsView>,
+) -> gpui::AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let mut buttons = h_flex().gap_1();
+    for s in VpDeltaScale::ALL {
+        let target = target.clone();
+        let scale = *s;
+        let is_active = scale == current;
+        let btn_id = SharedString::from(format!("vrvp-scale-{}-{}", id, scale.label()));
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(scale.label()))
+            .xsmall();
+        btn = if is_active { btn.primary() } else { btn.ghost() };
+        btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target.upgrade() else {
+                return;
+            };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<VrvpParams>(kind, |x| x.params.delta_scale = scale);
+                    });
+                }
+                p.refresh_chart_footprint_sub(cx);
+                cx.notify();
+                crate::panels::request_layout_save(cx);
+            });
+        }));
+        buttons = buttons.child(btn);
+    }
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("Scaling"))
+        .child(buttons)
+        .into_any_element()
+}
+
+fn vrvp_anchor_row(
+    current: AnchorEdge,
+    target: WeakEntity<ContentPanel>,
+    id: InstanceId,
+    cx: &mut Context<IndicatorSettingsView>,
+) -> gpui::AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let mut buttons = h_flex().gap_1();
+    for a in AnchorEdge::ALL {
+        let target = target.clone();
+        let anchor = *a;
+        let is_active = anchor == current;
+        let btn_id = SharedString::from(format!("vrvp-anchor-{}-{}", id, anchor.label()));
+        let mut btn = Button::new(btn_id)
+            .label(SharedString::from(anchor.label()))
+            .xsmall();
+        btn = if is_active { btn.primary() } else { btn.ghost() };
+        btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target.upgrade() else {
+                return;
+            };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<VrvpParams>(kind, |x| x.params.anchor = anchor);
+                    });
+                }
+                p.refresh_chart_footprint_sub(cx);
+                cx.notify();
+                crate::panels::request_layout_save(cx);
+            });
+        }));
+        buttons = buttons.child(btn);
+    }
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child("Anchor"))
+        .child(buttons)
+        .into_any_element()
+}
+
+/// Single-click toggle for a bool field. Button label flips between
+/// `On` / `Off` based on current state; primary variant when on, ghost
+/// when off, so the user gets clear feedback without a checkbox widget.
+fn vrvp_toggle_row(
+    label: &'static str,
+    current: bool,
+    target: WeakEntity<ContentPanel>,
+    id: InstanceId,
+    mutate_fn: fn(&mut Box<dyn crate::indicators::IndicatorKind>, bool),
+    cx: &mut Context<IndicatorSettingsView>,
+) -> gpui::AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let btn_id = SharedString::from(format!("vrvp-tog-{}-{}", id, label));
+    let target_click = target.clone();
+    let mut btn = Button::new(btn_id)
+        .label(SharedString::from(if current { "On" } else { "Off" }))
+        .xsmall();
+    btn = if current { btn.primary() } else { btn.ghost() };
+    let btn = btn.on_click(cx.listener(move |_this, _ev, _w, cx| {
+        let next = !current;
+        let Some(panel) = target_click.upgrade() else {
+            return;
+        };
+        panel.update(cx, |p, cx| {
+            if let Some(chart) = p.chart_state.as_mut() {
+                chart.update_indicator(id, |kind| mutate_fn(kind, next));
+            }
+            p.refresh_chart_footprint_sub(cx);
+            cx.notify();
+            crate::panels::request_layout_save(cx);
+        });
+    }));
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(div().w(px(90.)).text_sm().text_color(muted).child(label))
+        .child(btn)
+        .into_any_element()
+}
+
+/// Stepper handler — clamps to [BUCKET_TICKS_MIN, BUCKET_TICKS_MAX]. Steps
+/// by 10 ticks per click (= $1 at the BTCUSDT-perp tick) so the user
+/// reaches sensible bucket sizes (50, 100, 200 ticks) in a few clicks.
+///
+/// Bucket changes are the one VRVP edit that needs a footprint-sub refresh —
+/// the desired bucket set shifts. `apply_mutation` is invoked through
+/// `chart.update_indicator` which doesn't see ContentPanel, so the refresh
+/// happens via the panel-update closure inside `stepper_row`'s listener.
+/// We accept one redundant refresh on width/va-percent edits — `refresh_chart_footprint_sub`
+/// short-circuits when the desired set matches.
+fn step_vrvp_bucket_ticks(kind: &mut Box<dyn crate::indicators::IndicatorKind>, delta: i32) {
+    mutate::<VrvpParams>(kind, |x| {
+        let cur = x.params.bucket_ticks as i64;
+        let nxt = (cur + delta as i64 * 10)
+            .clamp(BUCKET_TICKS_MIN as i64, BUCKET_TICKS_MAX as i64);
+        x.params.bucket_ticks = nxt as u32;
+    });
+}
+
+fn step_vrvp_width_pct(kind: &mut Box<dyn crate::indicators::IndicatorKind>, delta: i32) {
+    mutate::<VrvpParams>(kind, |x| {
+        let cur = x.params.width_pct as i32;
+        let nxt = (cur + delta * 5).clamp(WIDTH_PCT_MIN as i32, WIDTH_PCT_MAX as i32);
+        x.params.width_pct = nxt as u8;
+    });
+}
+
+fn step_vrvp_va_percent(kind: &mut Box<dyn crate::indicators::IndicatorKind>, delta: i32) {
+    mutate::<VrvpParams>(kind, |x| {
+        let cur = x.params.va_percent as i32;
+        let nxt = (cur + delta * 5).clamp(VA_PERCENT_MIN as i32, VA_PERCENT_MAX as i32);
+        x.params.va_percent = nxt as u8;
+    });
 }
 
 /// Volume Delta form: a single Mode selector (Histogram / CVD / Both). No
@@ -757,8 +1115,12 @@ fn apply_mutation(
     panel.update(cx, |p, cx| {
         if let Some(chart) = p.chart_state.as_mut() {
             chart.update_indicator(id, |kind| mutate_fn(kind, delta));
-            cx.notify();
-            crate::panels::request_layout_save(cx);
         }
+        // VRVP edits can shift the bucket-sub set (bucket size stepper);
+        // refresh is idempotent for non-VRVP / same-bucket edits so call
+        // unconditionally rather than special-casing the kind.
+        p.refresh_chart_footprint_sub(cx);
+        cx.notify();
+        crate::panels::request_layout_save(cx);
     });
 }

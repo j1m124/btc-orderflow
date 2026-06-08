@@ -948,6 +948,16 @@ impl ChartState {
         Some((lo_t, hi_t))
     }
 
+    /// Oldest `open_time` cached for `bucket_bits`, or `None` when the
+    /// bucket has no cells loaded yet. Used by the VP history-fill loop to
+    /// decide whether to request older footprint cells for the visible
+    /// window.
+    pub fn oldest_footprint_cell_time(&self, bucket_bits: u64) -> Option<i64> {
+        self.footprint_cache
+            .get(&bucket_bits)
+            .and_then(|cells| cells.iter().map(|c| c.open_time).min())
+    }
+
     /// Replace the cached footprint cells for one bucket. Called by
     /// `ContentPanel`'s FootprintEvent handler after every Snapshot /
     /// Update / Prepended / Resnap on any bucket the chart has a live sub
@@ -2836,6 +2846,9 @@ pub fn render(
         axis_bg: theme_background,
         axis_border: theme_border,
     };
+    // Snapshot before the move-into-closure below — overlay paint runs
+    // after main_chart paint and reuses the same label color.
+    let overlay_label: Hsla = main_chart_colors.label;
     let entity = cx.entity();
 
     // Right (price) axis interaction zone — overlays the chart's reserved
@@ -4429,7 +4442,9 @@ pub fn render(
                                     &paint_overlay_items,
                                     overlay_bullish,
                                     overlay_bearish,
+                                    overlay_label,
                                     window,
+                                    cx,
                                 );
                             });
                         }

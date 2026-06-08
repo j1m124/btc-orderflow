@@ -110,20 +110,13 @@ impl IndicatorKind for VrvpParams {
     }
 
     fn color_slots(&self) -> Vec<SharedString> {
-        // Five colors, matching the five `color_*` fields on
-        // `VolumeProfileParams`. The settings form drives these through its
-        // own color pickers (write-back into params directly) rather than
-        // through `IndicatorInstance.colors`, but we still declare the slots
-        // so the generic color-section in `IndicatorSettingsView` mirrors
-        // the user's intent and the chip strip can render a representative
-        // swatch.
-        vec![
-            "Volume".into(),
-            "Bull".into(),
-            "Bear".into(),
-            "POC".into(),
-            "VA".into(),
-        ]
+        // VRVP's user-facing colors live inside `params.color_*` (not in
+        // `IndicatorInstance.colors`) so the settings form can drive
+        // mode-conditional pickers without colliding with the generic
+        // `set_indicator_color` plumbing. Empty here skips the generic
+        // color section in `IndicatorSettingsView`; the chip strip falls
+        // back to a palette default which is fine for v1.
+        Vec::new()
     }
 }
 

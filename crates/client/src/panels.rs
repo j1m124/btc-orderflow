@@ -453,6 +453,13 @@ pub struct ContentPanel {
     /// Refcounting at the `MarketDataService` level dedupes when the same
     /// bucket is requested by multiple owners — see `ensure_footprint`.
     footprint_subs: HashMap<u64, crate::services::market_data::SubscriptionHandle>,
+    /// Per-bucket throttle for VP-driven footprint history paging — the
+    /// last time (ms) we asked the service for older cells on that bucket.
+    /// `MarketDataService::load_older_footprint` already dedupes against
+    /// an in-flight set, but throttling here keeps the panel from spamming
+    /// requests every paint frame the moment a response arrives. 200ms
+    /// per the design grilling.
+    vp_history_last_request_ms: HashMap<u64, i64>,
     /// `(symbol, tf, bucket_bits)` for the **chart's own** footprint render
     /// (Cluster / Profile modes). The FootprintEvent subscription matches
     /// on this to know which sub's cells to copy into `state.footprint_cells`
@@ -997,6 +1004,7 @@ impl ContentPanel {
             _chart_prefs_subscription: chart_prefs_subscription,
             chart_sub_handles: chart_handles,
             footprint_subs: HashMap::new(),
+            vp_history_last_request_ms: HashMap::new(),
             chart_footprint_key: None,
             watchlist_sub_handles: watchlist_handles,
             trades_symbol,
@@ -1310,7 +1318,7 @@ impl ContentPanel {
     /// **before** allocating the new one. Otherwise two subs at the same
     /// `(symbol, tf, bucket)` would race when the user shifts the chart's
     /// bucket through a value also held by a VP instance.
-    fn refresh_chart_footprint_sub(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_chart_footprint_sub(&mut self, cx: &mut Context<Self>) {
         let Some((symbol, tf)) = self.chart_state.as_ref().map(|s| (s.symbol().clone(), s.timeframe()))
         else {
             // No chart on this panel — make sure no subs leak.
@@ -1399,6 +1407,73 @@ impl ContentPanel {
                 state.clear_footprint_cells();
             }
             self.chart_footprint_key = new_chart_key;
+        }
+    }
+
+    /// For each live VRVP, request older footprint cells if the visible
+    /// window extends past the oldest loaded cell for the instance's
+    /// bucket. Throttled per-bucket via `vp_history_last_request_ms` to
+    /// avoid hammering the WS during sustained pan into history; the
+    /// service-side `footprint_history_in_flight` set is the second line
+    /// of defense (a duplicate request slot-collides and no-ops).
+    fn maybe_request_vp_history(&mut self, cx: &mut Context<Self>) {
+        let Some((symbol, tf)) = self
+            .chart_state
+            .as_ref()
+            .map(|s| (s.symbol().clone(), s.timeframe()))
+        else {
+            return;
+        };
+        let view_lo = match self.chart_state.as_ref().and_then(|s| s.view_time_range()) {
+            Some((lo, _)) => lo,
+            None => return,
+        };
+        // Collect the (bucket_bits, bucket_dollars) pairs to query so we
+        // release the `&self.chart_state` immutable borrow before the
+        // service call below (which mutably borrows `cx.global`).
+        let mut wanted: Vec<(u64, f64)> = Vec::new();
+        if let Some(state) = self.chart_state.as_ref() {
+            for inst in state.indicators() {
+                if let Some(vrvp) = inst
+                    .kind
+                    .as_any()
+                    .downcast_ref::<crate::indicators::VrvpParams>()
+                {
+                    let bucket = vrvp.params.bucket_dollars();
+                    if !bucket.is_finite() || bucket <= 0.0 {
+                        continue;
+                    }
+                    let bits = bucket.to_bits();
+                    // Skip if we've fetched recently or have enough coverage
+                    // already.
+                    let oldest_loaded = state.oldest_footprint_cell_time(bits);
+                    if let Some(oldest) = oldest_loaded {
+                        if oldest <= view_lo {
+                            continue; // Have everything we need.
+                        }
+                    }
+                    wanted.push((bits, bucket));
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        const THROTTLE_MS: i64 = 200;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        for (bits, bucket) in wanted {
+            let last = self.vp_history_last_request_ms.get(&bits).copied().unwrap_or(0);
+            if now_ms - last < THROTTLE_MS {
+                continue;
+            }
+            self.vp_history_last_request_ms.insert(bits, now_ms);
+            market.update(cx, |svc, cx| {
+                svc.load_older_footprint(symbol.as_ref(), tf, bucket, cx)
+            });
         }
     }
 
@@ -1812,6 +1887,7 @@ impl Render for ContentPanel {
                 if let Some(chart) = self.chart_state.as_mut() {
                     chart.maybe_recompute_view_dependent_indicators();
                 }
+                self.maybe_request_vp_history(cx);
                 chart::render(
                     self.chart_state
                         .as_ref()

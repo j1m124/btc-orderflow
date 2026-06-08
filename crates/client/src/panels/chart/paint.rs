@@ -2061,7 +2061,9 @@ pub(super) fn paint_overlay_indicators(
     items: &[OverlayPaintItem],
     bullish: Hsla,
     bearish: Hsla,
+    label_color: Hsla,
     window: &mut Window,
+    cx: &mut App,
 ) {
     let canvas_w = bounds.size.width.as_f32();
     let canvas_h = bounds.size.height.as_f32();
@@ -2215,8 +2217,8 @@ pub(super) fn paint_overlay_indicators(
                 // shares the candle pane's coordinate system; `chart_w`
                 // excludes the y-axis gutter on the right.
                 crate::volume_profile::paint::paint_volume_profile(
-                    window, origin, 0.0, chart_w, chart_top, chart_bottom, y_lo, y_hi,
-                    output, params,
+                    window, cx, origin, 0.0, chart_w, chart_top, chart_bottom, y_lo, y_hi,
+                    output, params, label_color,
                 );
             }
         }
