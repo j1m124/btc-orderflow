@@ -2698,6 +2698,14 @@ pub fn render(
         )
     };
 
+    // Snapshot of the active drawing tool — drives the FRVP-on-sub-pane
+    // not-allowed cursor and the early-return guard in sub-pane
+    // mouse-down. Re-read on every render so a tool change picks up
+    // next paint (ContentPanel subscribes to DrawingToolEvent so the
+    // change triggers a notify even when the user hasn't moved the
+    // mouse).
+    let active_tool = crate::drawings::tool::current_tool(cx);
+
     // LIVE / Reconnecting / Disconnected badge in the header. Mirrors the
     // market-data service's connection state.
     let (badge_color, badge_label): (Hsla, &'static str) = {
@@ -4820,8 +4828,18 @@ pub fn render(
                 .w_full()
                 .h(px(pane_height))
                 // Crosshair cursor mirrors the main canvas so the hover
-                // affordance reads identically across panes.
-                .cursor_crosshair()
+                // affordance reads identically across panes — except when
+                // FRVP is active. FRVP only renders inside the main
+                // candle pane, so painting a crosshair over an indicator
+                // pane would suggest the user could click here to start a
+                // bracket. `not-allowed` makes the restriction explicit;
+                // the sub-pane has no mouse-down handler for FRVP so the
+                // click is already a silent no-op.
+                .map(|d| if matches!(active_tool, Tool::FixedRangeVolumeProfile) {
+                    d.cursor_not_allowed()
+                } else {
+                    d.cursor_crosshair()
+                })
                 .on_prepaint({
                     let entity = entity.clone();
                     move |bounds, _, cx| {

@@ -617,6 +617,21 @@ impl ContentPanel {
                 },
             )
             .detach();
+            // Tool-state changes drive the FRVP-on-sub-pane not-allowed
+            // cursor. Without this subscription the cursor only flips
+            // after the user moves the mouse — the gesture works either
+            // way, but the affordance lags.
+            let tool_handle = cx
+                .global::<crate::drawings::tool::DrawingToolStateHandle>()
+                .0
+                .clone();
+            cx.subscribe(
+                &tool_handle,
+                |_this, _tool, _ev: &crate::drawings::tool::DrawingToolEvent, cx| {
+                    cx.notify();
+                },
+            )
+            .detach();
         }
         let chart_tick_pending = Rc::new(Cell::new(false));
         let chart_tick_last_ms = Rc::new(Cell::new(0i64));
