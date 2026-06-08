@@ -173,6 +173,7 @@ impl Render for IndicatorSettingsView {
             "volume" => render_volume(&snapshot, target.clone(), id, cx),
             "volume_delta" => render_volume_delta(&snapshot, target.clone(), id, cx),
             "bar_stat" => render_bar_stat(&snapshot, target.clone(), id, cx),
+            "vrvp" => render_vrvp(&snapshot, muted),
             _ => div()
                 .text_color(muted)
                 .child("Unknown indicator kind")
@@ -329,6 +330,37 @@ fn render_volume(
                     Placement::Pane,
                     cx,
                 )),
+        )
+        .into_any_element()
+}
+
+/// VRVP form — Phase 5 stub. Real layout (4-section: Layout / Reference
+/// levels / Colors / Reset, mode-conditional fields, bucket-size stepper
+/// with live $-readout) lands in Phase 10 via the shared
+/// `VolumeProfileSettingsView`. Until then, surface the current bucket
+/// size so the user gets feedback that the instance exists.
+fn render_vrvp(snap: &InstanceSnapshot, muted: Hsla) -> gpui::AnyElement {
+    let bucket_ticks = snap
+        .params
+        .pointer("/params/bucket_ticks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100);
+    v_flex()
+        .gap_2()
+        .child(
+            div()
+                .text_sm()
+                .text_color(muted)
+                .child(SharedString::from(format!(
+                    "Bucket size: {} ticks",
+                    bucket_ticks
+                ))),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("Settings form lands in Phase 10."),
         )
         .into_any_element()
 }

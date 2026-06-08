@@ -17,6 +17,7 @@ pub mod output;
 pub mod trades;
 pub mod volume;
 pub mod volume_delta;
+pub mod vrvp;
 
 pub use bar_stat::{BarStatGrade, BarStatParams};
 pub use bb::BbParams;
@@ -29,6 +30,7 @@ pub use output::{IndicatorOutput, Series, ValueReadout};
 pub use trades::TradesParams;
 pub use volume::VolumeParams;
 pub use volume_delta::{VolumeDeltaMode, VolumeDeltaParams};
+pub use vrvp::VrvpParams;
 
 use gpui::SharedString;
 
@@ -95,6 +97,13 @@ pub fn kind_entries() -> Vec<KindEntry> {
             category: Category::Volume,
             spawn: || Box::new(BarStatParams::default()),
         },
+        KindEntry {
+            kind_id: "vrvp",
+            name: "Visible Range Volume Profile".into(),
+            description: "Per-price-bucket volume/delta histogram across the visible bar range".into(),
+            category: Category::Volume,
+            spawn: || Box::new(VrvpParams::default()),
+        },
     ]
 }
 
@@ -117,6 +126,9 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "bar_stat" => serde_json::from_value::<BarStatParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "vrvp" => serde_json::from_value::<VrvpParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy
