@@ -22,6 +22,20 @@ pub fn new_instance_id() -> InstanceId {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Ensure subsequent calls to `new_instance_id` return values strictly
+/// greater than `id`. Called by the persistence restore path so that
+/// instance ids loaded from disk don't collide with freshly-minted ones.
+pub fn bump_next_id_past(id: InstanceId) {
+    let target = id.saturating_add(1);
+    let mut cur = NEXT_ID.load(Ordering::Relaxed);
+    while cur < target {
+        match NEXT_ID.compare_exchange(cur, target, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
 /// One indicator on one chart panel. The `kind` Box owns the impl + its
 /// typed params; the surrounding fields are presentation state. `kind_id`
 /// mirrors `kind.kind_id()` so we can filter / route without dynamic
@@ -53,6 +67,15 @@ impl IndicatorInstance {
     /// pane height where applicable, and per-slot colors seeded from
     /// `primary_color` + a hue-shift rotation for additional slots.
     pub fn new(kind: Box<dyn IndicatorKind>, primary_color: Hsla) -> Self {
+        Self::new_with_id(new_instance_id(), kind, primary_color)
+    }
+
+    /// Like [`Self::new`] but adopts a caller-supplied `id`. Used by the
+    /// persistence restore path so that drawings anchored to a
+    /// `PaneRef::Indicator(InstanceId)` keep their target across reloads.
+    /// The caller is responsible for bumping the global `NEXT_ID` past the
+    /// id via [`bump_next_id_past`] to avoid future collisions.
+    pub fn new_with_id(id: InstanceId, kind: Box<dyn IndicatorKind>, primary_color: Hsla) -> Self {
         let kind_id = kind.kind_id();
         let placement = match kind.pane_kind() {
             PaneKind::OverlayOnly | PaneKind::Both => Placement::Overlay,
@@ -62,16 +85,12 @@ impl IndicatorInstance {
             Placement::Pane => Some(default_pane_height(kind_id)),
             Placement::Overlay => None,
         };
-        // Seed one Hsla per declared color slot. Slot 0 = primary palette
-        // pick; subsequent slots fan out across the hue wheel so multi-line
-        // kinds (MACD today, anything richer tomorrow) read distinctly out
-        // of the box. Users can override any slot in the settings panel.
         let slot_count = kind.color_slots().len();
         let colors = (0..slot_count)
             .map(|i| derive_slot_default(primary_color, i))
             .collect();
         Self {
-            id: new_instance_id(),
+            id,
             kind_id,
             kind,
             placement,

@@ -7,6 +7,7 @@ const FONT_SIZE_MAX: f32 = 28.0;
 pub mod bottom_bar;
 pub mod drawings;
 pub mod floating_code_editor;
+pub mod floating_strip;
 pub mod floating_window;
 pub mod indicator_picker;
 pub mod indicator_settings;

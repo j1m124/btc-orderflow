@@ -21,9 +21,23 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, SharedSt
 use crate::persistence;
 use crate::services::market_data::Timeframe;
 
-pub use super::shapes::{Drawing, DrawingOrigin, DrawingShape, LineRectShape, PositionShape, TextShape};
+pub use super::shapes::{
+    Drawing, DrawingColor, DrawingOrigin, DrawingShape, LineRectShape, PaneRef, PositionShape,
+    TextShape,
+};
 
 pub type DrawingId = u64;
+
+/// Which color slot on a drawing the strip's swatch writes to. Position
+/// shapes carry two distinct slots (profit / loss); everything else maps
+/// `Primary` to its single `color` field. The strip decides which roles
+/// to surface based on the selected shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorRole {
+    Primary,
+    Profit,
+    Loss,
+}
 
 #[derive(Clone, Debug)]
 pub enum DrawingEvent {
@@ -129,12 +143,29 @@ impl DrawingService {
         created_by: DrawingOrigin,
         cx: &mut Context<Self>,
     ) -> DrawingId {
+        self.add_in_pane(symbol, shape, PaneRef::Main, created_by, cx)
+    }
+
+    /// Like [`Self::add_with_origin`] but pins the drawing to a specific
+    /// paint surface. Indicator-pane drawings carry the
+    /// [`PaneRef::Indicator(instance_id)`] reference and disappear when
+    /// the indicator is removed (see [`Self::cleanup_indicator_pane`]).
+    pub fn add_in_pane(
+        &mut self,
+        symbol: SharedString,
+        shape: DrawingShape,
+        pane: PaneRef,
+        created_by: DrawingOrigin,
+        cx: &mut Context<Self>,
+    ) -> DrawingId {
         let id = self.next_id;
         self.next_id += 1;
         let drawing = Drawing {
             id,
             hidden: false,
+            locked: false,
             tf_filter: None,
+            pane,
             created_by,
             shape,
         };
@@ -244,6 +275,275 @@ impl DrawingService {
             symbol: SharedString::from(symbol.to_string()),
         });
         cx.notify();
+    }
+
+    pub fn set_locked(
+        &mut self,
+        symbol: &str,
+        id: DrawingId,
+        locked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list) = self.by_symbol.get_mut(symbol) else {
+            return;
+        };
+        let Some(d) = list.iter_mut().find(|d| d.id == id) else {
+            return;
+        };
+        if d.locked == locked {
+            return;
+        }
+        d.locked = locked;
+        self.persist();
+        cx.emit(DrawingEvent::Changed {
+            symbol: SharedString::from(symbol.to_string()),
+        });
+        cx.notify();
+    }
+
+    /// Write a color into the drawing's primary, profit, or loss slot
+    /// (depending on `role` + shape kind). `None` resets to the
+    /// shape's theme default at paint time. No-op when the role doesn't
+    /// match the shape.
+    pub fn set_color(
+        &mut self,
+        symbol: &str,
+        id: DrawingId,
+        role: ColorRole,
+        color: Option<DrawingColor>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list) = self.by_symbol.get_mut(symbol) else {
+            return;
+        };
+        let Some(d) = list.iter_mut().find(|d| d.id == id) else {
+            return;
+        };
+        let mut changed = false;
+        match (&mut d.shape, role) {
+            (DrawingShape::Line(s), ColorRole::Primary)
+            | (DrawingShape::Rect(s), ColorRole::Primary)
+            | (DrawingShape::Arrow(s), ColorRole::Primary)
+            | (DrawingShape::Fibonacci(s), ColorRole::Primary) => {
+                if s.color != color {
+                    s.color = color;
+                    changed = true;
+                }
+            }
+            (DrawingShape::HorizontalRay(s), ColorRole::Primary) => {
+                if s.color != color {
+                    s.color = color;
+                    changed = true;
+                }
+            }
+            (DrawingShape::AnchoredVwap(s), ColorRole::Primary) => {
+                if s.color != color {
+                    s.color = color;
+                    changed = true;
+                }
+            }
+            (DrawingShape::Text(s), ColorRole::Primary) => {
+                if s.color != color {
+                    s.color = color;
+                    changed = true;
+                }
+            }
+            (DrawingShape::Long(p), ColorRole::Profit)
+            | (DrawingShape::Short(p), ColorRole::Profit) => {
+                if p.profit_color != color {
+                    p.profit_color = color;
+                    changed = true;
+                }
+            }
+            (DrawingShape::Long(p), ColorRole::Loss)
+            | (DrawingShape::Short(p), ColorRole::Loss) => {
+                if p.loss_color != color {
+                    p.loss_color = color;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+        if !changed {
+            return;
+        }
+        self.persist();
+        cx.emit(DrawingEvent::Changed {
+            symbol: SharedString::from(symbol.to_string()),
+        });
+        cx.notify();
+    }
+
+    /// Set the stroke width for any shape that paints a line. No-op for
+    /// `Text` (uses font size, not stroke width).
+    pub fn set_width(
+        &mut self,
+        symbol: &str,
+        id: DrawingId,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list) = self.by_symbol.get_mut(symbol) else {
+            return;
+        };
+        let Some(d) = list.iter_mut().find(|d| d.id == id) else {
+            return;
+        };
+        let mut changed = false;
+        match &mut d.shape {
+            DrawingShape::Line(s)
+            | DrawingShape::Rect(s)
+            | DrawingShape::Arrow(s)
+            | DrawingShape::Fibonacci(s) => {
+                if (s.width - width).abs() > f32::EPSILON {
+                    s.width = width;
+                    changed = true;
+                }
+            }
+            DrawingShape::HorizontalRay(s) => {
+                if (s.width - width).abs() > f32::EPSILON {
+                    s.width = width;
+                    changed = true;
+                }
+            }
+            DrawingShape::AnchoredVwap(s) => {
+                if (s.width - width).abs() > f32::EPSILON {
+                    s.width = width;
+                    changed = true;
+                }
+            }
+            DrawingShape::Long(p) | DrawingShape::Short(p) => {
+                if (p.width - width).abs() > f32::EPSILON {
+                    p.width = width;
+                    changed = true;
+                }
+            }
+            DrawingShape::Text(_) => {}
+        }
+        if !changed {
+            return;
+        }
+        self.persist();
+        cx.emit(DrawingEvent::Changed {
+            symbol: SharedString::from(symbol.to_string()),
+        });
+        cx.notify();
+    }
+
+    /// Set the secondary text label for shapes that support one. Routes to
+    /// the per-variant field. No-op for `Text` (whose `text` IS the label)
+    /// — strip suppresses the label slot in that case.
+    pub fn set_label(
+        &mut self,
+        symbol: &str,
+        id: DrawingId,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list) = self.by_symbol.get_mut(symbol) else {
+            return;
+        };
+        let Some(d) = list.iter_mut().find(|d| d.id == id) else {
+            return;
+        };
+        let normalized = label.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        });
+        let mut changed = false;
+        match &mut d.shape {
+            DrawingShape::Line(s)
+            | DrawingShape::Rect(s)
+            | DrawingShape::Arrow(s)
+            | DrawingShape::Fibonacci(s) => {
+                if s.label != normalized {
+                    s.label = normalized;
+                    changed = true;
+                }
+            }
+            DrawingShape::HorizontalRay(s) => {
+                if s.text != normalized {
+                    s.text = normalized;
+                    changed = true;
+                }
+            }
+            DrawingShape::AnchoredVwap(s) => {
+                if s.label != normalized {
+                    s.label = normalized;
+                    changed = true;
+                }
+            }
+            DrawingShape::Long(p) | DrawingShape::Short(p) => {
+                if p.label != normalized {
+                    p.label = normalized;
+                    changed = true;
+                }
+            }
+            DrawingShape::Text(_) => {}
+        }
+        if !changed {
+            return;
+        }
+        self.persist();
+        cx.emit(DrawingEvent::Changed {
+            symbol: SharedString::from(symbol.to_string()),
+        });
+        cx.notify();
+    }
+
+    /// Remove every indicator-pane drawing whose `pane == Indicator(id)`.
+    /// Called by the chart when an indicator instance is destroyed so its
+    /// drawings don't orphan onto a non-existent pane. No-op when nothing
+    /// matched.
+    pub fn cleanup_indicator_pane(
+        &mut self,
+        instance_id: u64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut changed_symbols: Vec<SharedString> = Vec::new();
+        let mut cleared_selection = false;
+        let mut empty_symbols: Vec<SharedString> = Vec::new();
+        for (sym, list) in self.by_symbol.iter_mut() {
+            let before = list.len();
+            list.retain(|d| !matches!(&d.pane, PaneRef::Indicator(id) if *id == instance_id));
+            if list.len() != before {
+                changed_symbols.push(sym.clone());
+            }
+            if list.is_empty() && before > 0 {
+                empty_symbols.push(sym.clone());
+            }
+        }
+        for sym in empty_symbols {
+            self.by_symbol.remove(&sym);
+        }
+        if matches!(&self.selected, Some((s, sel_id)) if {
+            // Was the selected drawing one we just removed?
+            !self
+                .by_symbol
+                .get(s)
+                .map(|list| list.iter().any(|d| d.id == *sel_id))
+                .unwrap_or(false)
+        }) {
+            self.selected = None;
+            cleared_selection = true;
+        }
+        if changed_symbols.is_empty() {
+            return false;
+        }
+        self.persist();
+        for sym in changed_symbols {
+            cx.emit(DrawingEvent::Changed { symbol: sym });
+        }
+        if cleared_selection {
+            cx.emit(DrawingEvent::SelectionChanged);
+        }
+        cx.notify();
+        true
+    }
+
+    /// Convenience deselect — equivalent to `set_selected(None, cx)`.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.set_selected(None, cx);
     }
 
     /// Flip a single TF in a drawing's filter. `None` (all-visible) flips to

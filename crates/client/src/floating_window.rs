@@ -83,6 +83,10 @@ pub struct FloatingWindow {
     placed: bool,
     dragging: Option<DragOrigin>,
     resizing: Option<ResizeOrigin>,
+    show_title_bar: bool,
+    show_close: bool,
+    show_resize: bool,
+    min_size: Size<Pixels>,
 }
 
 impl FloatingWindow {
@@ -104,7 +108,36 @@ impl FloatingWindow {
             placed: false,
             dragging: None,
             resizing: None,
+            show_title_bar: true,
+            show_close: true,
+            show_resize: true,
+            min_size: MIN_SIZE,
         }
+    }
+
+    /// Override which pieces of chrome the window paints. Defaults are
+    /// `(true, true, true)`. Used by the strip's gear window (no resize)
+    /// and by tighter pop-ups in general.
+    pub fn with_chrome(mut self, title_bar: bool, resize: bool, close: bool) -> Self {
+        self.show_title_bar = title_bar;
+        self.show_resize = resize;
+        self.show_close = close;
+        self
+    }
+
+    /// Override the opening size. Must be called before the first prepaint
+    /// (i.e. immediately after `new`) to influence placement; afterwards
+    /// resize the existing bounds directly.
+    pub fn with_default_size(mut self, size: Size<Pixels>) -> Self {
+        self.bounds.size = size;
+        self
+    }
+
+    /// Override the floor enforced by drag-resize. Defaults to `MIN_SIZE`
+    /// (320 × 200).
+    pub fn with_min_size(mut self, min: Size<Pixels>) -> Self {
+        self.min_size = min;
+        self
     }
 
     fn clamp_origin(&self, origin: Point<Pixels>) -> Point<Pixels> {
@@ -169,12 +202,14 @@ impl FloatingWindow {
             return;
         };
         let delta = mouse_window - r.initial_mouse;
-        let mut new_w = (r.initial_size.width + delta.x).max(MIN_SIZE.width);
-        let mut new_h = (r.initial_size.height + delta.y).max(MIN_SIZE.height);
+        let mut new_w = (r.initial_size.width + delta.x).max(self.min_size.width);
+        let mut new_h = (r.initial_size.height + delta.y).max(self.min_size.height);
         // Cap at the container edge so resize can't push the card past the
         // right/bottom and lose the resize handle.
-        let max_w = (self.container_bounds.size.width - self.bounds.origin.x).max(MIN_SIZE.width);
-        let max_h = (self.container_bounds.size.height - self.bounds.origin.y).max(MIN_SIZE.height);
+        let max_w =
+            (self.container_bounds.size.width - self.bounds.origin.x).max(self.min_size.width);
+        let max_h =
+            (self.container_bounds.size.height - self.bounds.origin.y).max(self.min_size.height);
         new_w = new_w.min(max_w);
         new_h = new_h.min(max_h);
         if new_w != self.bounds.size.width || new_h != self.bounds.size.height {
@@ -213,54 +248,61 @@ impl Render for FloatingWindow {
         let placed = self.placed;
         let view = cx.entity().clone();
 
-        let title_bar = h_flex()
-            .id("floating-titlebar")
-            .h(TITLE_BAR_HEIGHT)
-            .w_full()
-            .px_3()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(theme_border)
-            .bg(theme_bg)
-            .cursor_grab()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, w, cx| this.on_drag_bar_down(ev, w, cx)),
-            )
-            .on_drag(DragMoving(entity_id), |drag, _, _, cx| {
-                cx.stop_propagation();
-                cx.new(|_| drag.clone())
-            })
-            .on_drag_move(cx.listener(
-                move |this, e: &DragMoveEvent<DragMoving>, _w, cx| {
-                    let DragMoving(id) = e.drag(cx);
-                    if *id != entity_id {
-                        return;
-                    }
-                    this.on_drag_bar_move(e.event.position, cx);
-                },
-            ))
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(theme_fg)
-                    .child(self.title.clone()),
-            )
-            .child(
-                div()
-                    .id("floating-close")
-                    .cursor_pointer()
-                    .px_2()
-                    .text_sm()
-                    .text_color(theme_muted)
-                    .child("\u{2715}")
-                    // Stop the mouse_down before it reaches the drag bar so
-                    // clicking the X doesn't start a drag.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
-            );
+        let title_bar = self.show_title_bar.then(|| {
+            let mut bar = h_flex()
+                .id("floating-titlebar")
+                .h(TITLE_BAR_HEIGHT)
+                .w_full()
+                .px_3()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(theme_border)
+                .bg(theme_bg)
+                .cursor_grab()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev: &MouseDownEvent, w, cx| {
+                        this.on_drag_bar_down(ev, w, cx)
+                    }),
+                )
+                .on_drag(DragMoving(entity_id), |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| drag.clone())
+                })
+                .on_drag_move(cx.listener(
+                    move |this, e: &DragMoveEvent<DragMoving>, _w, cx| {
+                        let DragMoving(id) = e.drag(cx);
+                        if *id != entity_id {
+                            return;
+                        }
+                        this.on_drag_bar_move(e.event.position, cx);
+                    },
+                ))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme_fg)
+                        .child(self.title.clone()),
+                );
+            if self.show_close {
+                bar = bar.child(
+                    div()
+                        .id("floating-close")
+                        .cursor_pointer()
+                        .px_2()
+                        .text_sm()
+                        .text_color(theme_muted)
+                        .child("\u{2715}")
+                        // Stop the mouse_down before it reaches the drag bar so
+                        // clicking the X doesn't start a drag.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
+                );
+            }
+            bar
+        });
 
         let resize_handle = div()
             .id("floating-resize")
@@ -313,7 +355,7 @@ impl Render for FloatingWindow {
             );
 
         if placed {
-            let card = v_flex()
+            let mut card = v_flex()
                 .id("floating-card")
                 .absolute()
                 .left(bounds.origin.x)
@@ -329,17 +371,21 @@ impl Render for FloatingWindow {
                 .occlude()
                 // Clicks inside the card shouldn't bubble to the layer's
                 // mouse handlers (which are only for drag release).
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(title_bar)
-                .child(
-                    div()
-                        .id("floating-content")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .child(content),
-                )
-                .child(resize_handle);
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+            if let Some(bar) = title_bar {
+                card = card.child(bar);
+            }
+            card = card.child(
+                div()
+                    .id("floating-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(content),
+            );
+            if self.show_resize {
+                card = card.child(resize_handle);
+            }
             layer = layer.child(card);
         }
         layer

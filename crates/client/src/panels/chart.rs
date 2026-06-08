@@ -1271,7 +1271,13 @@ impl ChartState {
                 .copied()
                 .map(|c| c.into_hsla())
                 .unwrap_or_else(|| palette_color_for(0));
-            let mut inst = IndicatorInstance::new(kind, primary);
+            let mut inst = match pref.id {
+                Some(id) => {
+                    crate::indicators::bump_next_id_past(id);
+                    IndicatorInstance::new_with_id(id, kind, primary)
+                }
+                None => IndicatorInstance::new(kind, primary),
+            };
             inst.placement = pref.placement.into_placement();
             inst.pane_height = pref.pane_height;
             inst.hidden = pref.hidden;
@@ -3611,8 +3617,12 @@ pub fn render(
                                     width: editing.width,
                                     text: trimmed.to_string(),
                                 };
-                                let shape =
-                                    drawings_view::view_to_shape(&view, &candles_snap, interval);
+                                let shape = drawings_view::view_to_shape(
+                                    &view,
+                                    &candles_snap,
+                                    interval,
+                                    None,
+                                );
                                 let symbol2 = symbol.clone();
                                 let id = svc.update(cx, |s, cx| s.add(symbol2.clone(), shape, cx));
                                 svc.update(cx, |s, cx| s.set_selected(Some((symbol2, id)), cx));
@@ -3665,6 +3675,7 @@ pub fn render(
                             &drawing,
                             &state.candles,
                             state.candle_interval_ms(),
+                            None,
                         );
                         let symbol = state.symbol.clone();
                         let svc = cx.global::<DrawingServiceHandle>().0.clone();
@@ -3692,6 +3703,7 @@ pub fn render(
                             &drawing,
                             &state.candles,
                             state.candle_interval_ms(),
+                            None,
                         );
                         let symbol = state.symbol.clone();
                         let svc = cx.global::<DrawingServiceHandle>().0.clone();
@@ -3725,6 +3737,7 @@ pub fn render(
                                 &drawing,
                                 &state.candles,
                                 state.candle_interval_ms(),
+                                None,
                             );
                             let symbol = state.symbol.clone();
                             let svc = cx.global::<DrawingServiceHandle>().0.clone();
@@ -3851,15 +3864,26 @@ pub fn render(
                                 }
                                 let symbol2 = symbol.clone();
                                 let svc = cx.global::<DrawingServiceHandle>().0.clone();
+                                // Locked drawings select but never enter
+                                // edit-drag — the strip surfaces an unlock
+                                // toggle so the user can release the lock
+                                // before moving the geometry.
+                                let is_locked = svc
+                                    .read(cx)
+                                    .for_symbol(symbol2.as_ref())
+                                    .iter()
+                                    .any(|d| d.id == hit_id && d.locked);
                                 svc.update(cx, |s, cx| s.set_selected(Some((symbol2, hit_id)), cx));
-                                state.edit_drag = Some(EditDrag {
-                                    id: hit_id,
-                                    handle,
-                                    baseline,
-                                    anchor_world: (world_t, world_p),
-                                    anchor_screen: (canvas_x, canvas_y),
-                                    moved: false,
-                                });
+                                if !is_locked {
+                                    state.edit_drag = Some(EditDrag {
+                                        id: hit_id,
+                                        handle,
+                                        baseline,
+                                        anchor_world: (world_t, world_p),
+                                        anchor_screen: (canvas_x, canvas_y),
+                                        moved: false,
+                                    });
+                                }
                                 cx.notify();
                                 return;
                             }
@@ -3953,13 +3977,20 @@ pub fn render(
                 if !handled {
                     apply_edit(&mut edited, &drag.baseline, drag.handle, dt, dp);
                 }
+                let symbol = state.symbol.clone();
+                let svc = cx.global::<DrawingServiceHandle>().0.clone();
+                let prev_shape: Option<crate::drawings::shapes::DrawingShape> = svc
+                    .read(cx)
+                    .for_symbol(symbol.as_ref())
+                    .iter()
+                    .find(|d| d.id == drag.id)
+                    .map(|d| d.shape.clone());
                 let shape = drawings_view::view_to_shape(
                     &edited,
                     &state.candles,
                     state.candle_interval_ms(),
+                    prev_shape.as_ref(),
                 );
-                let symbol = state.symbol.clone();
-                let svc = cx.global::<DrawingServiceHandle>().0.clone();
                 svc.update(cx, |s, cx| {
                     s.preview_shape(symbol.as_ref(), drag.id, shape, cx)
                 });
@@ -4052,7 +4083,12 @@ pub fn render(
                                     let mut view =
                                         drawings_view::shape_to_view(d, &candles_snap, interval);
                                     snap_view_to_grid(&mut view);
-                                    drawings_view::view_to_shape(&view, &candles_snap, interval)
+                                    drawings_view::view_to_shape(
+                                        &view,
+                                        &candles_snap,
+                                        interval,
+                                        Some(&d.shape),
+                                    )
                                 })
                         };
                         if let Some(shape) = snapped {

@@ -12,6 +12,7 @@ use gpui::{App, Global, SharedString};
 pub mod actions;
 pub mod service;
 pub mod shapes;
+pub mod strip_content;
 pub mod tool;
 
 /// Captured at right-mouse-down on a chart canvas; read by that chart's

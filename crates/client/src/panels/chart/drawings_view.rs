@@ -179,54 +179,123 @@ pub fn shape_to_view(
 
 /// Convert a view-coord drawing back to a service shape. Called at commit
 /// points (mouse-up after create or edit) so the service stores absolute ms.
-pub fn view_to_shape(view: &ViewDrawing, candles: &[Candle], bar_duration_ms: i64) -> DrawingShape {
+///
+/// `baseline` carries the style fields (color/width/label/…) that should be
+/// preserved across the round-trip. Pass the previous `DrawingShape` for
+/// edits; pass `None` for fresh creations (the result then carries the
+/// per-shape defaults). Mismatched variant → defaults (which only matters
+/// if a future caller tries to "morph" a shape, which we don't today).
+pub fn view_to_shape(
+    view: &ViewDrawing,
+    candles: &[Candle],
+    bar_duration_ms: i64,
+    baseline: Option<&DrawingShape>,
+) -> DrawingShape {
     let i2t = |i: f32| idx_to_time(i, candles, bar_duration_ms);
     use crate::drawings::shapes::{
         AnchoredVwapShape, HorizontalRayShape, LineRectShape, PositionShape, TextShape,
     };
     match view {
-        ViewDrawing::Line { a, b, .. } => DrawingShape::Line(LineRectShape {
-            a_time: i2t(a.0),
-            a_price: a.1,
-            b_time: i2t(b.0),
-            b_price: b.1,
-        }),
-        ViewDrawing::Arrow { a, b, .. } => DrawingShape::Arrow(LineRectShape {
-            a_time: i2t(a.0),
-            a_price: a.1,
-            b_time: i2t(b.0),
-            b_price: b.1,
-        }),
-        ViewDrawing::Fibonacci { a, b, .. } => DrawingShape::Fibonacci(LineRectShape {
-            a_time: i2t(a.0),
-            a_price: a.1,
-            b_time: i2t(b.0),
-            b_price: b.1,
-        }),
-        ViewDrawing::Rect { a, b, .. } => DrawingShape::Rect(LineRectShape {
-            a_time: i2t(a.0),
-            a_price: a.1,
-            b_time: i2t(b.0),
-            b_price: b.1,
-        }),
+        ViewDrawing::Line { a, b, .. } => {
+            let mut s = LineRectShape {
+                a_time: i2t(a.0),
+                a_price: a.1,
+                b_time: i2t(b.0),
+                b_price: b.1,
+                color: None,
+                width: 1.0,
+                label: None,
+            };
+            if let Some(DrawingShape::Line(b)) = baseline {
+                s.color = b.color;
+                s.width = b.width;
+                s.label = b.label.clone();
+            }
+            DrawingShape::Line(s)
+        }
+        ViewDrawing::Arrow { a, b, .. } => {
+            let mut s = LineRectShape {
+                a_time: i2t(a.0),
+                a_price: a.1,
+                b_time: i2t(b.0),
+                b_price: b.1,
+                color: None,
+                width: 1.0,
+                label: None,
+            };
+            if let Some(DrawingShape::Arrow(b)) = baseline {
+                s.color = b.color;
+                s.width = b.width;
+                s.label = b.label.clone();
+            }
+            DrawingShape::Arrow(s)
+        }
+        ViewDrawing::Fibonacci { a, b, .. } => {
+            let mut s = LineRectShape {
+                a_time: i2t(a.0),
+                a_price: a.1,
+                b_time: i2t(b.0),
+                b_price: b.1,
+                color: None,
+                width: 1.0,
+                label: None,
+            };
+            if let Some(DrawingShape::Fibonacci(b)) = baseline {
+                s.color = b.color;
+                s.width = b.width;
+                s.label = b.label.clone();
+            }
+            DrawingShape::Fibonacci(s)
+        }
+        ViewDrawing::Rect { a, b, .. } => {
+            let mut s = LineRectShape {
+                a_time: i2t(a.0),
+                a_price: a.1,
+                b_time: i2t(b.0),
+                b_price: b.1,
+                color: None,
+                width: 1.0,
+                label: None,
+            };
+            if let Some(DrawingShape::Rect(b)) = baseline {
+                s.color = b.color;
+                s.width = b.width;
+                s.label = b.label.clone();
+            }
+            DrawingShape::Rect(s)
+        }
         ViewDrawing::HorizontalRay { anchor, text, .. } => {
-            DrawingShape::HorizontalRay(HorizontalRayShape {
+            let mut s = HorizontalRayShape {
                 anchor_time: i2t(anchor.0),
                 anchor_price: anchor.1,
                 text: text.clone(),
-            })
+                color: None,
+                width: 1.0,
+            };
+            if let Some(DrawingShape::HorizontalRay(b)) = baseline {
+                s.color = b.color;
+                s.width = b.width;
+            }
+            DrawingShape::HorizontalRay(s)
         }
         ViewDrawing::Text {
             anchor,
             width,
             text,
             ..
-        } => DrawingShape::Text(TextShape {
-            anchor_time: i2t(anchor.0),
-            anchor_price: anchor.1,
-            width: *width,
-            text: text.clone(),
-        }),
+        } => {
+            let mut s = TextShape {
+                anchor_time: i2t(anchor.0),
+                anchor_price: anchor.1,
+                width: *width,
+                text: text.clone(),
+                color: None,
+            };
+            if let Some(DrawingShape::Text(b)) = baseline {
+                s.color = b.color;
+            }
+            DrawingShape::Text(s)
+        }
         ViewDrawing::Long {
             t0,
             t1,
@@ -234,13 +303,26 @@ pub fn view_to_shape(view: &ViewDrawing, candles: &[Candle], bar_duration_ms: i6
             take_profit,
             stop_loss,
             ..
-        } => DrawingShape::Long(PositionShape {
-            t0: i2t(*t0),
-            t1: i2t(*t1),
-            entry: *entry,
-            take_profit: *take_profit,
-            stop_loss: *stop_loss,
-        }),
+        } => {
+            let mut s = PositionShape {
+                t0: i2t(*t0),
+                t1: i2t(*t1),
+                entry: *entry,
+                take_profit: *take_profit,
+                stop_loss: *stop_loss,
+                profit_color: None,
+                loss_color: None,
+                width: 1.0,
+                label: None,
+            };
+            if let Some(DrawingShape::Long(b)) = baseline {
+                s.profit_color = b.profit_color;
+                s.loss_color = b.loss_color;
+                s.width = b.width;
+                s.label = b.label.clone();
+            }
+            DrawingShape::Long(s)
+        }
         ViewDrawing::Short {
             t0,
             t1,
@@ -248,15 +330,39 @@ pub fn view_to_shape(view: &ViewDrawing, candles: &[Candle], bar_duration_ms: i6
             take_profit,
             stop_loss,
             ..
-        } => DrawingShape::Short(PositionShape {
-            t0: i2t(*t0),
-            t1: i2t(*t1),
-            entry: *entry,
-            take_profit: *take_profit,
-            stop_loss: *stop_loss,
-        }),
-        ViewDrawing::AnchoredVwap { anchor, .. } => DrawingShape::AnchoredVwap(AnchoredVwapShape {
-            anchor_time: i2t(anchor.0),
-        }),
+        } => {
+            let mut s = PositionShape {
+                t0: i2t(*t0),
+                t1: i2t(*t1),
+                entry: *entry,
+                take_profit: *take_profit,
+                stop_loss: *stop_loss,
+                profit_color: None,
+                loss_color: None,
+                width: 1.0,
+                label: None,
+            };
+            if let Some(DrawingShape::Short(b)) = baseline {
+                s.profit_color = b.profit_color;
+                s.loss_color = b.loss_color;
+                s.width = b.width;
+                s.label = b.label.clone();
+            }
+            DrawingShape::Short(s)
+        }
+        ViewDrawing::AnchoredVwap { anchor, .. } => {
+            let mut s = AnchoredVwapShape {
+                anchor_time: i2t(anchor.0),
+                color: None,
+                width: 1.0,
+                label: None,
+            };
+            if let Some(DrawingShape::AnchoredVwap(b)) = baseline {
+                s.color = b.color;
+                s.width = b.width;
+                s.label = b.label.clone();
+            }
+            DrawingShape::AnchoredVwap(s)
+        }
     }
 }

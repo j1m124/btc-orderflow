@@ -84,3 +84,18 @@ pub struct EditHorizontalRayText {
     pub symbol: SharedString,
     pub id: u64,
 }
+
+/// Toggle the `locked` flag on a drawing. `(symbol, id)`. Surfaced from the
+/// floating settings strip.
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct ToggleDrawingLocked {
+    pub symbol: SharedString,
+    pub id: u64,
+}
+
+/// Drop the global drawing selection (closes the floating settings strip).
+/// Dispatched from ESC, empty-canvas clicks, and TF-mismatch auto-deselect.
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = client, no_json)]
+pub struct DeselectDrawing;

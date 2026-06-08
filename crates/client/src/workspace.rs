@@ -12,7 +12,9 @@ use gpui_component::{
 };
 
 use crate::bottom_bar::BottomBar;
+use crate::drawings::strip_content::DrawingStripContent;
 use crate::floating_code_editor::{FloatingCodeEditor, ToggleFloatingCodeEditor};
+use crate::floating_strip::{FloatingStrip, FloatingStripEvent};
 use crate::floating_window::FloatingWindow;
 use crate::indicator_picker::{
     IndicatorPickerEvent, IndicatorPickerIntent, IndicatorPickerState, OpenIndicatorPicker,
@@ -44,6 +46,12 @@ pub struct TerminalWorkspace {
     indicator_settings: Option<FloatingIndicatorSettingsSlot>,
     chart_render_settings: Option<FloatingChartRenderSettingsSlot>,
     floating_code_editor: Option<FloatingCodeEditorSlot>,
+    drawing_strip: Entity<FloatingStrip>,
+    /// Kept alive on the workspace so the subscription wiring in
+    /// `new` can call `cx.notify` on it from outside the strip itself.
+    /// The strip's content view holds the same handle via `AnyView`.
+    #[allow(dead_code)]
+    drawing_strip_content: Entity<DrawingStripContent>,
 }
 
 struct FloatingCodeEditorSlot {
@@ -118,6 +126,68 @@ impl TerminalWorkspace {
         )
         .detach();
 
+        let drawing_strip = cx.new(FloatingStrip::new);
+        let drawing_strip_content = crate::drawings::strip_content::build(cx);
+        drawing_strip.update(cx, |strip, cx| {
+            strip.set_content(drawing_strip_content.clone().into(), cx);
+            if let Some(pos) = persistence::load_drawing_strip_position() {
+                strip.set_origin(gpui::point(px(pos.x), px(pos.y)), cx);
+            }
+        });
+        cx.subscribe(&drawing_strip, |_this, _strip, ev: &FloatingStripEvent, _cx| {
+            match ev {
+                FloatingStripEvent::Moved(o) => {
+                    let _ = persistence::save_drawing_strip_position(
+                        persistence::DrawingStripPosition {
+                            x: f32::from(o.x),
+                            y: f32::from(o.y),
+                        },
+                    );
+                }
+            }
+        })
+        .detach();
+
+        // Mirror the global drawing-selection state into the strip's
+        // visibility. SelectionChanged also fires on programmatic deselect
+        // (TF-mismatch, ESC, etc.) so the strip naturally hides.
+        if let Some(handle) = cx.try_global::<crate::drawings::service::DrawingServiceHandle>().cloned() {
+            // Set initial visibility from the current selection.
+            let initially_visible = handle.0.read(cx).selected().is_some();
+            drawing_strip.update(cx, |strip, cx| {
+                if initially_visible {
+                    strip.show(cx);
+                } else {
+                    strip.hide(cx);
+                }
+            });
+            let strip_for_sub = drawing_strip.clone();
+            let content_for_sub = drawing_strip_content.clone();
+            cx.subscribe(
+                &handle.0,
+                move |_this, svc, ev: &crate::drawings::service::DrawingEvent, cx| match ev {
+                    crate::drawings::service::DrawingEvent::SelectionChanged => {
+                        let has_sel = svc.read(cx).selected().is_some();
+                        strip_for_sub.update(cx, |strip, cx| {
+                            if has_sel {
+                                strip.show(cx);
+                            } else {
+                                strip.hide(cx);
+                            }
+                        });
+                        content_for_sub.update(cx, |_, cx| cx.notify());
+                    }
+                    crate::drawings::service::DrawingEvent::Changed { .. }
+                    | crate::drawings::service::DrawingEvent::Wiped => {
+                        // Style/visibility flag mutations on the selected
+                        // drawing must repaint the strip's button chrome.
+                        content_for_sub.update(cx, |_, cx| cx.notify());
+                    }
+                },
+            )
+            .detach();
+        }
+
         Self {
             top_bar,
             bottom_bar,
@@ -131,6 +201,8 @@ impl TerminalWorkspace {
             indicator_settings: None,
             chart_render_settings: None,
             floating_code_editor: None,
+            drawing_strip,
+            drawing_strip_content,
         }
     }
 
@@ -736,6 +808,43 @@ impl TerminalWorkspace {
                 )
         });
     }
+
+    fn on_toggle_drawing_locked(
+        &mut self,
+        action: &crate::drawings::actions::ToggleDrawingLocked,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol = action.symbol.clone();
+        let id = action.id;
+        let svc = cx
+            .global::<crate::drawings::service::DrawingServiceHandle>()
+            .0
+            .clone();
+        let cur = svc
+            .read(cx)
+            .for_symbol(symbol.as_ref())
+            .iter()
+            .find(|d| d.id == id)
+            .map(|d| d.locked)
+            .unwrap_or(false);
+        svc.update(cx, |s, cx| s.set_locked(symbol.as_ref(), id, !cur, cx));
+    }
+
+    fn on_deselect_drawing(
+        &mut self,
+        _: &crate::drawings::actions::DeselectDrawing,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = cx
+            .try_global::<crate::drawings::service::DrawingServiceHandle>()
+            .cloned()
+        else {
+            return;
+        };
+        handle.0.update(cx, |s, cx| s.clear_selection(cx));
+    }
 }
 
 #[derive(Clone)]
@@ -792,6 +901,8 @@ impl Render for TerminalWorkspace {
             .on_action(cx.listener(Self::on_clear_chart_drawings))
             .on_action(cx.listener(Self::on_clear_all_drawings))
             .on_action(cx.listener(Self::on_edit_horizontal_ray_text))
+            .on_action(cx.listener(Self::on_toggle_drawing_locked))
+            .on_action(cx.listener(Self::on_deselect_drawing))
             .relative()
             .size_full()
             .flex()
@@ -822,7 +933,8 @@ impl Render for TerminalWorkspace {
                         self.chart_render_settings
                             .as_ref()
                             .map(|slot| slot.window.clone()),
-                    ),
+                    )
+                    .child(self.drawing_strip.clone()),
             )
             .child(self.bottom_bar.clone())
             .child(self.symbol_picker.clone())

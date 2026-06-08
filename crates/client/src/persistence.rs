@@ -265,6 +265,22 @@ fn read_drawings_blob() -> Option<String> {
     read_storage_blob(DRAWINGS_KEY)
 }
 
+const DRAWING_STRIP_POS_KEY: &str = "btc_orderflow.drawing_strip_position.v1";
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct DrawingStripPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+pub fn load_drawing_strip_position() -> Option<DrawingStripPosition> {
+    load_json_opt(DRAWING_STRIP_POS_KEY)
+}
+
+pub fn save_drawing_strip_position(pos: DrawingStripPosition) -> Result<()> {
+    save_json(DRAWING_STRIP_POS_KEY, &pos)
+}
+
 const GENERAL_PREFS_KEY: &str = "btc_orderflow.general_prefs.v3";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

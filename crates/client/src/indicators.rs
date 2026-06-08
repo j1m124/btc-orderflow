@@ -21,8 +21,8 @@ pub mod volume_delta;
 pub use bar_stat::{BarStatGrade, BarStatParams};
 pub use bb::BbParams;
 pub use instance::{
-    COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, default_pane_height, new_instance_id,
-    palette_color_for,
+    COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, bump_next_id_past, default_pane_height,
+    new_instance_id, palette_color_for,
 };
 pub use kind::{ComputeCtx, IndicatorKind, PaneKind, Placement, Source};
 pub use output::{IndicatorOutput, Series, ValueReadout};

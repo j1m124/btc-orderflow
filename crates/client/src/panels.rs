@@ -98,6 +98,14 @@ pub fn init(cx: &mut App) {
             crate::drawings::actions::DeleteSelectedDrawing,
             Some("Chart"),
         ),
+        // ESC drops the global drawing selection — hides the floating
+        // settings strip + closes any open gear window. Bound on Chart so
+        // input fields elsewhere still treat ESC as their own cancel.
+        gpui::KeyBinding::new(
+            "escape",
+            crate::drawings::actions::DeselectDrawing,
+            Some("Chart"),
+        ),
     ]);
     for kind in Kind::ALL {
         let kind = *kind;
@@ -186,6 +194,11 @@ pub(crate) struct IndicatorPrefs {
     pub colors: Vec<HslaPref>,
     #[serde(default)]
     pub hidden: bool,
+    /// Persisted across reloads so drawings anchored to
+    /// `PaneRef::Indicator(InstanceId)` keep their target. `None` on
+    /// pre-feature blobs — restore mints a fresh id in that case.
+    #[serde(default)]
+    pub id: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -1146,6 +1159,25 @@ impl ContentPanel {
         self.chart_sub_handles = new_handles;
         let live = live_snapshot(symbol.as_ref(), tf, cx);
         if state.switch_timeframe(tf, live) {
+            // The selected drawing might have a tf_filter that excludes the
+            // new TF — clear the global selection so the floating settings
+            // strip closes instead of orphaning over a now-invisible
+            // drawing. Mirrors the chart's per-TF visibility rule.
+            if let Some(handle) = cx
+                .try_global::<crate::drawings::service::DrawingServiceHandle>()
+                .cloned()
+            {
+                let tf_str = tf.as_str();
+                let should_clear = handle
+                    .0
+                    .read(cx)
+                    .selected_drawing()
+                    .map(|(_, d)| !d.visible_on(tf_str))
+                    .unwrap_or(false);
+                if should_clear {
+                    handle.0.update(cx, |s, cx| s.clear_selection(cx));
+                }
+            }
             self.refresh_chart_footprint_sub(cx);
             cx.notify();
             request_layout_save(cx);
@@ -1590,6 +1622,7 @@ impl Panel for ContentPanel {
                     pane_height: inst.pane_height,
                     colors: inst.colors.iter().copied().map(HslaPref::from).collect(),
                     hidden: inst.hidden,
+                    id: Some(inst.id),
                 })
                 .collect();
             if let Ok(value) = serde_json::to_value(ChartPrefs {
