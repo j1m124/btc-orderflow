@@ -275,7 +275,7 @@ pub fn view_to_shape(
                 b_time: i2t(b.0),
                 b_price: b.1,
                 color: None,
-                width: 1.0,
+                width: 2.0,
                 label: None,
             };
             if let Some(DrawingShape::Line(b)) = baseline {
@@ -292,7 +292,7 @@ pub fn view_to_shape(
                 b_time: i2t(b.0),
                 b_price: b.1,
                 color: None,
-                width: 1.0,
+                width: 2.0,
                 label: None,
             };
             if let Some(DrawingShape::Arrow(b)) = baseline {
@@ -309,7 +309,7 @@ pub fn view_to_shape(
                 b_time: i2t(b.0),
                 b_price: b.1,
                 color: None,
-                width: 1.0,
+                width: 2.0,
                 label: None,
             };
             if let Some(DrawingShape::Fibonacci(b)) = baseline {
@@ -326,7 +326,7 @@ pub fn view_to_shape(
                 b_time: i2t(b.0),
                 b_price: b.1,
                 color: None,
-                width: 1.0,
+                width: 2.0,
                 label: None,
             };
             if let Some(DrawingShape::Rect(b)) = baseline {
@@ -342,7 +342,7 @@ pub fn view_to_shape(
                 anchor_price: anchor.1,
                 text: text.clone(),
                 color: None,
-                width: 1.0,
+                width: 2.0,
             };
             if let Some(DrawingShape::HorizontalRay(b)) = baseline {
                 s.color = b.color;
@@ -384,7 +384,7 @@ pub fn view_to_shape(
                 stop_loss: *stop_loss,
                 profit_color: None,
                 loss_color: None,
-                width: 1.0,
+                width: 2.0,
                 label: None,
             };
             if let Some(DrawingShape::Long(b)) = baseline {
@@ -411,7 +411,7 @@ pub fn view_to_shape(
                 stop_loss: *stop_loss,
                 profit_color: None,
                 loss_color: None,
-                width: 1.0,
+                width: 2.0,
                 label: None,
             };
             if let Some(DrawingShape::Short(b)) = baseline {
@@ -426,7 +426,7 @@ pub fn view_to_shape(
             let mut s = AnchoredVwapShape {
                 anchor_time: i2t(anchor.0),
                 color: None,
-                width: 1.0,
+                width: 2.0,
                 label: None,
             };
             if let Some(DrawingShape::AnchoredVwap(b)) = baseline {

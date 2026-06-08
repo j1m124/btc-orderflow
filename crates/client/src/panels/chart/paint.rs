@@ -1462,9 +1462,9 @@ fn paint_drawings_overlay(
     let paint_line =
         |window: &mut Window, ax: f32, ay: f32, bx: f32, by: f32, color: Hsla, width: f32| {
             // `width <= 0.0` is the "no per-drawing override" sentinel
-            // (in-flight create previews, indicator-derived overlays). Keep
-            // the legacy 1.5 px so the visual matches pre-Phase-7 exactly.
-            let w = if width > 0.0 { width } else { 1.5 };
+            // (in-flight create previews, crosshair guides). Falls back to
+            // the global 2 px default so previews match the committed look.
+            let w = if width > 0.0 { width } else { 2.0 };
             let mut pb = PathBuilder::stroke(px(w));
             pb.move_to(point(px(ax) + origin.x, px(ay) + origin.y));
             pb.line_to(point(px(bx) + origin.x, px(by) + origin.y));
@@ -1586,23 +1586,17 @@ fn paint_drawings_overlay(
                     is_preview: bool| {
         // Preview drawings carry no style record (they live on the chart's
         // `creating` state, not the service). Lookup returns the default
-        // style → paint falls back to the theme + the legacy 1.5 px stroke.
+        // style → paint falls back to the theme line color + 2 px default.
         let style = styles.get(&d.id()).cloned().unwrap_or_default();
         let custom_stroke = style.color;
-        // In-flight previews flip to the ring colour so the user can see
-        // what they're drawing against the theme stroke. Selection no longer
-        // recolours the stroke — endpoint handles are the selection cue and
-        // the user's custom colour should stay visible while it's the active
-        // drawing.
-        let stroke = if is_preview {
-            colors.ring
-        } else {
-            custom_stroke.unwrap_or(colors.line)
-        };
-        // Width override applies to committed drawings only; the preview
-        // sticks with the paint default so an in-flight line doesn't suddenly
-        // jump to a thicker stroke at mouse-up.
-        let line_w = if is_preview { 0.0 } else { style.width };
+        // Stroke colour: previews and committed drawings both use the
+        // shape's effective colour (theme default unless overridden).
+        // Endpoint handles are the selection cue; previews are visible by
+        // virtue of being drawn under the cursor — no blue tint needed.
+        let stroke = custom_stroke.unwrap_or(colors.line);
+        // Width: previews carry no style record, so width=0 → paint's 2 px
+        // fallback. Committed drawings use their stored width.
+        let line_w = style.width;
         match d {
             Drawing::Line { a, b, .. } => {
                 let (ax, ay) = to_screen(*a);
@@ -1659,11 +1653,7 @@ fn paint_drawings_overlay(
                 let (ax, _ay) = to_screen(*a);
                 let (bx, _by) = to_screen(*b);
                 let (xmin, xmax) = (ax.min(bx), ax.max(bx));
-                let level_color = if is_preview {
-                    colors.ring
-                } else {
-                    custom_stroke.unwrap_or(colors.line)
-                };
+                let level_color = custom_stroke.unwrap_or(colors.line);
                 let fade_color = Hsla {
                     a: 0.6,
                     ..level_color
@@ -1826,20 +1816,21 @@ fn paint_drawings_overlay(
                     origin: point(px(xmin) + origin.x, px(ymin) + origin.y),
                     size: gpui::size(px(xmax - xmin), px(ymax - ymin)),
                 };
-                let border_color = if is_selected || is_preview {
-                    colors.ring
-                } else {
-                    colors.rect_border
-                };
+                // Border colour/width: user override (style.color, style.width)
+                // both flow through `stroke` + `line_w` above. Falls back to
+                // the theme rect-border + 2 px default when the user hasn't
+                // customised the shape.
+                let border_color = custom_stroke.unwrap_or(colors.rect_border);
+                let border_w = if line_w > 0.0 { line_w } else { 2.0 };
                 window.paint_quad(PaintQuad {
                     bounds: rb,
                     corner_radii: Corners::default(),
                     background: colors.rect_fill.into(),
                     border_widths: Edges {
-                        top: px(1.5),
-                        right: px(1.5),
-                        bottom: px(1.5),
-                        left: px(1.5),
+                        top: px(border_w),
+                        right: px(border_w),
+                        bottom: px(border_w),
+                        left: px(border_w),
                     },
                     border_color,
                     border_style: BorderStyle::default(),
@@ -1883,10 +1874,10 @@ fn paint_drawings_overlay(
             _ => {}
         }
 
-        // Optional top-right label. Each non-Text / non-Ray shape may carry
-        // a short user-supplied label rendered just above-right of its
-        // bounding box. Skipped for previews (no style record), and skipped
-        // for HorizontalRay (which paints its own label inside the arm).
+        // Optional top-right label. Only Rect / Fibonacci / Long / Short
+        // surface a user-editable label today — Line / Arrow / AnchoredVwap
+        // were trimmed at user request (visual noise outweighed the value).
+        // HorizontalRay and Text paint their own text inline / as a div.
         if is_preview {
             return;
         }
@@ -1894,14 +1885,27 @@ fn paint_drawings_overlay(
             Some(s) if !s.is_empty() => s,
             _ => return,
         };
-        let label_pos = match d {
-            Drawing::Line { a, b, .. }
-            | Drawing::Arrow { a, b, .. }
-            | Drawing::Rect { a, b, .. }
-            | Drawing::Fibonacci { a, b, .. } => {
+        // (label_anchor_x, label_anchor_y, inside_rect)
+        //  - inside_rect=true → label is right-aligned inside the rect's
+        //    right edge (Rect only); the anchor_x carries `xmax`.
+        //  - inside_rect=false → label paints to the right of anchor_x at
+        //    `anchor_x + 4`; anchor_y is the y of the label's top edge.
+        let (label_anchor_x, label_anchor_y, inside_rect) = match d {
+            Drawing::Rect { a, b, .. } => {
                 let (ax, ay) = to_screen(*a);
                 let (bx, by) = to_screen(*b);
-                Some((ax.max(bx), ay.min(by)))
+                let xmax = ax.max(bx);
+                let ymin = ay.min(by);
+                // Right-aligned inside, with a small inset from the top edge.
+                (xmax, ymin + 2.0, true)
+            }
+            Drawing::Fibonacci { a, b, .. } => {
+                let (ax, ay) = to_screen(*a);
+                let (bx, by) = to_screen(*b);
+                // Fib's top horizontal line sits at `ay.min(by)`. Float the
+                // label well above it so it doesn't overlap the level line
+                // or its ratio chip on the right.
+                (ax.max(bx), ay.min(by) - 22.0, false)
             }
             Drawing::Long {
                 t0,
@@ -1924,26 +1928,16 @@ fn paint_drawings_overlay(
                 let (_, y_entry) = to_screen((*t0, *entry));
                 let (_, y_tp) = to_screen((*t0, *take_profit));
                 let (_, y_sl) = to_screen((*t0, *stop_loss));
-                Some((x0.max(x1), y_entry.min(y_tp).min(y_sl)))
+                // Align with the E / TP / SL chips at the right edge — those
+                // sit at `top(y - 7)`. Anchor to the top-most price line so
+                // the label sits beside (not above) the topmost chip.
+                let ytop = y_entry.min(y_tp).min(y_sl);
+                (x0.max(x1), ytop - 7.0, false)
             }
-            Drawing::AnchoredVwap { anchor, .. } => {
-                // Pin to the anchor's x at the top of the overlay — the
-                // line's actual top-right depends on accumulated VWAP we'd
-                // have to recompute, and the anchor x is a stable visual
-                // tie back to the line's origin.
-                let sx = index_to_screen(
-                    view_start,
-                    view_size,
-                    anchor.0,
-                    chart_w_for_x,
-                    y_axis_gap,
-                );
-                Some((sx, 0.0))
-            }
-            // HorizontalRay paints its own label; Text's text IS the label.
-            _ => None,
+            // HorizontalRay paints its own inline label; Text's content IS
+            // the label; Line / Arrow / AnchoredVwap intentionally suppress.
+            _ => return,
         };
-        let Some((lx, ly)) = label_pos else { return };
         let label_owned = SharedString::from(label_str.to_string());
         let label_len = label_owned.len();
         let run = TextRun {
@@ -1957,8 +1951,15 @@ fn paint_drawings_overlay(
         let line = window
             .text_system()
             .shape_line(label_owned, px(11.0), &[run], None);
+        let (paint_x, paint_y) = if inside_rect {
+            let text_w = line.width().as_f32();
+            // Pin to the rect's right edge inside, with a 4px gutter.
+            (label_anchor_x - text_w - 4.0, label_anchor_y)
+        } else {
+            (label_anchor_x + 4.0, label_anchor_y)
+        };
         let _ = line.paint(
-            point(px(lx + 4.0) + origin.x, px(ly - 14.0) + origin.y),
+            point(px(paint_x) + origin.x, px(paint_y) + origin.y),
             px(11.0),
             gpui::TextAlign::Left,
             None,

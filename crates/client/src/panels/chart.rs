@@ -44,8 +44,8 @@ use crate::indicators::{
     ComputeCtx, IndicatorInstance, IndicatorKind, IndicatorOutput, InstanceId, Placement,
     ValueReadout, palette_color_for,
 };
-use crate::persistence::VolumeUnit;
 use crate::panels::LastFocusedChart;
+use crate::persistence::VolumeUnit;
 use crate::services::market_data::{self, Candle, Timeframe};
 
 /// Format a bar's open_time in the user's chosen timezone for crosshair /
@@ -156,7 +156,7 @@ pub struct GoToLatest;
 // Default candles per viewport — now user-settable via Settings → General →
 // Chart. The const remains as the seed value for the atomic in `prefs.rs`;
 // runtime reads go through `crate::prefs::chart_default_view()`.
-const CHART_MIN_VIEW: f32 = 8.0;
+const CHART_MIN_VIEW: f32 = 4.0;
 /// Maximum candles visible at once — the hard zoom-out limit. Past ~1px per
 /// candle the view is already aggregated (see the dense paint path), so showing
 /// more adds no detail; this also keeps the whole buffer (up to 5,000 bars)
@@ -262,10 +262,7 @@ pub enum Drawing {
     /// component `anchor.1` is unused for rendering (the line is computed
     /// from candle data) but kept for symmetry with single-anchor drawings
     /// so existing handle/hit-test scaffolding doesn't special-case.
-    AnchoredVwap {
-        id: DrawingId,
-        anchor: (f32, f64),
-    },
+    AnchoredVwap { id: DrawingId, anchor: (f32, f64) },
 }
 
 impl Drawing {
@@ -886,10 +883,7 @@ impl ChartState {
     /// FootprintEvent handler on Snapshot / Update / Prepended. Cleared
     /// (`Vec::new`) when the sub is released — leaves the chart's render
     /// branch free to fall back to candle bodies automatically.
-    pub fn set_footprint_cells(
-        &mut self,
-        cells: Vec<crate::services::market_data::FootprintCell>,
-    ) {
+    pub fn set_footprint_cells(&mut self, cells: Vec<crate::services::market_data::FootprintCell>) {
         self.footprint_cells = cells;
     }
 
@@ -972,13 +966,7 @@ impl ChartState {
             let next_open = prev.open_time + dur;
             let next_close = next_open + dur - 1;
             let flat = Candle::new(
-                next_open,
-                next_close,
-                prev.close,
-                prev.close,
-                prev.close,
-                prev.close,
-                0.0,
+                next_open, next_close, prev.close, prev.close, prev.close, prev.close, 0.0,
             );
             self.candles.push(flat.clone());
             prev = flat;
@@ -1013,7 +1001,8 @@ impl ChartState {
             // (post-reconnect catch-up). User's `view_size` is preserved.
             let total = self.candles.len() as f32;
             if total > 0.0 {
-                self.view_start = total - self.view_size * (1.0 - crate::prefs::chart_right_buffer());
+                self.view_start =
+                    total - self.view_size * (1.0 - crate::prefs::chart_right_buffer());
                 self.clamp();
             }
         }
@@ -1131,7 +1120,9 @@ impl ChartState {
         // instance's per-slot color Vec so paint and the settings UI
         // see a consistent shape.
         self.indicators[idx].sync_colors();
-        let new_output = self.indicators[idx].kind.compute(&self.candles, self.compute_ctx());
+        let new_output = self.indicators[idx]
+            .kind
+            .compute(&self.candles, self.compute_ctx());
         self.indicator_outputs[idx] = new_output;
         true
     }
@@ -1177,9 +1168,7 @@ impl ChartState {
         if let Some(inst) = self.indicators.iter_mut().find(|i| i.id == id) {
             inst.placement = placement;
             inst.pane_height = match placement {
-                Placement::Pane => {
-                    Some(crate::indicators::default_pane_height(inst.kind_id))
-                }
+                Placement::Pane => Some(crate::indicators::default_pane_height(inst.kind_id)),
                 Placement::Overlay => None,
             };
         }
@@ -1623,7 +1612,13 @@ fn render_indicator_chip(
     let (text_color, border_color) = {
         let theme = cx.theme();
         if hidden {
-            (theme.muted_foreground, Hsla { a: 0.45, ..theme.border })
+            (
+                theme.muted_foreground,
+                Hsla {
+                    a: 0.45,
+                    ..theme.border
+                },
+            )
         } else {
             (theme.foreground, theme.border)
         }
@@ -1680,8 +1675,7 @@ fn render_indicator_chip(
                     .menu("Move pane up", Box::new(MoveIndicatorPaneUp(id)))
                     .menu("Move pane down", Box::new(MoveIndicatorPaneDown(id)));
             }
-            m.separator()
-                .menu("Remove", Box::new(RemoveIndicator(id)))
+            m.separator().menu("Remove", Box::new(RemoveIndicator(id)))
         })
         .child(div().child(label))
         .child(
@@ -1769,14 +1763,23 @@ fn render_synthetic_render_chip(
         if !visible {
             (
                 theme.muted_foreground,
-                Hsla { a: 0.45, ..theme.border },
-                Hsla { a: 0.35, ..theme.muted_foreground },
+                Hsla {
+                    a: 0.45,
+                    ..theme.border
+                },
+                Hsla {
+                    a: 0.35,
+                    ..theme.muted_foreground
+                },
             )
         } else {
             (
                 theme.foreground,
                 theme.border,
-                Hsla { a: 0.35, ..theme.muted_foreground },
+                Hsla {
+                    a: 0.35,
+                    ..theme.muted_foreground
+                },
             )
         }
     };
@@ -1878,7 +1881,10 @@ fn render_main_indicator_list(
             theme.border,
             theme.muted_foreground,
             theme.background,
-            Hsla { a: 0.30, ..theme.muted },
+            Hsla {
+                a: 0.30,
+                ..theme.muted
+            },
         )
     };
     let header = h_flex()
@@ -2543,7 +2549,11 @@ pub fn render(
         .ghost()
         .dropdown_menu(move |menu, _, _| {
             let mut menu = menu.action_context(render_focus.clone());
-            for kind in [RenderKind::Candlestick, RenderKind::Cluster, RenderKind::Profile] {
+            for kind in [
+                RenderKind::Candlestick,
+                RenderKind::Cluster,
+                RenderKind::Profile,
+            ] {
                 menu = menu.menu(
                     SharedString::from(kind.display_name()),
                     Box::new(ChangeChartRender(SharedString::from(kind.as_id()))),
@@ -2599,10 +2609,8 @@ pub fn render(
     // to candle bodies automatically.
     let paint_render_kind = state.render_kind();
     let paint_render_visible = state.render_visible();
-    let paint_footprint_params: Option<FootprintParams> =
-        state.active_footprint_params().copied();
-    let paint_footprint_cells: Vec<market_data::FootprintCell> =
-        state.footprint_cells().to_vec();
+    let paint_footprint_params: Option<FootprintParams> = state.active_footprint_params().copied();
+    let paint_footprint_cells: Vec<market_data::FootprintCell> = state.footprint_cells().to_vec();
     let paint_volume_unit = state.volume_unit();
     // Pre-filter overlay indicators for the paint closure: skip hidden /
     // pane-placed instances, snapshot color + output so the closure stays
@@ -2638,9 +2646,9 @@ pub fn render(
             .zip(state.indicator_outputs.iter())
             .filter(|(i, _)| i.placement == Placement::Pane)
             .filter_map(|(i, o)| {
-                let height = i.pane_height.unwrap_or_else(|| {
-                    crate::indicators::default_pane_height(i.kind_id)
-                });
+                let height = i
+                    .pane_height
+                    .unwrap_or_else(|| crate::indicators::default_pane_height(i.kind_id));
                 if i.hidden {
                     // Placeholder y range — never read since `paint_sub_pane`
                     // early-returns on `hidden`. Keep the slot at full height
@@ -3126,109 +3134,108 @@ pub fn render(
     // pill on the right axis, and a "M:SS" countdown to the next bar open.
     // Only live symbols have a developing bar; for historical charts this
     // collapses to an empty vec so we don't paint a stale last-close marker.
-    let live_price_chrome: Vec<gpui::AnyElement> = if let (Some(bounds), Some(last)) =
-        (state.bounds, state.candles.last())
-    {
-        let canvas_w = bounds.size.width.as_f32();
-        let canvas_h = bounds.size.height.as_f32();
-        let y_axis_gap = state.y_axis_gap_px.get();
-        let chart_w = (canvas_w - y_axis_gap).max(0.0);
-        let chart_h = (canvas_h - AXIS_GAP).max(0.0);
+    let live_price_chrome: Vec<gpui::AnyElement> =
+        if let (Some(bounds), Some(last)) = (state.bounds, state.candles.last()) {
+            let canvas_w = bounds.size.width.as_f32();
+            let canvas_h = bounds.size.height.as_f32();
+            let y_axis_gap = state.y_axis_gap_px.get();
+            let chart_w = (canvas_w - y_axis_gap).max(0.0);
+            let chart_h = (canvas_h - AXIS_GAP).max(0.0);
 
-        let last_idx = (state.candles.len() - 1) as f32;
-        let last_x = index_to_screen(
-            state.view_start,
-            state.view_size,
-            last_idx,
-            canvas_w,
-            state.y_axis_gap_px.get(),
-        );
-        let price_y = price_to_screen(y_lo, y_hi, last.close, canvas_h);
+            let last_idx = (state.candles.len() - 1) as f32;
+            let last_x = index_to_screen(
+                state.view_start,
+                state.view_size,
+                last_idx,
+                canvas_w,
+                state.y_axis_gap_px.get(),
+            );
+            let price_y = price_to_screen(y_lo, y_hi, last.close, canvas_h);
 
-        // Direction relative to bar open — colour matches the candle body so
-        // the guide reads as "this is the current bar's close".
-        let bar_color = if last.close >= last.open {
-            theme_chart_bullish
-        } else {
-            theme_chart_bearish
-        };
+            // Direction relative to bar open — colour matches the candle body so
+            // the guide reads as "this is the current bar's close".
+            let bar_color = if last.close >= last.open {
+                theme_chart_bullish
+            } else {
+                theme_chart_bearish
+            };
 
-        let mut out: Vec<gpui::AnyElement> = Vec::new();
+            let mut out: Vec<gpui::AnyElement> = Vec::new();
 
-        // Horizontal price ray. Clamp left to the chart area; if the bar has
-        // scrolled off-screen the ray still hugs the chart's right half so
-        // the user can find the live price without re-anchoring.
-        let line_left = last_x.clamp(0.0, chart_w);
-        let line_width = (chart_w - line_left).max(0.0);
-        if line_width > 0.0 && price_y >= 0.0 && price_y <= chart_h {
+            // Horizontal price ray. Clamp left to the chart area; if the bar has
+            // scrolled off-screen the ray still hugs the chart's right half so
+            // the user can find the live price without re-anchoring.
+            let line_left = last_x.clamp(0.0, chart_w);
+            let line_width = (chart_w - line_left).max(0.0);
+            if line_width > 0.0 && price_y >= 0.0 && price_y <= chart_h {
+                out.push(
+                    div()
+                        .absolute()
+                        .left(px(line_left))
+                        .top(px(price_y - 0.5))
+                        .w(px(line_width))
+                        .h(px(1.0))
+                        // Faded so it doesn't fight the candles/drawings under it.
+                        .bg(Hsla {
+                            a: 0.55,
+                            ..bar_color
+                        })
+                        .into_any_element(),
+                );
+            }
+
+            // Right-axis price pill — solid background in the bar's direction
+            // colour so it's the loudest thing on the axis (this is the "live"
+            // signal users want at a glance).
+            let pill_top = (price_y - 8.0).clamp(0.0, (chart_h - 16.0).max(0.0));
             out.push(
                 div()
                     .absolute()
-                    .left(px(line_left))
-                    .top(px(price_y - 0.5))
-                    .w(px(line_width))
-                    .h(px(1.0))
-                    // Faded so it doesn't fight the candles/drawings under it.
-                    .bg(Hsla {
-                        a: 0.55,
-                        ..bar_color
-                    })
+                    .right(px(0.0))
+                    .top(px(pill_top))
+                    .w(px((y_axis_gap - 2.0).max(0.0)))
+                    .pl(px(4.0))
+                    .pr(px(4.0))
+                    .text_size(px(11.))
+                    .font_semibold()
+                    .text_color(theme_background)
+                    .bg(bar_color)
+                    .rounded(px(2.0))
+                    .child(format_price(last.close))
                     .into_any_element(),
             );
-        }
 
-        // Right-axis price pill — solid background in the bar's direction
-        // colour so it's the loudest thing on the axis (this is the "live"
-        // signal users want at a glance).
-        let pill_top = (price_y - 8.0).clamp(0.0, (chart_h - 16.0).max(0.0));
-        out.push(
-            div()
-                .absolute()
-                .right(px(0.0))
-                .top(px(pill_top))
-                .w(px((y_axis_gap - 2.0).max(0.0)))
-                .pl(px(4.0))
-                .pr(px(4.0))
-                .text_size(px(11.))
-                .font_semibold()
-                .text_color(theme_background)
-                .bg(bar_color)
-                .rounded(px(2.0))
-                .child(format_price(last.close))
-                .into_any_element(),
-        );
+            // M:SS countdown to bar close. Clamped to ≥0 — if `close_time` has
+            // already elapsed (WS-stream hasn't told us yet that the bar
+            // rolled), we just show 0:00 instead of a negative number.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let remaining_ms = (last.close_time - now_ms).max(0);
+            let total_sec = remaining_ms / 1000;
+            let mm = total_sec / 60;
+            let ss = total_sec % 60;
+            let cd_top = (price_y + 8.0).clamp(0.0, (chart_h - 14.0).max(0.0));
+            out.push(
+                div()
+                    .absolute()
+                    .right(px(0.0))
+                    .top(px(cd_top))
+                    .w(px((y_axis_gap - 2.0).max(0.0)))
+                    .pl(px(4.0))
+                    .pr(px(4.0))
+                    .text_size(px(11.))
+                    .text_color(theme_muted_foreground)
+                    .bg(theme_background)
+                    .border_1()
+                    .border_color(theme_border)
+                    .rounded(px(2.0))
+                    .child(SharedString::from(format!("{}:{:02}", mm, ss)))
+                    .into_any_element(),
+            );
 
-        // M:SS countdown to bar close. Clamped to ≥0 — if `close_time` has
-        // already elapsed (WS-stream hasn't told us yet that the bar
-        // rolled), we just show 0:00 instead of a negative number.
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let remaining_ms = (last.close_time - now_ms).max(0);
-        let total_sec = remaining_ms / 1000;
-        let mm = total_sec / 60;
-        let ss = total_sec % 60;
-        let cd_top = (price_y + 8.0).clamp(0.0, (chart_h - 14.0).max(0.0));
-        out.push(
-            div()
-                .absolute()
-                .right(px(0.0))
-                .top(px(cd_top))
-                .w(px((y_axis_gap - 2.0).max(0.0)))
-                .pl(px(4.0))
-                .pr(px(4.0))
-                .text_size(px(11.))
-                .text_color(theme_muted_foreground)
-                .bg(theme_background)
-                .border_1()
-                .border_color(theme_border)
-                .rounded(px(2.0))
-                .child(SharedString::from(format!("{}:{:02}", mm, ss)))
-                .into_any_element(),
-        );
-
-        out
-    } else {
-        Vec::new()
-    };
+            out
+        } else {
+            Vec::new()
+        };
 
     // Y-axis price pill for every visible horizontal ray. Mirrors the
     // live-price pill so each ray's exact price is readable on the axis,
@@ -3278,42 +3285,41 @@ pub fn render(
     // latest bar lands at the default trailing offset, preserving the
     // user's zoom. Anchored to the canvas, inset past the y-axis gutter
     // and the x-axis label row.
-    let go_to_latest_chrome: Vec<gpui::AnyElement> = if state.bounds.is_some()
-        && state.latest_off_right()
-    {
-        let y_axis_gap = state.y_axis_gap_px.get();
-        // No tooltip: the button removes itself on click (latest comes back
-        // into view), and the gpui-component tooltip overlay only hides on
-        // hover-leave — which never fires for a vanished element, leaving a
-        // sticky popup behind. The arrow icon is conventional enough for
-        // "go to latest" without a label.
-        let btn = Button::new("chart-go-to-latest")
-            .icon(IconName::ArrowRight)
-            .ghost()
-            .xsmall()
-            .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
-            .on_click(cx.listener(|this, _ev, _w, cx| {
-                let Some(state) = this.chart_state.as_mut() else {
-                    return;
-                };
-                state.snap_to_latest();
-                cx.notify();
-            }));
-        vec![
-            div()
-                .absolute()
-                .right(px(y_axis_gap + 12.0))
-                .bottom(px(AXIS_GAP + 12.0))
-                // Eat the mouse-down so the canvas's pan handler doesn't
-                // arm a drag underneath the button. The Button's own
-                // on_click still fires on release.
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(btn)
-                .into_any_element(),
-        ]
-    } else {
-        Vec::new()
-    };
+    let go_to_latest_chrome: Vec<gpui::AnyElement> =
+        if state.bounds.is_some() && state.latest_off_right() {
+            let y_axis_gap = state.y_axis_gap_px.get();
+            // No tooltip: the button removes itself on click (latest comes back
+            // into view), and the gpui-component tooltip overlay only hides on
+            // hover-leave — which never fires for a vanished element, leaving a
+            // sticky popup behind. The arrow icon is conventional enough for
+            // "go to latest" without a label.
+            let btn = Button::new("chart-go-to-latest")
+                .icon(IconName::ArrowRight)
+                .ghost()
+                .xsmall()
+                .rounded(gpui_component::button::ButtonRounded::Size(px(999.0)))
+                .on_click(cx.listener(|this, _ev, _w, cx| {
+                    let Some(state) = this.chart_state.as_mut() else {
+                        return;
+                    };
+                    state.snap_to_latest();
+                    cx.notify();
+                }));
+            vec![
+                div()
+                    .absolute()
+                    .right(px(y_axis_gap + 12.0))
+                    .bottom(px(AXIS_GAP + 12.0))
+                    // Eat the mouse-down so the canvas's pan handler doesn't
+                    // arm a drag underneath the button. The Button's own
+                    // on_click still fires on release.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(btn)
+                    .into_any_element(),
+            ]
+        } else {
+            Vec::new()
+        };
 
     // Text labels live as positioned divs (not painted in the overlay) so
     // editing reuses gpui-component's `Input` widget. Each label is purely
@@ -3542,9 +3548,8 @@ pub fn render(
                         // misaligned until some other event triggers another
                         // render. Notify on size change so the next frame
                         // re-renders with the fresh bounds.
-                        let size_changed = state
-                            .bounds
-                            .map_or(true, |prev| prev.size != bounds.size);
+                        let size_changed =
+                            state.bounds.map_or(true, |prev| prev.size != bounds.size);
                         state.bounds = Some(bounds);
                         if size_changed {
                             cx.notify();
@@ -4227,149 +4232,150 @@ pub fn render(
             div()
                 .size_full()
                 .child(
-            // Custom main-chart paint: continuous candle x-positions plus
-            // auto-fit grid + axis labels. Replaces `CandlestickChart`
-            // whose `ScaleBand` slot positioning made horizontal pan feel
-            // discrete.
-            canvas(
-                |_, _, _| (),
-                {
-                    // Capture bullish/bearish before `main_chart_colors` is
-                    // moved into the closure: `MainChartColors` isn't Copy
-                    // and `paint_main_chart` consumes it.
-                    let overlay_bullish = main_chart_colors.bullish;
-                    let overlay_bearish = main_chart_colors.bearish;
-                    move |bounds, _, window, cx| {
-                        // Clip every paint call to the canvas's bounds.
-                        // Without this, wicks of candles whose high/low
-                        // sit outside the locked y range (or the chart's
-                        // 10px top inset) paint past `chart_bottom` into
-                        // the sub-pane below — visible as candle bleed.
-                        // Mirrors what `render_drawings_overlay` does for
-                        // drawing labels.
-                        window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                        paint_main_chart(
-                            bounds,
-                            &paint_candles,
-                            paint_start_idx,
-                            paint_view_start,
-                            paint_view_size,
-                            y_lo,
-                            y_hi,
-                            paint_candle_interval_ms,
-                            paint_y_axis_gap,
-                            main_chart_colors,
-                            paint_render_kind,
-                            paint_render_visible,
-                            paint_footprint_params.as_ref(),
-                            &paint_footprint_cells,
-                            paint_volume_unit,
-                            window,
-                            cx,
-                        );
-                        // Overlay indicators paint after candles + grid but
-                        // before drawings, so user-drawn lines stay on top.
-                        paint_overlay_indicators(
-                            bounds,
-                            paint_start_idx,
-                            paint_candles.len(),
-                            paint_view_start,
-                            paint_view_size,
-                            y_lo,
-                            y_hi,
-                            paint_y_axis_gap,
-                            &paint_overlay_items,
-                            overlay_bullish,
-                            overlay_bearish,
-                            window,
-                        );
-                        });
-                    }
-                },
-            )
-            .size_full(),
-        )
-        // Right-click → context menu shaped by the hit-test captured on
-        // right-mouse-down. Drawing hit → per-drawing actions (Show/Hide,
-        // Visible-on submenu, Delete) plus canvas defaults. Empty area →
-        // canvas defaults only (Clear drawings on chart, Reset scale).
-        // `action_context` routes dispatched actions up through this panel's
-        // focus handle so multi-chart workspaces don't fight over them.
-        // Hosted on the inner paint wrapper (not the outer chart-canvas
-        // div) so its hitbox registers early in prepaint and indicator
-        // chips with `.occlude()` can shadow it — see the wrapper's own
-        // doc-comment above.
-        .context_menu({
-            let focus = focus.clone();
-            move |menu, window, cx| {
-                let mut menu = menu.action_context(focus.clone());
-                let target = cx
-                    .try_global::<crate::drawings::LastChartRightClick>()
-                    .and_then(|g| g.0.borrow().clone());
-                if let Some(target) = target {
-                    if let Some(drawing_id) = target.drawing_id {
-                        // Snapshot the drawing's `hidden`, `tf_filter`, and
-                        // shape kind so the submenu builders don't re-borrow
-                        // the service. `is_ray` gates the "Edit label" item
-                        // since only horizontal rays carry a text label.
-                        let (hidden, tf_filter, is_ray) = {
-                            let svc = cx
-                                .global::<crate::drawings::service::DrawingServiceHandle>()
-                                .0
-                                .clone();
-                            let svc_read = svc.read(cx);
-                            svc_read
-                                .for_symbol(target.symbol.as_ref())
-                                .iter()
-                                .find(|d| d.id == drawing_id)
-                                .map(|d| {
-                                    let is_ray = matches!(
+                    // Custom main-chart paint: continuous candle x-positions plus
+                    // auto-fit grid + axis labels. Replaces `CandlestickChart`
+                    // whose `ScaleBand` slot positioning made horizontal pan feel
+                    // discrete.
+                    canvas(|_, _, _| (), {
+                        // Capture bullish/bearish before `main_chart_colors` is
+                        // moved into the closure: `MainChartColors` isn't Copy
+                        // and `paint_main_chart` consumes it.
+                        let overlay_bullish = main_chart_colors.bullish;
+                        let overlay_bearish = main_chart_colors.bearish;
+                        move |bounds, _, window, cx| {
+                            // Clip every paint call to the canvas's bounds.
+                            // Without this, wicks of candles whose high/low
+                            // sit outside the locked y range (or the chart's
+                            // 10px top inset) paint past `chart_bottom` into
+                            // the sub-pane below — visible as candle bleed.
+                            // Mirrors what `render_drawings_overlay` does for
+                            // drawing labels.
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                paint_main_chart(
+                                    bounds,
+                                    &paint_candles,
+                                    paint_start_idx,
+                                    paint_view_start,
+                                    paint_view_size,
+                                    y_lo,
+                                    y_hi,
+                                    paint_candle_interval_ms,
+                                    paint_y_axis_gap,
+                                    main_chart_colors,
+                                    paint_render_kind,
+                                    paint_render_visible,
+                                    paint_footprint_params.as_ref(),
+                                    &paint_footprint_cells,
+                                    paint_volume_unit,
+                                    window,
+                                    cx,
+                                );
+                                // Overlay indicators paint after candles + grid but
+                                // before drawings, so user-drawn lines stay on top.
+                                paint_overlay_indicators(
+                                    bounds,
+                                    paint_start_idx,
+                                    paint_candles.len(),
+                                    paint_view_start,
+                                    paint_view_size,
+                                    y_lo,
+                                    y_hi,
+                                    paint_y_axis_gap,
+                                    &paint_overlay_items,
+                                    overlay_bullish,
+                                    overlay_bearish,
+                                    window,
+                                );
+                            });
+                        }
+                    })
+                    .size_full(),
+                )
+                // Right-click → context menu shaped by the hit-test captured on
+                // right-mouse-down. Drawing hit → per-drawing actions (Show/Hide,
+                // Visible-on submenu, Delete) plus canvas defaults. Empty area →
+                // canvas defaults only (Clear drawings on chart, Reset scale).
+                // `action_context` routes dispatched actions up through this panel's
+                // focus handle so multi-chart workspaces don't fight over them.
+                // Hosted on the inner paint wrapper (not the outer chart-canvas
+                // div) so its hitbox registers early in prepaint and indicator
+                // chips with `.occlude()` can shadow it — see the wrapper's own
+                // doc-comment above.
+                .context_menu({
+                    let focus = focus.clone();
+                    move |menu, window, cx| {
+                        let mut menu = menu.action_context(focus.clone());
+                        let target = cx
+                            .try_global::<crate::drawings::LastChartRightClick>()
+                            .and_then(|g| g.0.borrow().clone());
+                        if let Some(target) = target {
+                            if let Some(drawing_id) = target.drawing_id {
+                                // Snapshot the drawing's `hidden`, `tf_filter`, and
+                                // shape kind so the submenu builders don't re-borrow
+                                // the service. `is_ray` gates the "Edit label" item
+                                // since only horizontal rays carry a text label.
+                                let (hidden, tf_filter, is_ray) = {
+                                    let svc = cx
+                                        .global::<crate::drawings::service::DrawingServiceHandle>()
+                                        .0
+                                        .clone();
+                                    let svc_read = svc.read(cx);
+                                    svc_read
+                                        .for_symbol(target.symbol.as_ref())
+                                        .iter()
+                                        .find(|d| d.id == drawing_id)
+                                        .map(|d| {
+                                            let is_ray = matches!(
                                         &d.shape,
                                         crate::drawings::shapes::DrawingShape::HorizontalRay(_)
                                     );
-                                    (d.hidden, d.tf_filter.clone(), is_ray)
-                                })
-                                .unwrap_or((false, None, false))
-                        };
-                        let sym_select = target.symbol.clone();
-                        menu = menu.menu(
-                            "Select",
-                            Box::new(crate::drawings::actions::SelectDrawing {
-                                symbol: sym_select,
-                                id: drawing_id,
-                            }),
-                        );
-                        if is_ray {
-                            let sym_label = target.symbol.clone();
-                            menu = menu.menu(
-                                "Edit label",
-                                Box::new(crate::drawings::actions::EditHorizontalRayText {
-                                    symbol: sym_label,
-                                    id: drawing_id,
-                                }),
-                            );
-                        }
-                        let sym_hidden = target.symbol.clone();
-                        menu = menu.menu(
-                            if hidden { "Show" } else { "Hide" },
-                            Box::new(crate::drawings::actions::ToggleDrawingHidden {
-                                symbol: sym_hidden,
-                                id: drawing_id,
-                            }),
-                        );
-                        // Per-drawing "Visible on" submenu (5 TF checkboxes).
-                        let sym_for_sub = target.symbol.clone();
-                        menu = menu.submenu("Visible on", window, cx, move |vis, _w, _cx| {
-                            let mut vis = vis;
-                            for tf in crate::services::market_data::Timeframe::ALL {
-                                let checked = match &tf_filter {
-                                    None => true,
-                                    Some(set) => set.contains(tf.as_str()),
+                                            (d.hidden, d.tf_filter.clone(), is_ray)
+                                        })
+                                        .unwrap_or((false, None, false))
                                 };
-                                let prefix = if checked { "✓ " } else { "  " };
-                                let label =
-                                    SharedString::from(format!("{}{}", prefix, tf.as_str()));
-                                vis = vis.menu(
+                                let sym_select = target.symbol.clone();
+                                menu = menu.menu(
+                                    "Select",
+                                    Box::new(crate::drawings::actions::SelectDrawing {
+                                        symbol: sym_select,
+                                        id: drawing_id,
+                                    }),
+                                );
+                                if is_ray {
+                                    let sym_label = target.symbol.clone();
+                                    menu = menu.menu(
+                                        "Edit label",
+                                        Box::new(crate::drawings::actions::EditHorizontalRayText {
+                                            symbol: sym_label,
+                                            id: drawing_id,
+                                        }),
+                                    );
+                                }
+                                let sym_hidden = target.symbol.clone();
+                                menu = menu.menu(
+                                    if hidden { "Show" } else { "Hide" },
+                                    Box::new(crate::drawings::actions::ToggleDrawingHidden {
+                                        symbol: sym_hidden,
+                                        id: drawing_id,
+                                    }),
+                                );
+                                // Per-drawing "Visible on" submenu (5 TF checkboxes).
+                                let sym_for_sub = target.symbol.clone();
+                                menu =
+                                    menu.submenu("Visible on", window, cx, move |vis, _w, _cx| {
+                                        let mut vis = vis;
+                                        for tf in crate::services::market_data::Timeframe::ALL {
+                                            let checked = match &tf_filter {
+                                                None => true,
+                                                Some(set) => set.contains(tf.as_str()),
+                                            };
+                                            let prefix = if checked { "✓ " } else { "  " };
+                                            let label = SharedString::from(format!(
+                                                "{}{}",
+                                                prefix,
+                                                tf.as_str()
+                                            ));
+                                            vis = vis.menu(
                                     label,
                                     Box::new(crate::drawings::actions::ToggleDrawingTfFilter {
                                         symbol: sym_for_sub.clone(),
@@ -4377,34 +4383,36 @@ pub fn render(
                                         tf: SharedString::from(tf.as_str()),
                                     }),
                                 );
+                                        }
+                                        vis.separator().menu(
+                                            "Visible on all",
+                                            Box::new(
+                                                crate::drawings::actions::ResetDrawingTfFilter {
+                                                    symbol: sym_for_sub.clone(),
+                                                    id: drawing_id,
+                                                },
+                                            ),
+                                        )
+                                    });
+                                let sym_del = target.symbol.clone();
+                                menu = menu.menu(
+                                    "Delete",
+                                    Box::new(crate::drawings::actions::DeleteDrawing {
+                                        symbol: sym_del,
+                                        id: drawing_id,
+                                    }),
+                                );
+                                menu = menu.separator();
                             }
-                            vis.separator().menu(
-                                "Visible on all",
-                                Box::new(crate::drawings::actions::ResetDrawingTfFilter {
-                                    symbol: sym_for_sub.clone(),
-                                    id: drawing_id,
-                                }),
+                        }
+                        menu.menu("Go to latest", Box::new(GoToLatest))
+                            .menu(
+                                "Clear drawings on chart",
+                                Box::new(crate::drawings::actions::ClearChartDrawings),
                             )
-                        });
-                        let sym_del = target.symbol.clone();
-                        menu = menu.menu(
-                            "Delete",
-                            Box::new(crate::drawings::actions::DeleteDrawing {
-                                symbol: sym_del,
-                                id: drawing_id,
-                            }),
-                        );
-                        menu = menu.separator();
+                            .menu("Reset chart scale", Box::new(ResetChartScale))
                     }
-                }
-                menu.menu("Go to latest", Box::new(GoToLatest))
-                    .menu(
-                        "Clear drawings on chart",
-                        Box::new(crate::drawings::actions::ClearChartDrawings),
-                    )
-                    .menu("Reset chart scale", Box::new(ResetChartScale))
-            }
-        }),
+                }),
         )
         // Drawings paint between candles and the axis interaction zones —
         // visually above the chart, but the (non-interactive) overlay
@@ -4689,22 +4697,20 @@ pub fn render(
         // 4px boundary. Limitation: drag also dies when the cursor exits
         // the panel root entirely (v1 — a global pointer-capture would
         // fix it but isn't needed for the common adjust gesture).
-        .on_mouse_move(
-            cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                let Some(state) = this.chart_state.as_mut() else {
-                    return;
-                };
-                let Some(drag) = state.splitter_drag else {
-                    return;
-                };
-                // Splitter sits ABOVE its sub-pane. Drag up (delta_y < 0)
-                // grows the pane; drag down (delta_y > 0) shrinks it.
-                let delta_y = ev.position.y.as_f32() - drag.start_y;
-                let new_h = drag.start_height - delta_y;
-                state.set_indicator_pane_height(drag.instance_id, new_h);
-                cx.notify();
-            }),
-        )
+        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
+            let Some(state) = this.chart_state.as_mut() else {
+                return;
+            };
+            let Some(drag) = state.splitter_drag else {
+                return;
+            };
+            // Splitter sits ABOVE its sub-pane. Drag up (delta_y < 0)
+            // grows the pane; drag down (delta_y > 0) shrinks it.
+            let delta_y = ev.position.y.as_f32() - drag.start_y;
+            let new_h = drag.start_height - delta_y;
+            state.set_indicator_pane_height(drag.instance_id, new_h);
+            cx.notify();
+        }))
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(|this, _ev, _w, cx| {

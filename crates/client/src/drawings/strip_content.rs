@@ -354,10 +354,21 @@ fn supports_width(shape: &DrawingShape) -> bool {
     !matches!(shape, DrawingShape::Text(_))
 }
 
-/// True iff the shape carries a separate label/text field. `Text`'s
-/// own text content IS the label so we don't expose a second slot.
+/// True iff the shape exposes a separate label/text field in the strip.
+/// Per user preference, label is only useful on shapes whose geometry has
+/// a clear "header" location (Rect's top-right inside, Fib's top, Long/
+/// Short's E/TP/SL header row, HorizontalRay's right edge). Line / Arrow
+/// / AnchoredVwap are too thin to host a label cleanly and were trimmed.
+/// `Text`'s own text content IS the label, so it has no separate field.
 fn supports_label(shape: &DrawingShape) -> bool {
-    !matches!(shape, DrawingShape::Text(_))
+    matches!(
+        shape,
+        DrawingShape::Rect(_)
+            | DrawingShape::Fibonacci(_)
+            | DrawingShape::HorizontalRay(_)
+            | DrawingShape::Long(_)
+            | DrawingShape::Short(_)
+    )
 }
 
 /// Read the current stroke width from any shape that has one. Returns

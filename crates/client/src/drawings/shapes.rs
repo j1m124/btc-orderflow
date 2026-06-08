@@ -67,12 +67,14 @@ impl PaneRef {
 
 /// Default line width for shapes that didn't carry a width before this
 /// field existed. Serde reaches for this when older blobs lack `width`.
+/// Bumped to 2 px so freshly-created drawings render at the new global
+/// default; legacy blobs that had explicitly stored `1.0` keep theirs.
 fn default_width() -> f32 {
-    1.0
+    2.0
 }
 
 fn is_default_width(w: &f32) -> bool {
-    (*w - 1.0).abs() < f32::EPSILON
+    (*w - 2.0).abs() < f32::EPSILON
 }
 
 /// Endpoints for line / rectangle / arrow / fibonacci drawings — these
