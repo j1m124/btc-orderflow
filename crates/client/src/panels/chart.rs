@@ -671,6 +671,28 @@ pub struct ChartState {
     /// fallback to candle bodies so the chart never goes blank during the
     /// snapshot round-trip.
     footprint_cells: Vec<crate::services::market_data::FootprintCell>,
+    /// Per-bucket footprint cell cache for VP-family consumers (VRVP today,
+    /// FRVP in Phase 12). Keyed by the bit-pattern of the bucket f64 — same
+    /// keying `ContentPanel.footprint_subs` uses, so a chart-owned bucket
+    /// and a VP-instance bucket at the same dollar value collide cleanly
+    /// into one entry. Replaced wholesale per bucket by
+    /// `ContentPanel`'s FootprintEvent handler; cleared per-bucket via
+    /// [`Self::clear_footprint_cache_bucket`] when the sub is released.
+    ///
+    /// Separate from `footprint_cells` (which is the chart's own primary
+    /// render bucket and gets a fast-path in the candle pane paint) because
+    /// VP consumers often want a *different* bucket than the chart, and we
+    /// don't want VP sub churn to disturb the chart's own paint cache.
+    footprint_cache: std::collections::HashMap<
+        u64,
+        Vec<crate::services::market_data::FootprintCell>,
+    >,
+    /// View-time-range snapshot captured at the last
+    /// [`Self::recompute_indicators`] call. Drives the cheap dirty-check in
+    /// [`Self::maybe_recompute_view_dependent_indicators`] — pan/zoom that
+    /// doesn't actually shift the visible bar range (e.g. dragging within
+    /// one bar's width) is a no-op for VRVP.
+    last_recomputed_view_range: Option<(i64, i64)>,
     /// Per-chart volume display unit. Affects this chart's volume /
     /// volume-delta / CVD indicators (threaded into `ComputeCtx`) AND its
     /// footprint paint pipeline. Surfaces as the header Coin/USD dropdown
@@ -881,20 +903,75 @@ impl ChartState {
 
     /// Build the `ComputeCtx` for the current chart settings — threaded
     /// into every `IndicatorKind::compute` call so per-chart knobs (volume
-    /// unit, future fields) flow through without a global.
+    /// unit, footprint cache, viewport) flow without a global.
     ///
-    /// Returns the `'static` flavor because nothing borrowed from `self`
-    /// lives in the ctx today (footprint lookup is `None`). Keeping the
-    /// outer lifetime free of `&self` lets call sites mutate other
-    /// `ChartState` fields after constructing the ctx without tripping
-    /// the borrow checker. Phase 3 introduces a sibling builder that takes
-    /// a `FootprintCellLookup` parameter from ContentPanel and returns a
-    /// lifetime-bound ctx for the VRVP compute path.
-    fn compute_ctx(&self) -> ComputeCtx<'static> {
+    /// Takes disjoint field references (rather than `&self`) so the
+    /// returned ctx's lifetime is tied only to `footprint_cache`. This
+    /// lets call sites mutate other fields (`self.indicators[idx]`,
+    /// `self.indicator_outputs[i]`) without tripping the borrow checker —
+    /// a single `&self` method would conflict.
+    fn make_compute_ctx<'a>(
+        volume_unit: VolumeUnit,
+        footprint_cache: &'a std::collections::HashMap<
+            u64,
+            Vec<crate::services::market_data::FootprintCell>,
+        >,
+        view_time_range: Option<(i64, i64)>,
+    ) -> ComputeCtx<'a> {
         ComputeCtx {
-            volume_unit: self.volume_unit,
-            footprint: None,
+            volume_unit,
+            footprint: Some(crate::services::market_data::FootprintCellLookup::new(
+                footprint_cache,
+            )),
+            view_time_range,
         }
+    }
+
+    /// Inclusive-exclusive `(lo, hi)` open-time window in ms covering the
+    /// currently-visible bar range. Used by `compute_ctx` to bound the VRVP
+    /// aggregation to visible bars. Returns `None` when the chart has no
+    /// candles yet or the viewport hasn't been initialized.
+    pub fn view_time_range(&self) -> Option<(i64, i64)> {
+        if self.candles.is_empty() {
+            return None;
+        }
+        let tf_ms = self.timeframe.duration_ms();
+        let lo_idx = self
+            .view_start
+            .max(0.0)
+            .floor()
+            .min(self.candles.len().saturating_sub(1) as f32) as usize;
+        let raw_hi = (self.view_start + self.view_size).ceil() as usize;
+        let hi_idx = raw_hi.min(self.candles.len()).max(lo_idx + 1);
+        let lo_t = self.candles[lo_idx].open_time;
+        let hi_t = self.candles[hi_idx - 1].open_time + tf_ms;
+        Some((lo_t, hi_t))
+    }
+
+    /// Replace the cached footprint cells for one bucket. Called by
+    /// `ContentPanel`'s FootprintEvent handler after every Snapshot /
+    /// Update / Prepended / Resnap on any bucket the chart has a live sub
+    /// on — VRVP's compute reads from this cache via its
+    /// `params.bucket_bits()` slot.
+    pub fn set_footprint_cache_bucket(
+        &mut self,
+        bucket_bits: u64,
+        cells: Vec<crate::services::market_data::FootprintCell>,
+    ) {
+        self.footprint_cache.insert(bucket_bits, cells);
+    }
+
+    /// Drop the cache entry for `bucket_bits`. Called when the bucket's
+    /// sub leaves the desired set (last VRVP / FRVP holding it was
+    /// removed, or the chart switched symbol / timeframe).
+    pub fn clear_footprint_cache_bucket(&mut self, bucket_bits: u64) {
+        self.footprint_cache.remove(&bucket_bits);
+    }
+
+    /// Wipe the whole cache. Called on (symbol, tf) change — every bucket
+    /// is stale at that point.
+    pub fn clear_footprint_cache(&mut self) {
+        self.footprint_cache.clear();
     }
 
     pub fn timeframe(&self) -> Timeframe {
@@ -1107,7 +1184,9 @@ impl ChartState {
         let color = palette_color_for(count);
         let instance = IndicatorInstance::new(kind, color);
         let id = instance.id;
-        let output = instance.kind.compute(&self.candles, self.compute_ctx());
+        let view_range = self.view_time_range();
+        let ctx = Self::make_compute_ctx(self.volume_unit, &self.footprint_cache, view_range);
+        let output = instance.kind.compute(&self.candles, ctx);
         self.indicators.push(instance);
         self.indicator_outputs.push(output);
         id
@@ -1149,9 +1228,9 @@ impl ChartState {
         // instance's per-slot color Vec so paint and the settings UI
         // see a consistent shape.
         self.indicators[idx].sync_colors();
-        let new_output = self.indicators[idx]
-            .kind
-            .compute(&self.candles, self.compute_ctx());
+        let view_range = self.view_time_range();
+        let ctx = Self::make_compute_ctx(self.volume_unit, &self.footprint_cache, view_range);
+        let new_output = self.indicators[idx].kind.compute(&self.candles, ctx);
         self.indicator_outputs[idx] = new_output;
         true
     }
@@ -1164,7 +1243,8 @@ impl ChartState {
         let Some(idx) = self.indicators.iter().position(|i| i.id == id) else {
             return false;
         };
-        let ctx = self.compute_ctx();
+        let view_range = self.view_time_range();
+        let ctx = Self::make_compute_ctx(self.volume_unit, &self.footprint_cache, view_range);
         let inst = &mut self.indicators[idx];
         inst.kind_id = kind.kind_id();
         inst.kind = kind;
@@ -1324,10 +1404,29 @@ impl ChartState {
             self.indicator_outputs
                 .resize_with(self.indicators.len(), || IndicatorOutput::Line(Vec::new()));
         }
-        let ctx = self.compute_ctx();
+        let view_range = self.view_time_range();
+        let ctx = Self::make_compute_ctx(self.volume_unit, &self.footprint_cache, view_range);
         for (i, inst) in self.indicators.iter().enumerate() {
             self.indicator_outputs[i] = inst.kind.compute(&self.candles, ctx);
         }
+        self.last_recomputed_view_range = view_range;
+    }
+
+    /// Dirty-check + conditional re-run for indicators whose compute reads
+    /// from the chart's viewport (today only VRVP). Called from
+    /// `ContentPanel::render` so panning / zooming refreshes the profile
+    /// without scattering recompute calls through every input handler.
+    /// No-op when no view-dependent instance is attached, or when the
+    /// visible time range hasn't shifted since the last recompute.
+    pub fn maybe_recompute_view_dependent_indicators(&mut self) {
+        if !self.indicators.iter().any(|i| i.kind_id == "vrvp") {
+            return;
+        }
+        let cur = self.view_time_range();
+        if cur == self.last_recomputed_view_range {
+            return;
+        }
+        self.recompute_indicators();
     }
 
     /// Shift all candle-index-space state right by `n`. Committed drawings live
@@ -1404,6 +1503,8 @@ impl ChartState {
             cluster_params: FootprintParams::cluster_default(),
             profile_params: FootprintParams::profile_default(),
             footprint_cells: Vec::new(),
+            footprint_cache: std::collections::HashMap::new(),
+            last_recomputed_view_range: None,
             volume_unit: VolumeUnit::default(),
         };
         // No default indicator. Fresh charts are born empty; the user

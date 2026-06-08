@@ -677,19 +677,22 @@ impl ContentPanel {
                  _window,
                  cx| {
                     use crate::services::market_data::FootprintEvent::*;
-                    let Some((key_symbol, key_tf, key_bucket_bits)) =
-                        this.chart_footprint_key.clone()
+                    // The chart's identity gates everything — events for a
+                    // (symbol, tf) the chart isn't watching are dropped.
+                    let Some((chart_symbol, chart_tf)) = this
+                        .chart_state
+                        .as_ref()
+                        .map(|s| (s.symbol().clone(), s.timeframe()))
                     else {
                         return;
                     };
-                    let key_bucket = f64::from_bits(key_bucket_bits);
                     let matches = match event {
                         Snapshot { symbol, tf, .. }
                         | Update { symbol, tf, .. }
                         | Prepended { symbol, tf, .. }
                         | HistoryCapped { symbol, tf }
                         | Resnap { symbol, tf } => {
-                            symbol.as_ref() == key_symbol.as_ref() && *tf == key_tf
+                            symbol.as_ref() == chart_symbol.as_ref() && *tf == chart_tf
                         }
                     };
                     if !matches {
@@ -703,13 +706,51 @@ impl ContentPanel {
                                 >()
                                 .0
                                 .clone();
-                            let cells = market.read(cx).footprint_cells(
-                                key_symbol.as_ref(),
-                                key_tf,
-                                key_bucket,
-                            );
+                            // Snapshot every active bucket up-front so the
+                            // borrow on `this` (via `footprint_subs.keys`)
+                            // is released before we take `chart_state.as_mut`.
+                            let bucket_bits_list: Vec<u64> =
+                                this.footprint_subs.keys().copied().collect();
+                            let primary_key = this.chart_footprint_key.clone();
+                            let cells_by_bucket: Vec<(u64, Vec<_>)> = bucket_bits_list
+                                .into_iter()
+                                .map(|bits| {
+                                    let bucket = f64::from_bits(bits);
+                                    let cells = market.read(cx).footprint_cells(
+                                        chart_symbol.as_ref(),
+                                        chart_tf,
+                                        bucket,
+                                    );
+                                    (bits, cells)
+                                })
+                                .collect();
+                            // The chart's own render path still goes through
+                            // `footprint_cells` (not the per-bucket cache),
+                            // so refresh it separately for whichever bucket
+                            // the chart is currently displaying.
+                            let primary_cells = primary_key.and_then(|(s, t, bits)| {
+                                (s.as_ref() == chart_symbol.as_ref() && t == chart_tf).then(
+                                    || {
+                                        let bucket = f64::from_bits(bits);
+                                        market.read(cx).footprint_cells(
+                                            chart_symbol.as_ref(),
+                                            chart_tf,
+                                            bucket,
+                                        )
+                                    },
+                                )
+                            });
                             if let Some(state) = this.chart_state.as_mut() {
-                                state.set_footprint_cells(cells);
+                                for (bits, cells) in cells_by_bucket {
+                                    state.set_footprint_cache_bucket(bits, cells);
+                                }
+                                if let Some(cells) = primary_cells {
+                                    state.set_footprint_cells(cells);
+                                }
+                                // VRVP outputs depend on the cache; force a
+                                // recompute now so the next paint draws the
+                                // refreshed profile rather than stale data.
+                                state.recompute_indicators();
                             }
                             cx.notify();
                         }
@@ -1134,6 +1175,10 @@ impl ContentPanel {
             return;
         };
         state.add_indicator(kind);
+        // VRVP joins the desired-bucket set; refresh so its sub is
+        // allocated. Cheap no-op for non-VP kinds (the desired set is
+        // unchanged).
+        self.refresh_chart_footprint_sub(cx);
         cx.notify();
         request_layout_save(cx);
     }
@@ -1286,15 +1331,31 @@ impl ContentPanel {
             chart::FootprintParams::bucket_is_valid(params.bucket).then_some(params.bucket)
         });
 
-        // Desired bucket set across all consumers. Currently only the chart
-        // itself; VRVP (Phase 5) and FRVP (Phase 12) extend this with their
-        // per-instance buckets via `params.bucket_dollars()`.
+        // Desired bucket set across all consumers: the chart's render-mode
+        // bucket plus one entry per VRVP instance (FRVP joins this list in
+        // Phase 12). Duplicates collapse via the bit-pattern key.
         let mut desired: HashMap<u64, f64> = HashMap::new();
         if let Some(b) = chart_bucket {
             desired.insert(b.to_bits(), b);
         }
+        if let Some(state) = self.chart_state.as_ref() {
+            for inst in state.indicators() {
+                if let Some(vrvp) = inst
+                    .kind
+                    .as_any()
+                    .downcast_ref::<crate::indicators::VrvpParams>()
+                {
+                    let b = vrvp.params.bucket_dollars();
+                    if b.is_finite() && b > 0.0 {
+                        desired.insert(b.to_bits(), b);
+                    }
+                }
+            }
+        }
 
-        // Drop any sub whose bucket left the desired set.
+        // Drop any sub whose bucket left the desired set, plus its cached
+        // cells — otherwise VRVP would keep reading stale aggregates after
+        // the user changes the bucket / removes the instance.
         let to_drop: Vec<u64> = self
             .footprint_subs
             .keys()
@@ -1305,6 +1366,9 @@ impl ContentPanel {
             // Explicit drop before any later allocate to let the refcount
             // settle. (Same intent as the old single-sub path.)
             self.footprint_subs.remove(&k);
+            if let Some(state) = self.chart_state.as_mut() {
+                state.clear_footprint_cache_bucket(k);
+            }
         }
 
         // Allocate any sub whose bucket newly appeared in the desired set.
@@ -1533,6 +1597,9 @@ impl ContentPanel {
     ) {
         if let Some(chart) = self.chart_state.as_mut() {
             chart.remove_indicator(action.0);
+            // If the removed instance was VRVP, its bucket may have left
+            // the desired set — refresh drops the sub + cache entry.
+            self.refresh_chart_footprint_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1734,15 +1801,27 @@ impl Render for ContentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let raw_body = match self.kind {
             Kind::Watchlist => watchlist::render(window, cx).into_any_element(),
-            Kind::Chart => chart::render(
-                self.chart_state
-                    .as_ref()
-                    .expect("chart_state set for Chart"),
-                self.focus_handle.clone(),
-                window,
-                cx,
-            )
-            .into_any_element(),
+            Kind::Chart => {
+                // View-dependent indicators (VRVP) cache the visible time
+                // range at their last compute; if the user has panned /
+                // zoomed since, the cached output is stale. This lazy
+                // recompute keeps VRVP's range tracking continuous without
+                // sprinkling refresh calls through every pan/zoom site. The
+                // check is O(indicators) + a couple of comparisons, and
+                // short-circuits to a no-op when there's no VP instance.
+                if let Some(chart) = self.chart_state.as_mut() {
+                    chart.maybe_recompute_view_dependent_indicators();
+                }
+                chart::render(
+                    self.chart_state
+                        .as_ref()
+                        .expect("chart_state set for Chart"),
+                    self.focus_handle.clone(),
+                    window,
+                    cx,
+                )
+                .into_any_element()
+            }
             Kind::Trades => {
                 let symbol = self
                     .trades_symbol

@@ -133,6 +133,10 @@ impl IndicatorKind for BarStatParams {
         self
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn color_slots(&self) -> Vec<SharedString> {
         // Bull/bear colors come from the theme; no user-configurable slot.
         Vec::new()

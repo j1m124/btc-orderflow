@@ -84,6 +84,9 @@ impl IndicatorKind for VolumeParams {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn color_slots(&self) -> Vec<SharedString> {
         // Volume bars use the theme's bullish/bearish colors per-bar; the
         // settings panel exposes no configurable color.

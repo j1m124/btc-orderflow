@@ -35,6 +35,13 @@ pub struct ComputeCtx<'a> {
     /// `footprint?.cells_for_bucket(params.bucket_dollars())`. `None` if no
     /// VP instance is active (ContentPanel skips building the cache).
     pub footprint: Option<FootprintCellLookup<'a>>,
+    /// Inclusive-exclusive `(lo, hi)` open-time window in ms of the bars
+    /// currently visible on the chart. VRVP filters its footprint cells
+    /// against this to limit aggregation to the visible bars (the "visible
+    /// range" in the name). `None` when the chart hasn't measured yet or
+    /// is empty — VRVP falls back to "no data" in that case rather than
+    /// aggregating the whole loaded buffer.
+    pub view_time_range: Option<(i64, i64)>,
 }
 
 impl<'a> Default for ComputeCtx<'a> {
@@ -42,6 +49,7 @@ impl<'a> Default for ComputeCtx<'a> {
         Self {
             volume_unit: VolumeUnit::default(),
             footprint: None,
+            view_time_range: None,
         }
     }
 }
@@ -150,6 +158,13 @@ pub trait IndicatorKind: Any + Send + Sync {
     /// edit typed fields in place. Avoids round-tripping through
     /// `params_json()` on every keystroke.
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Immutable counterpart to [`Self::as_any_mut`]. Used by paths that
+    /// just want to inspect typed params (e.g. VP code asking
+    /// "is this VRVP, and what's its bucket?") without taking a mutable
+    /// borrow on the instance vector. Default `self` upcast is unblocked
+    /// by the `Any` supertrait.
+    fn as_any(&self) -> &dyn Any;
 
     /// Names of the color slots this kind exposes. The settings panel
     /// renders one color picker per slot, and `IndicatorInstance.colors`

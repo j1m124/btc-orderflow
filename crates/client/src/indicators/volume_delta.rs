@@ -214,6 +214,10 @@ impl IndicatorKind for VolumeDeltaParams {
         self
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn color_slots(&self) -> Vec<SharedString> {
         // Only the CVD line is user-colorable. Histogram bars use the theme's
         // bull/bear colors driven by per-bar sign (paint-time decision), so

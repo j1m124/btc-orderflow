@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::services::market_data::Candle;
-use crate::volume_profile::{VolumeProfileOutput, VolumeProfileParams};
+use crate::volume_profile::{
+    VolumeProfileOutput, VolumeProfileParams, compute_volume_profile,
+};
 
 /// One VRVP instance. Single field: the shared params struct (FRVP uses the
 /// same struct inside its `DrawingShape::Frvp`). Serializing the wrapper
@@ -47,12 +49,35 @@ impl IndicatorKind for VrvpParams {
         format!("VRVP {}t", self.params.bucket_ticks).into()
     }
 
-    fn compute(&self, _candles: &[Candle], _ctx: ComputeCtx<'_>) -> IndicatorOutput {
-        // Phase 5 stub. `compute_volume_profile` exists (Phase 6) but
-        // wiring it here needs a `tf_ms` value plumbed through ComputeCtx
-        // — that lands as part of Phase 7 alongside the paint arm so we
-        // don't introduce another ctx field with no consumer.
-        IndicatorOutput::VolumeProfile(VolumeProfileOutput::default())
+    fn compute(&self, candles: &[Candle], ctx: ComputeCtx<'_>) -> IndicatorOutput {
+        // VRVP aggregates over the chart's visible bar window only — that's
+        // the "visible range" in the name. Without a measured viewport the
+        // window is undefined and we report empty (rather than over- or
+        // under-counting against the full loaded buffer).
+        let Some(range) = ctx.view_time_range else {
+            return IndicatorOutput::VolumeProfile {
+                output: VolumeProfileOutput::default(),
+                params: self.params.clone(),
+            };
+        };
+        // TF inferred from adjacent open_times (avoids plumbing the chart's
+        // `Timeframe` through ComputeCtx for a one-call consumer). Falls to
+        // 0 when fewer than 2 candles are loaded — `compute_volume_profile`
+        // short-circuits in that case.
+        let tf_ms = if candles.len() >= 2 {
+            candles[1].open_time - candles[0].open_time
+        } else {
+            0
+        };
+        let cells = ctx
+            .footprint
+            .and_then(|lookup| lookup.cells_for_bucket(self.params.bucket_dollars()))
+            .unwrap_or(&[]);
+        let output = compute_volume_profile(cells, range, tf_ms, &self.params);
+        IndicatorOutput::VolumeProfile {
+            output,
+            params: self.params.clone(),
+        }
     }
 
     fn value_at(&self, _output: &IndicatorOutput, _index: usize) -> ValueReadout {
@@ -80,6 +105,10 @@ impl IndicatorKind for VrvpParams {
         self
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn color_slots(&self) -> Vec<SharedString> {
         // Five colors, matching the five `color_*` fields on
         // `VolumeProfileParams`. The settings form drives these through its
@@ -97,3 +126,4 @@ impl IndicatorKind for VrvpParams {
         ]
     }
 }
+

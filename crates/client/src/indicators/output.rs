@@ -69,7 +69,17 @@ pub enum IndicatorOutput {
     /// — so per-bar helpers (`len`, `y_range`, `value_at`) all degenerate
     /// to no-ops for this variant. Overlay paint renders horizontal bars
     /// anchored to the chart edge per `VolumeProfileParams.anchor`.
-    VolumeProfile(crate::volume_profile::VolumeProfileOutput),
+    ///
+    /// Params travel inside the variant rather than via the standard
+    /// `OverlayPaintItem.colors` slot Vec because VP needs the full
+    /// `VolumeProfileParams` (render mode, anchor edge, width%, va%, show
+    /// flags) at paint time, not just colors. Cloning a small struct per
+    /// compute is cheap; threading params via a parallel paint-item field
+    /// would balloon the overlay plumbing for one consumer.
+    VolumeProfile {
+        output: crate::volume_profile::VolumeProfileOutput,
+        params: crate::volume_profile::VolumeProfileParams,
+    },
 }
 
 impl IndicatorOutput {
@@ -84,7 +94,7 @@ impl IndicatorOutput {
             // VP outputs are keyed by *price bucket*, not by bar index; no
             // sensible bar-count to report. Callers that special-case VP
             // (e.g., the VP paint arm) don't go through `len()`.
-            IndicatorOutput::VolumeProfile(_) => 0,
+            IndicatorOutput::VolumeProfile { .. } => 0,
         }
     }
 
