@@ -76,6 +76,11 @@ pub fn style_from_shape(shape: &DrawingShape) -> DrawingStyle {
         Text(d) => {
             s.color = d.color.map(|c| c.into_hsla());
         }
+        Frvp(_) => {
+            // FRVP colours live inside `params`; the parallel `DrawingStyle`
+            // record stays at its default sentinel so the generic chart-
+            // paint codepath skips it.
+        }
         Long(p) | Short(p) => {
             s.profit_color = p.profit_color.map(|c| c.into_hsla());
             s.loss_color = p.loss_color.map(|c| c.into_hsla());
@@ -247,6 +252,19 @@ pub fn shape_to_view(
             // Price component is unused at render — the line is computed from
             // candle data. Pass 0.0 as a deterministic placeholder.
             anchor: (t2i(a.anchor_time), 0.0),
+        },
+        DrawingShape::Frvp(f) => ViewDrawing::Frvp {
+            id: service.id,
+            t0: t2i(f.a_time),
+            t1: t2i(f.b_time),
+            // Clone params so the paint closure (which is `'static`) doesn't
+            // need to borrow back into the service. Cheap — a small struct
+            // of primitives + 5 colour blobs.
+            params: f.params.clone(),
+            // Output is populated after this call by the chart render path
+            // (which holds the per-bucket footprint cell cache). Leaving it
+            // None here keeps `shape_to_view` cell-cache-free and pure.
+            output: None,
         },
     }
 }
@@ -449,6 +467,27 @@ pub fn view_to_shape(
                 s.label = b.label.clone();
             }
             DrawingShape::AnchoredVwap(s)
+        }
+        ViewDrawing::Frvp { t0, t1, params, output: _, .. } => {
+            use crate::drawings::shapes::FrvpShape;
+            // Persisted range is normalized so `a_time <= b_time` regardless
+            // of which order the user dragged the bracket. The painter
+            // doesn't care about ordering but keeping it normalized makes
+            // the JSON easier to reason about + future hit-tests simpler.
+            let (a, b) = (i2t(*t0), i2t(*t1));
+            let (a_time, b_time) = if a <= b { (a, b) } else { (b, a) };
+            let mut s = FrvpShape {
+                a_time,
+                b_time,
+                params: params.clone(),
+            };
+            if let Some(DrawingShape::Frvp(prev)) = baseline {
+                // Round-trip the persisted params across edits so a body
+                // drag doesn't reset the user's settings back to the
+                // default snapshot the view carried at creation.
+                s.params = prev.params.clone();
+            }
+            DrawingShape::Frvp(s)
         }
     }
 }

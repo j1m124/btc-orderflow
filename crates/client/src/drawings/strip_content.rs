@@ -333,6 +333,7 @@ fn shape_label_for(shape: &DrawingShape) -> &'static str {
         DrawingShape::Text(_) => "Text",
         DrawingShape::Long(_) => "Long",
         DrawingShape::Short(_) => "Short",
+        DrawingShape::Frvp(_) => "FRVP",
     }
 }
 
@@ -343,6 +344,11 @@ fn roles_for_shape(shape: &DrawingShape) -> Vec<ColorRole> {
         DrawingShape::Long(_) | DrawingShape::Short(_) => {
             vec![ColorRole::Profit, ColorRole::Loss]
         }
+        // FRVP carries its colours inside `params` (mode-conditional —
+        // bull/bear only apply in Delta mode, etc.) and the strip's
+        // generic single-swatch picker can't represent that. Edits flow
+        // through the gear-window's `VolumeProfileSettingsView` instead.
+        DrawingShape::Frvp(_) => Vec::new(),
         _ => vec![ColorRole::Primary],
     }
 }
@@ -351,7 +357,7 @@ fn roles_for_shape(shape: &DrawingShape) -> Vec<ColorRole> {
 /// Text uses pixel-based font sizing; the strip suppresses the width
 /// slot for it.
 fn supports_width(shape: &DrawingShape) -> bool {
-    !matches!(shape, DrawingShape::Text(_))
+    !matches!(shape, DrawingShape::Text(_) | DrawingShape::Frvp(_))
 }
 
 /// True iff the shape exposes a separate label/text field in the strip.
@@ -383,7 +389,7 @@ fn current_width(shape: &DrawingShape) -> f32 {
         DrawingShape::HorizontalRay(s) => s.width,
         DrawingShape::AnchoredVwap(s) => s.width,
         DrawingShape::Long(p) | DrawingShape::Short(p) => p.width,
-        DrawingShape::Text(_) => 1.0,
+        DrawingShape::Text(_) | DrawingShape::Frvp(_) => 1.0,
     }
 }
 
@@ -397,7 +403,7 @@ fn current_label(shape: &DrawingShape) -> Option<&str> {
         DrawingShape::HorizontalRay(s) => s.text.as_deref(),
         DrawingShape::AnchoredVwap(s) => s.label.as_deref(),
         DrawingShape::Long(p) | DrawingShape::Short(p) => p.label.as_deref(),
-        DrawingShape::Text(_) => None,
+        DrawingShape::Text(_) | DrawingShape::Frvp(_) => None,
     }
 }
 

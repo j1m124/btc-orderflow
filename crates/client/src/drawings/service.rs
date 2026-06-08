@@ -22,8 +22,8 @@ use crate::persistence;
 use crate::services::market_data::Timeframe;
 
 pub use super::shapes::{
-    Drawing, DrawingColor, DrawingOrigin, DrawingShape, LineRectShape, PaneRef, PositionShape,
-    TextShape,
+    Drawing, DrawingColor, DrawingOrigin, DrawingShape, FrvpShape, LineRectShape, PaneRef,
+    PositionShape, TextShape,
 };
 
 pub type DrawingId = u64;
@@ -418,7 +418,9 @@ impl DrawingService {
                     changed = true;
                 }
             }
-            DrawingShape::Text(_) => {}
+            // Text uses font size, FRVP uses params.color_* + width_pct —
+            // neither participates in the generic stroke-width slot.
+            DrawingShape::Text(_) | DrawingShape::Frvp(_) => {}
         }
         if !changed {
             return;
@@ -479,7 +481,9 @@ impl DrawingService {
                     changed = true;
                 }
             }
-            DrawingShape::Text(_) => {}
+            // Text content IS the label; FRVP has no top-level label slot
+            // (its name comes from the bucket size, surfaced in `label()`).
+            DrawingShape::Text(_) | DrawingShape::Frvp(_) => {}
         }
         if !changed {
             return;
@@ -700,6 +704,35 @@ impl DrawingService {
             return;
         }
         t.font_size = clamped;
+        self.persist();
+        cx.emit(DrawingEvent::Changed {
+            symbol: SharedString::from(symbol.to_string()),
+        });
+        cx.notify();
+    }
+
+    /// Replace the `VolumeProfileParams` on an FRVP drawing. No-op for any
+    /// other shape kind. Used by the FRVP settings window to commit edits
+    /// from the shared `VolumeProfileSettingsView` form. Single setter
+    /// (rather than per-field) keeps the settings view free to write the
+    /// whole params struct on each tick without thinking about diffing.
+    pub fn set_vp_params(
+        &mut self,
+        symbol: &str,
+        id: DrawingId,
+        params: crate::volume_profile::VolumeProfileParams,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list) = self.by_symbol.get_mut(symbol) else {
+            return;
+        };
+        let Some(d) = list.iter_mut().find(|d| d.id == id) else {
+            return;
+        };
+        let DrawingShape::Frvp(s) = &mut d.shape else {
+            return;
+        };
+        s.params = params;
         self.persist();
         cx.emit(DrawingEvent::Changed {
             symbol: SharedString::from(symbol.to_string()),

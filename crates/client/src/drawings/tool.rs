@@ -20,6 +20,10 @@ pub enum Tool {
     Rectangle,
     Fibonacci,
     AnchoredVwap,
+    /// Fixed Range Volume Profile — click-drag two time anchors; the
+    /// profile renders inside the bracket. Backed by the same shared
+    /// `volume_profile` module the VRVP indicator uses.
+    FixedRangeVolumeProfile,
     Text,
     Long,
     Short,
@@ -36,6 +40,7 @@ impl Tool {
         Tool::Rectangle,
         Tool::Fibonacci,
         Tool::AnchoredVwap,
+        Tool::FixedRangeVolumeProfile,
         Tool::Text,
         Tool::Long,
         Tool::Short,
@@ -51,6 +56,7 @@ impl Tool {
             Tool::Rectangle => "Rectangle",
             Tool::Fibonacci => "Fibonacci",
             Tool::AnchoredVwap => "Anchored VWAP",
+            Tool::FixedRangeVolumeProfile => "Fixed Range Volume Profile",
             Tool::Text => "Text",
             Tool::Long => "Long",
             Tool::Short => "Short",
@@ -70,6 +76,7 @@ impl Tool {
             Tool::Rectangle => "rectangle",
             Tool::Fibonacci => "fibonacci",
             Tool::AnchoredVwap => "anchored_vwap",
+            Tool::FixedRangeVolumeProfile => "frvp",
             Tool::Text => "text",
             Tool::Long => "long",
             Tool::Short => "short",
@@ -94,6 +101,9 @@ impl Tool {
             Tool::Fibonacci => IconName::ChartPie,
             // No dedicated VWAP icon; reuse the chart-line-ish glyph.
             Tool::AnchoredVwap => IconName::ChartPie,
+            // Reuse the pie-ish chart icon for FRVP — closest visual
+            // match in the gpui-component asset set.
+            Tool::FixedRangeVolumeProfile => IconName::ChartPie,
             Tool::Text => IconName::CaseSensitive,
             Tool::Long => IconName::ArrowUp,
             Tool::Short => IconName::ArrowDown,
@@ -185,6 +195,7 @@ pub fn tool_chip_label(tool: Tool) -> SharedString {
         Tool::Rectangle => "Rect",
         Tool::Fibonacci => "Fib",
         Tool::AnchoredVwap => "AVWAP",
+        Tool::FixedRangeVolumeProfile => "FRVP",
         Tool::Text => "Text",
         Tool::Long => "Long",
         Tool::Short => "Short",

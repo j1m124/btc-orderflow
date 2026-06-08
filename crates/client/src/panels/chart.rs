@@ -271,6 +271,23 @@ pub enum Drawing {
     /// from candle data) but kept for symmetry with single-anchor drawings
     /// so existing handle/hit-test scaffolding doesn't special-case.
     AnchoredVwap { id: DrawingId, anchor: (f32, f64) },
+    /// Fixed-Range Volume Profile. `t0` / `t1` are fractional bar
+    /// indices; the painter aggregates per-bucket bid/ask volume over
+    /// the corresponding wall-clock time range and renders the profile
+    /// inside the bracket. `params` is a snapshot of the persisted
+    /// `VolumeProfileParams` so paint doesn't have to re-read the
+    /// service inside its `'static` closure. `output` is the precomputed
+    /// per-bucket aggregate — built at chart-render time using the
+    /// chart's footprint cell cache. `None` when cells for the
+    /// instance's bucket haven't loaded yet (paint then draws just the
+    /// bracket so the user sees the geometry while waiting).
+    Frvp {
+        id: DrawingId,
+        t0: f32,
+        t1: f32,
+        params: crate::volume_profile::VolumeProfileParams,
+        output: Option<crate::volume_profile::VolumeProfileOutput>,
+    },
 }
 
 impl Drawing {
@@ -284,7 +301,8 @@ impl Drawing {
             | Drawing::HorizontalRay { id, .. }
             | Drawing::Arrow { id, .. }
             | Drawing::Fibonacci { id, .. }
-            | Drawing::AnchoredVwap { id, .. } => *id,
+            | Drawing::AnchoredVwap { id, .. }
+            | Drawing::Frvp { id, .. } => *id,
         }
     }
 
@@ -305,6 +323,10 @@ impl Drawing {
                 anchor.0 += n;
             }
             Drawing::Long { t0, t1, .. } | Drawing::Short { t0, t1, .. } => {
+                *t0 += n;
+                *t1 += n;
+            }
+            Drawing::Frvp { t0, t1, .. } => {
                 *t0 += n;
                 *t1 += n;
             }
@@ -360,6 +382,15 @@ enum CreatingDrawing {
     AnchoredVwap {
         anchor: (f32, f64),
     },
+    /// FRVP being click-dragged into existence. Two clicks: first sets
+    /// `a`, mouse-move updates `b`, second click commits. Vertical
+    /// (price) component is ignored — the profile is time-only. We
+    /// reuse `(f32, f64)` for shape-symmetry with the other two-anchor
+    /// variants so `set_end` can be uniform.
+    Frvp {
+        a: (f32, f64),
+        b: (f32, f64),
+    },
 }
 
 /// Default-R:R risk-to-reward ratio for new positions. SL is placed half the
@@ -384,6 +415,7 @@ impl CreatingDrawing {
                 extend_left: true,
             }),
             Tool::AnchoredVwap => Some(CreatingDrawing::AnchoredVwap { anchor: pt }),
+            Tool::FixedRangeVolumeProfile => Some(CreatingDrawing::Frvp { a: pt, b: pt }),
             Tool::Long => Some(CreatingDrawing::Long {
                 entry: pt,
                 tp: (pt.0 + default_width, pt.1),
@@ -402,6 +434,9 @@ impl CreatingDrawing {
             | CreatingDrawing::Arrow { b, .. }
             | CreatingDrawing::Rect { b, .. }
             | CreatingDrawing::Fibonacci { b, .. } => *b = pt,
+            // FRVP only uses the x (time) component of `pt`; the y
+            // (price) is captured for shape-symmetry but never read.
+            CreatingDrawing::Frvp { b, .. } => *b = pt,
             // Position width is locked at creation; only the TP price (y)
             // follows the cursor. Otherwise zero-width rects would be easy to
             // accidentally create with a near-vertical drag.
@@ -434,6 +469,10 @@ impl CreatingDrawing {
             }
             CreatingDrawing::AnchoredVwap { anchor } => {
                 anchor.0 += n;
+            }
+            CreatingDrawing::Frvp { a, b } => {
+                a.0 += n;
+                b.0 += n;
             }
         }
     }
@@ -477,6 +516,27 @@ impl CreatingDrawing {
                     entry: entry.1,
                     take_profit: tp.1,
                     stop_loss: sl,
+                }
+            }
+            CreatingDrawing::Frvp { a, b } => {
+                // Order anchors so `t0 <= t1` — the persisted shape gets
+                // re-normalized in `view_to_shape` regardless, but this
+                // keeps the preview consistent with the eventual paint.
+                let (t0, t1) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
+                Drawing::Frvp {
+                    id,
+                    t0,
+                    t1,
+                    params: crate::volume_profile::VolumeProfileParams {
+                        // FRVP defaults to a Left anchor — matches the
+                        // design call from the grilling that VRVP is
+                        // right-anchored, FRVP is left-anchored.
+                        anchor: crate::volume_profile::AnchorEdge::Left,
+                        ..crate::volume_profile::VolumeProfileParams::default()
+                    },
+                    // Filled in by the chart render path after the
+                    // shape ↔ view conversion (only it knows the cells).
+                    output: None,
                 }
             }
         }
@@ -982,6 +1042,16 @@ impl ChartState {
     /// is stale at that point.
     pub fn clear_footprint_cache(&mut self) {
         self.footprint_cache.clear();
+    }
+
+    /// Read-only slice into the per-bucket footprint cache. `None` when no
+    /// sub holds that bucket — FRVP paint then short-circuits to "just the
+    /// bracket" so the user sees the geometry while waiting for cells.
+    pub fn footprint_cells_for_bucket(
+        &self,
+        bucket_bits: u64,
+    ) -> Option<&[crate::services::market_data::FootprintCell]> {
+        self.footprint_cache.get(&bucket_bits).map(|v| v.as_slice())
     }
 
     pub fn timeframe(&self) -> Timeframe {
@@ -2193,6 +2263,10 @@ fn snap_view_to_grid(view: &mut Drawing) {
             *t0 = t0.round();
             *t1 = t1.round();
         }
+        Drawing::Frvp { t0, t1, .. } => {
+            *t0 = t0.round();
+            *t1 = t1.round();
+        }
     }
 }
 
@@ -2260,6 +2334,13 @@ impl Drawing {
                 *entry += dp;
                 *take_profit += dp;
                 *stop_loss += dp;
+            }
+            // FRVP geometry is time-only — vertical drag is meaningless
+            // (the profile spans the full pane regardless), so only the
+            // time component shifts.
+            Drawing::Frvp { t0, t1, .. } => {
+                *t0 += dt;
+                *t1 += dt;
             }
         }
     }
@@ -2558,6 +2639,24 @@ fn hit_test_drawings(
                 // keeps it cheap.
                 let (ax, _) = to_screen(*anchor);
                 if (pt_x - ax).abs() <= DRAWING_HANDLE_HIT_PX {
+                    return Some((d.id(), EditHandle::Body));
+                }
+            }
+            Drawing::Frvp { t0, t1, .. } => {
+                // FRVP body hit: cursor inside the time bracket at any
+                // y. The bracket spans the full chart height visually, so
+                // a single y-range test isn't needed — only the x range
+                // is meaningful. Adds a small horizontal margin so the
+                // user can grab the bracket edges, not just the
+                // (potentially empty) interior.
+                let (x0, _) = to_screen((*t0, 0.0));
+                let (x1, _) = to_screen((*t1, 0.0));
+                let (xmin, xmax) = (x0.min(x1), x0.max(x1));
+                if pt_x >= xmin - DRAWING_STROKE_HIT_PX
+                    && pt_x <= xmax + DRAWING_STROKE_HIT_PX
+                    && pt_y >= 0.0
+                    && pt_y <= canvas_h
+                {
                     return Some((d.id(), EditHandle::Body));
                 }
             }
@@ -3044,7 +3143,7 @@ pub fn render(
     // downstream code can iterate freely.
     let symbol_str = state.symbol.as_ref();
     let tf_str = state.timeframe.as_str();
-    let (drawings_snapshot, styles_snapshot, selected_for_overlay) = {
+    let (mut drawings_snapshot, styles_snapshot, selected_for_overlay) = {
         let service = cx.global::<DrawingServiceHandle>().0.clone();
         let svc = service.read(cx);
         let visible: Vec<&crate::drawings::shapes::Drawing> = svc
@@ -3069,6 +3168,35 @@ pub fn render(
             .map(|(_, d)| d.id);
         (snapshot, styles, sel)
     };
+    // Enrich FRVP entries with their precomputed `VolumeProfileOutput`.
+    // Done here (not inside `shape_to_view`) so the conversion stays
+    // cache-free; the chart owns the per-bucket footprint cell cache and
+    // is the only natural place to dereference it. The output is fed
+    // straight into the drawings overlay paint closure — no service /
+    // borrow back-and-forth from inside the `'static` closure.
+    if !state.candles.is_empty() {
+        let tf_ms_for_frvp = paint_candle_interval_ms;
+        for d in drawings_snapshot.iter_mut() {
+            let Drawing::Frvp { t0, t1, params, output, .. } = d else {
+                continue;
+            };
+            // FRVP range: convert the view-coord time anchors back to ms
+            // for `compute_volume_profile` (whose API is wall-clock).
+            // Already normalized in `view_to_shape` but a creating-preview
+            // can still arrive with `t0 > t1`; min/max guards both.
+            let lo = drawings_view::idx_to_time(t0.min(*t1), &state.candles, tf_ms_for_frvp);
+            let hi = drawings_view::idx_to_time(t0.max(*t1), &state.candles, tf_ms_for_frvp);
+            let bits = params.bucket_bits();
+            let cells_opt = state.footprint_cells_for_bucket(bits);
+            let cells: &[crate::services::market_data::FootprintCell] = cells_opt.unwrap_or(&[]);
+            *output = Some(crate::volume_profile::compute_volume_profile(
+                cells,
+                (lo, hi),
+                tf_ms_for_frvp,
+                params,
+            ));
+        }
+    }
     let creating_preview = state.creating.as_ref().map(|c| c.preview());
     // Reuse the y_range computed at the top of render — overlay anchors must
     // match the candles they sit next to.
@@ -3896,7 +4024,8 @@ pub fn render(
                     | Tool::Rectangle
                     | Tool::Fibonacci
                     | Tool::Long
-                    | Tool::Short => {
+                    | Tool::Short
+                    | Tool::FixedRangeVolumeProfile => {
                         // Two-click creation: first click places the anchor,
                         // mouse-move updates the trailing point (in the
                         // mouse-move handler), and the second click commits.

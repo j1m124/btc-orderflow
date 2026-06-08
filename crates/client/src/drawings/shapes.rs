@@ -166,6 +166,24 @@ pub(crate) fn is_default_font_size(v: &f32) -> bool {
     (*v - 12.0).abs() < f32::EPSILON
 }
 
+/// Fixed Range Volume Profile (FRVP). User click-drags two time anchors;
+/// the painter aggregates per-price-bucket bid/ask volume across the
+/// `[a_time, b_time]` range and renders the profile inside that rect.
+///
+/// Geometry is time-only — no price endpoints. The profile spans the full
+/// vertical extent of the chart at paint time; the y axis follows the
+/// chart's price range, not a per-drawing locked range. Styling + bucket
+/// + mode all live inside `params` (shared with the VRVP indicator), so
+/// there are no top-level `color`/`width`/`label` fields — the strip
+/// suppresses those slots for this shape.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FrvpShape {
+    pub a_time: i64,
+    pub b_time: i64,
+    #[serde(default)]
+    pub params: crate::volume_profile::VolumeProfileParams,
+}
+
 /// Long / short position zone — entry, take-profit, stop-loss prices over a
 /// time range. Direction (long vs short) lives on the enum tag.
 ///
@@ -212,6 +230,11 @@ pub enum DrawingShape {
     /// Anchored VWAP starting at `anchor_time`. The line itself is computed
     /// per-bar from the chart's candle buffer; only the anchor is persisted.
     AnchoredVwap(AnchoredVwapShape),
+    /// Fixed Range Volume Profile (FRVP). Shares the rendering machinery
+    /// in `crate::volume_profile` with the VRVP indicator; differs only
+    /// in that the time range is user-anchored instead of derived from
+    /// the chart's visible window.
+    Frvp(FrvpShape),
 }
 
 impl DrawingShape {
@@ -236,6 +259,7 @@ impl DrawingShape {
             DrawingShape::Arrow(_) => format!("Arrow #{id}"),
             DrawingShape::Fibonacci(_) => format!("Fib #{id}"),
             DrawingShape::AnchoredVwap(_) => format!("AVWAP #{id}"),
+            DrawingShape::Frvp(s) => format!("FRVP #{id} · {}t", s.params.bucket_ticks),
         }
     }
 }

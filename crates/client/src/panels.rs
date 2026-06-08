@@ -593,11 +593,24 @@ impl ContentPanel {
                         Changed { symbol } => {
                             if let Some(state) = this.chart_state.as_ref() {
                                 if state.symbol().as_ref() == symbol.as_ref() {
+                                    // A drawing on our symbol changed —
+                                    // refresh footprint subs in case an
+                                    // FRVP was added / removed / had its
+                                    // bucket edited. Idempotent: same
+                                    // desired set ⇒ no churn.
+                                    this.refresh_chart_footprint_sub(cx);
                                     cx.notify();
                                 }
                             }
                         }
-                        Wiped | SelectionChanged => {
+                        Wiped => {
+                            // Drawings wiped across every symbol — every
+                            // FRVP just disappeared, so any FRVP-only
+                            // footprint sub should be released.
+                            this.refresh_chart_footprint_sub(cx);
+                            cx.notify();
+                        }
+                        SelectionChanged => {
                             cx.notify();
                         }
                     }
@@ -1360,6 +1373,23 @@ impl ContentPanel {
                 }
             }
         }
+        // FRVP drawings on the same symbol also need their bucket subscribed —
+        // the shared `volume_profile::compute_volume_profile` reads from the
+        // same per-bucket cache that VRVP uses. Read the service once;
+        // drawings carry no liveness concept, so every persisted FRVP on
+        // this symbol contributes its bucket regardless of whether the
+        // bracket is currently inside the viewport.
+        if let Some(handle) = cx.try_global::<crate::drawings::service::DrawingServiceHandle>().cloned() {
+            let svc = handle.0.read(cx);
+            for d in svc.for_symbol(symbol.as_ref()) {
+                if let crate::drawings::shapes::DrawingShape::Frvp(s) = &d.shape {
+                    let b = s.params.bucket_dollars();
+                    if b.is_finite() && b > 0.0 {
+                        desired.insert(b.to_bits(), b);
+                    }
+                }
+            }
+        }
 
         // Drop any sub whose bucket left the desired set, plus its cached
         // cells — otherwise VRVP would keep reading stale aggregates after
@@ -1431,7 +1461,11 @@ impl ContentPanel {
         // Collect the (bucket_bits, bucket_dollars) pairs to query so we
         // release the `&self.chart_state` immutable borrow before the
         // service call below (which mutably borrows `cx.global`).
-        let mut wanted: Vec<(u64, f64)> = Vec::new();
+        // VRVP wants coverage up to the *viewport* left edge; FRVP wants
+        // coverage up to its own `a_time`. Either trigger backfills the
+        // same bucket — `wanted_lo[bits] = min(over all consumers)` so we
+        // only fire one request per bucket per throttle window.
+        let mut wanted_lo: HashMap<u64, (f64, i64)> = HashMap::new();
         if let Some(state) = self.chart_state.as_ref() {
             for inst in state.indicators() {
                 if let Some(vrvp) = inst
@@ -1452,10 +1486,46 @@ impl ContentPanel {
                             continue; // Have everything we need.
                         }
                     }
-                    wanted.push((bits, bucket));
+                    wanted_lo
+                        .entry(bits)
+                        .and_modify(|(_, lo)| *lo = (*lo).min(view_lo))
+                        .or_insert((bucket, view_lo));
                 }
             }
         }
+        // FRVPs on this symbol: each one wants cells back to its `a_time`,
+        // regardless of the viewport (an FRVP can sit fully off-screen and
+        // still need its history loaded so it stays accurate when the user
+        // scrolls back to it).
+        if let Some(handle) = cx.try_global::<crate::drawings::service::DrawingServiceHandle>().cloned() {
+            let svc = handle.0.read(cx);
+            for d in svc.for_symbol(symbol.as_ref()) {
+                let crate::drawings::shapes::DrawingShape::Frvp(s) = &d.shape else {
+                    continue;
+                };
+                let bucket = s.params.bucket_dollars();
+                if !bucket.is_finite() || bucket <= 0.0 {
+                    continue;
+                }
+                let bits = bucket.to_bits();
+                let need_lo = s.a_time.min(s.b_time);
+                if let Some(state) = self.chart_state.as_ref() {
+                    if let Some(oldest) = state.oldest_footprint_cell_time(bits) {
+                        if oldest <= need_lo {
+                            continue;
+                        }
+                    }
+                }
+                wanted_lo
+                    .entry(bits)
+                    .and_modify(|(_, lo)| *lo = (*lo).min(need_lo))
+                    .or_insert((bucket, need_lo));
+            }
+        }
+        let wanted: Vec<(u64, f64)> = wanted_lo
+            .into_iter()
+            .map(|(bits, (bucket, _lo))| (bits, bucket))
+            .collect();
         if wanted.is_empty() {
             return;
         }

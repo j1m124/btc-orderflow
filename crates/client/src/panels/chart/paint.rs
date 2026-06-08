@@ -1881,6 +1881,47 @@ fn paint_drawings_overlay(
                     line_w,
                 );
             }
+            Drawing::Frvp { t0, t1, params, output, .. } => {
+                let (x0, _) = to_screen((*t0, 0.0));
+                let (x1, _) = to_screen((*t1, 0.0));
+                let (xmin, xmax) = (x0.min(x1), x0.max(x1));
+                let frvp_w = (xmax - xmin).max(1.0);
+                // Bracket: thin vertical hairlines at t0 and t1 so the
+                // user sees the range even when cells haven't loaded
+                // yet. Selection bumps width + uses the ring colour for
+                // the standard selected affordance.
+                let bracket_color = if is_selected { colors.ring } else { custom_stroke.unwrap_or(colors.muted) };
+                let bracket_w = if is_selected { 1.5 } else { 1.0 };
+                paint_line(window, xmin, 0.0, xmin, h, bracket_color, bracket_w);
+                paint_line(window, xmax, 0.0, xmax, h, bracket_color, bracket_w);
+                if is_selected {
+                    paint_handle(window, xmin, h * 0.5);
+                    paint_handle(window, xmax, h * 0.5);
+                }
+                // Paint the profile only when we have cells aggregated.
+                // The overlay's vertical band is [0, h] (we bottom-clipped
+                // the wrapper div by AXIS_GAP); FRVP shares the same
+                // price->y mapping VRVP uses by passing the same y_lo /
+                // y_hi the overlay was built with.
+                if let Some(out) = output.as_ref() {
+                    if !out.buckets.is_empty() && frvp_w > 1.0 {
+                        crate::volume_profile::paint::paint_volume_profile(
+                            window,
+                            cx,
+                            origin,
+                            xmin,
+                            frvp_w,
+                            10.0,
+                            h,
+                            y_lo,
+                            y_hi,
+                            out,
+                            params,
+                            colors.muted,
+                        );
+                    }
+                }
+            }
             // Text painted as a positioned div outside the overlay.
             _ => {}
         }

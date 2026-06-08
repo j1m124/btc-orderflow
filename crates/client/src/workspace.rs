@@ -984,7 +984,7 @@ impl TerminalWorkspace {
                     DrawingShape::HorizontalRay(s) => s.text.clone(),
                     DrawingShape::AnchoredVwap(s) => s.label.clone(),
                     DrawingShape::Long(p) | DrawingShape::Short(p) => p.label.clone(),
-                    DrawingShape::Text(_) => None,
+                    DrawingShape::Text(_) | DrawingShape::Frvp(_) => None,
                 })
         };
 
