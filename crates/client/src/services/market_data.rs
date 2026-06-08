@@ -241,6 +241,36 @@ pub struct FootprintCell {
     pub ask_vol: f64,
 }
 
+/// Borrowed bucket-keyed view over the footprint cell cache that
+/// [`crate::panels::ContentPanel`] hands to [`crate::indicators::ComputeCtx`]
+/// every compute pass. The indicator-side compute (notably VRVP) doesn't
+/// otherwise have access to per-bucket footprint data, so we route it
+/// through this read-only lookup; non-VP indicators ignore the field.
+///
+/// The backing map's outer key is the *bit pattern* of the bucket f64
+/// (matches the existing `FootprintSubKey` keying so a chart-owned bucket
+/// and a VP-instance-owned bucket at the same dollar value collide
+/// correctly into one map entry).
+#[derive(Clone, Copy, Debug)]
+pub struct FootprintCellLookup<'a> {
+    by_bucket: &'a std::collections::HashMap<u64, Vec<FootprintCell>>,
+}
+
+impl<'a> FootprintCellLookup<'a> {
+    pub fn new(by_bucket: &'a std::collections::HashMap<u64, Vec<FootprintCell>>) -> Self {
+        Self { by_bucket }
+    }
+
+    /// Cells for the bucket whose dollar size is `bucket`. `None` if no live
+    /// subscription has populated cells for that bucket yet — caller
+    /// (VP compute) treats it the same as an empty slice.
+    pub fn cells_for_bucket(&self, bucket: f64) -> Option<&'a [FootprintCell]> {
+        self.by_bucket
+            .get(&bucket.to_bits())
+            .map(|v| v.as_slice())
+    }
+}
+
 /// One book price level.
 #[derive(Clone, Debug)]
 pub struct BookLevel {

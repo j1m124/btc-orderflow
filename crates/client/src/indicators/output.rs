@@ -62,6 +62,14 @@ pub enum IndicatorOutput {
         daily_max_vol: Series,
         daily_max_delta: Series,
     },
+
+    /// Visible-range volume profile: aggregated bid/ask per price bucket
+    /// across the chart's currently-visible bar window. Unlike every other
+    /// variant, this is keyed on **price** (buckets), not on **bar index**
+    /// — so per-bar helpers (`len`, `y_range`, `value_at`) all degenerate
+    /// to no-ops for this variant. Overlay paint renders horizontal bars
+    /// anchored to the chart edge per `VolumeProfileParams.anchor`.
+    VolumeProfile(crate::volume_profile::VolumeProfileOutput),
 }
 
 impl IndicatorOutput {
@@ -73,6 +81,10 @@ impl IndicatorOutput {
             IndicatorOutput::Bands { upper, .. } => upper.len(),
             IndicatorOutput::Macd { macd, .. } => macd.len(),
             IndicatorOutput::BarStat { volume, .. } => volume.len(),
+            // VP outputs are keyed by *price bucket*, not by bar index; no
+            // sensible bar-count to report. Callers that special-case VP
+            // (e.g., the VP paint arm) don't go through `len()`.
+            IndicatorOutput::VolumeProfile(_) => 0,
         }
     }
 

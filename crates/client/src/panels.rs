@@ -444,13 +444,20 @@ pub struct ContentPanel {
     /// any chart-wide setting (volume unit, price decimals, …).
     _chart_prefs_subscription: Option<gpui::Subscription>,
     chart_sub_handles: Vec<crate::services::market_data::SubscriptionHandle>,
-    /// Footprint subscription for the chart's active render kind. Allocated
-    /// lazily when render kind enters Cluster / Profile; dropped on the way
-    /// out. The key is tracked separately so the lifecycle helper can detect
-    /// (symbol, tf, bucket) drift and drop+reopen exactly once.
-    chart_footprint_sub: Option<crate::services::market_data::SubscriptionHandle>,
-    /// `(symbol, tf, bucket_bits)` — bucket bits are `f64::to_bits` so the
-    /// key supports `Eq`. Any drift triggers drop+reopen of the sub.
+    /// Live footprint subscriptions for the chart panel, keyed by the
+    /// bucket size's `f64::to_bits` (matches `FootprintSubKey`'s keying).
+    /// One entry per **distinct bucket** in use:
+    ///   * the chart's own render bucket (if Cluster / Profile mode), AND
+    ///   * one per VRVP indicator instance (Phase 5+) and FRVP drawing
+    ///     (Phase 12+) whose bucket differs from the chart's.
+    /// Refcounting at the `MarketDataService` level dedupes when the same
+    /// bucket is requested by multiple owners — see `ensure_footprint`.
+    footprint_subs: HashMap<u64, crate::services::market_data::SubscriptionHandle>,
+    /// `(symbol, tf, bucket_bits)` for the **chart's own** footprint render
+    /// (Cluster / Profile modes). The FootprintEvent subscription matches
+    /// on this to know which sub's cells to copy into `state.footprint_cells`
+    /// for the chart's render path. VP-only buckets are tracked solely via
+    /// `footprint_subs` and read on demand by the VP compute / paint code.
     chart_footprint_key:
         Option<(SharedString, crate::services::market_data::Timeframe, u64)>,
     watchlist_sub_handles: HashMap<SharedString, crate::services::market_data::SubscriptionHandle>,
@@ -948,7 +955,7 @@ impl ContentPanel {
             _tz_subscription: tz_subscription,
             _chart_prefs_subscription: chart_prefs_subscription,
             chart_sub_handles: chart_handles,
-            chart_footprint_sub: None,
+            footprint_subs: HashMap::new(),
             chart_footprint_key: None,
             watchlist_sub_handles: watchlist_handles,
             trades_symbol,
@@ -1247,51 +1254,87 @@ impl ContentPanel {
         }
     }
 
-    /// Reconcile `chart_footprint_sub` with the chart's current render kind
-    /// + params. Idempotent — bails fast when the desired key matches the
-    /// pinned one, drops the old handle and clears stale cells when the
-    /// key shifts, allocates a new sub when entering a footprint mode.
+    /// Reconcile `footprint_subs` with every bucket the chart panel needs
+    /// live cells for: the chart's own render bucket (when Cluster /
+    /// Profile mode active) plus — in later phases — one entry per VRVP
+    /// indicator instance and FRVP drawing whose bucket differs from the
+    /// chart's. Idempotent: same desired set ⇒ no churn.
+    ///
+    /// Order matters when a bucket changes: drop the *old* handle (so the
+    /// service refcount settles to zero and a WS `Unsubscribe` fires)
+    /// **before** allocating the new one. Otherwise two subs at the same
+    /// `(symbol, tf, bucket)` would race when the user shifts the chart's
+    /// bucket through a value also held by a VP instance.
     fn refresh_chart_footprint_sub(&mut self, cx: &mut Context<Self>) {
-        let desired: Option<(
-            SharedString,
-            crate::services::market_data::Timeframe,
-            f64,
-        )> = self.chart_state.as_ref().and_then(|state| {
+        let Some((symbol, tf)) = self.chart_state.as_ref().map(|s| (s.symbol().clone(), s.timeframe()))
+        else {
+            // No chart on this panel — make sure no subs leak.
+            if !self.footprint_subs.is_empty() {
+                self.footprint_subs.clear();
+            }
+            self.chart_footprint_key = None;
+            return;
+        };
+
+        // The chart's own render-driven bucket (the one whose cells get
+        // copied into `state.footprint_cells` for the candle-pane render).
+        let chart_bucket: Option<f64> = self.chart_state.as_ref().and_then(|state| {
             if !state.render_kind().needs_footprint_sub() {
                 return None;
             }
             let params = state.active_footprint_params()?;
-            if !chart::FootprintParams::bucket_is_valid(params.bucket) {
-                return None;
-            }
-            Some((state.symbol().clone(), state.timeframe(), params.bucket))
+            chart::FootprintParams::bucket_is_valid(params.bucket).then_some(params.bucket)
         });
-        let desired_key = desired
-            .as_ref()
-            .map(|(s, tf, b)| (s.clone(), *tf, b.to_bits()));
-        if desired_key == self.chart_footprint_key {
-            return;
+
+        // Desired bucket set across all consumers. Currently only the chart
+        // itself; VRVP (Phase 5) and FRVP (Phase 12) extend this with their
+        // per-instance buckets via `params.bucket_dollars()`.
+        let mut desired: HashMap<u64, f64> = HashMap::new();
+        if let Some(b) = chart_bucket {
+            desired.insert(b.to_bits(), b);
         }
-        // Drop the old handle BEFORE allocating the new one so the service
-        // refcount can settle to zero (and the WS Unsubscribe fire) before
-        // the new Subscribe — keeps the per-(symbol, tf, bucket) sub from
-        // racing itself when only the bucket changed.
-        self.chart_footprint_sub = None;
-        if let Some(state) = self.chart_state.as_mut() {
-            state.clear_footprint_cells();
+
+        // Drop any sub whose bucket left the desired set.
+        let to_drop: Vec<u64> = self
+            .footprint_subs
+            .keys()
+            .copied()
+            .filter(|k| !desired.contains_key(k))
+            .collect();
+        for k in to_drop {
+            // Explicit drop before any later allocate to let the refcount
+            // settle. (Same intent as the old single-sub path.)
+            self.footprint_subs.remove(&k);
         }
-        if let Some((sym, tf, bucket)) = desired {
-            let handle = cx
-                .global::<crate::services::market_data::MarketDataServiceHandle>()
-                .0
-                .clone()
-                .update(cx, |svc, cx| {
-                    svc.ensure_footprint(sym.as_ref(), tf, bucket, cx)
-                });
-            self.chart_footprint_sub = Some(handle);
-            self.chart_footprint_key = Some((sym, tf, bucket.to_bits()));
-        } else {
-            self.chart_footprint_key = None;
+
+        // Allocate any sub whose bucket newly appeared in the desired set.
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        for (bits, bucket) in desired.iter() {
+            if self.footprint_subs.contains_key(bits) {
+                continue;
+            }
+            let handle = market.clone().update(cx, |svc, cx| {
+                svc.ensure_footprint(symbol.as_ref(), tf, *bucket, cx)
+            });
+            self.footprint_subs.insert(*bits, handle);
+        }
+
+        // Update the chart-render key separately. The FootprintEvent
+        // subscription reads this to know which sub's snapshot it should
+        // copy into `state.footprint_cells`. VP-only buckets are NOT
+        // surfaced here — VP code reads them directly via the lookup cache.
+        let new_chart_key = chart_bucket.map(|b| (symbol.clone(), tf, b.to_bits()));
+        if new_chart_key != self.chart_footprint_key {
+            if let Some(state) = self.chart_state.as_mut() {
+                // Clear cells when the chart's bucket itself shifts (entered/
+                // left Cluster/Profile mode, or the user changed the bucket
+                // input). VP-only sub churn doesn't trigger this.
+                state.clear_footprint_cells();
+            }
+            self.chart_footprint_key = new_chart_key;
         }
     }
 

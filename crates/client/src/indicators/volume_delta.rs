@@ -90,7 +90,7 @@ impl IndicatorKind for VolumeDeltaParams {
         }
     }
 
-    fn compute(&self, candles: &[Candle], ctx: ComputeCtx) -> IndicatorOutput {
+    fn compute(&self, candles: &[Candle], ctx: ComputeCtx<'_>) -> IndicatorOutput {
         let n = candles.len();
         let none_series = vec![None; n];
         let unit = ctx.volume_unit;

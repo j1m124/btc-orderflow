@@ -20,6 +20,7 @@ pub mod settings;
 pub mod symbol_picker;
 pub mod themes;
 pub mod top_bar;
+pub mod volume_profile;
 pub mod workspace;
 
 pub use workspace::TerminalWorkspace;

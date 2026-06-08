@@ -2208,6 +2208,11 @@ pub(super) fn paint_overlay_indicators(
                 // MACD and BarStat are pane-only; ignore here. Pane render
                 // routes them to their own canvases in `paint_sub_pane`.
             }
+            IndicatorOutput::VolumeProfile(_) => {
+                // VRVP overlay paint lands here in Phase 7. Stub for now —
+                // an instance is paintable as soon as Phase 7 wires
+                // `volume_profile::paint::paint_volume_profile`.
+            }
         }
     }
 }
@@ -2573,10 +2578,13 @@ pub(super) fn paint_sub_pane(
         }
         IndicatorOutput::Bands { .. }
         | IndicatorOutput::Lines(_)
-        | IndicatorOutput::BarStat { .. } => {
+        | IndicatorOutput::BarStat { .. }
+        | IndicatorOutput::VolumeProfile(_) => {
             // Bands (BB) and Lines (MA Suite) are overlay-only by kind
             // contract; no-op here for safety. BarStat is handled up
             // front (before the grid pass) since it owns its own layout.
+            // VolumeProfile is overlay-only (VRVP is `OverlayOnly`); never
+            // routes to a sub-pane.
         }
     }
 

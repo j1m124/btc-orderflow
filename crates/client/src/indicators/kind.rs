@@ -16,16 +16,34 @@ use serde::{Deserialize, Serialize};
 
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::persistence::VolumeUnit;
-use crate::services::market_data::Candle;
+use crate::services::market_data::{Candle, FootprintCellLookup};
 
 /// Cross-cutting per-compute context, threaded from `ChartState` into each
 /// `IndicatorKind::compute` call. Lets per-chart settings (e.g., the volume
-/// unit toggle that sits in the chart header) flow into indicator math
+/// unit toggle that sits in the chart header) AND per-chart shared data
+/// caches (footprint cells, indexed by bucket) flow into indicator math
 /// without going through a global. Add fields here as more per-chart
 /// scaling/normalisation knobs surface.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ComputeCtx {
+///
+/// `'a` borrows from a ContentPanel-owned cache that gets rebuilt before
+/// each `recompute_indicators` pass. Default-constructed has `footprint =
+/// None`, which non-VP indicators (every kind except VRVP) just ignore.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputeCtx<'a> {
     pub volume_unit: VolumeUnit,
+    /// Per-bucket footprint cell lookup. VRVP reads its bucket's cells via
+    /// `footprint?.cells_for_bucket(params.bucket_dollars())`. `None` if no
+    /// VP instance is active (ContentPanel skips building the cache).
+    pub footprint: Option<FootprintCellLookup<'a>>,
+}
+
+impl<'a> Default for ComputeCtx<'a> {
+    fn default() -> Self {
+        Self {
+            volume_unit: VolumeUnit::default(),
+            footprint: None,
+        }
+    }
 }
 
 /// Where an indicator can render. Drives picker entry placement, default
@@ -108,8 +126,9 @@ pub trait IndicatorKind: Any + Send + Sync {
     /// Pure compute: full recompute over the candle array. Output length
     /// matches `candles.len()`; positions where there isn't enough history
     /// (e.g., the first `period - 1` bars) are `None`. `ctx` carries any
-    /// chart-scoped knobs that affect indicator math (e.g., volume unit).
-    fn compute(&self, candles: &[Candle], ctx: ComputeCtx) -> IndicatorOutput;
+    /// chart-scoped knobs that affect indicator math (volume unit; the
+    /// per-bucket footprint cell lookup for VP-family indicators).
+    fn compute(&self, candles: &[Candle], ctx: ComputeCtx<'_>) -> IndicatorOutput;
 
     /// Crosshair-active chip readout at a specific bar index. Each kind
     /// formats this differently — single-line kinds return `One(...)`,

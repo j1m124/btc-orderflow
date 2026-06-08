@@ -43,7 +43,7 @@ impl IndicatorKind for VolumeParams {
     fn label(&self) -> SharedString {
         "Volume".into()
     }
-    fn compute(&self, candles: &[Candle], ctx: ComputeCtx) -> IndicatorOutput {
+    fn compute(&self, candles: &[Candle], ctx: ComputeCtx<'_>) -> IndicatorOutput {
         let unit = ctx.volume_unit;
         let values: Vec<Option<f64>> = candles
             .iter()

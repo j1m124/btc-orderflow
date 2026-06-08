@@ -882,9 +882,18 @@ impl ChartState {
     /// Build the `ComputeCtx` for the current chart settings — threaded
     /// into every `IndicatorKind::compute` call so per-chart knobs (volume
     /// unit, future fields) flow through without a global.
-    fn compute_ctx(&self) -> ComputeCtx {
+    ///
+    /// Returns the `'static` flavor because nothing borrowed from `self`
+    /// lives in the ctx today (footprint lookup is `None`). Keeping the
+    /// outer lifetime free of `&self` lets call sites mutate other
+    /// `ChartState` fields after constructing the ctx without tripping
+    /// the borrow checker. Phase 3 introduces a sibling builder that takes
+    /// a `FootprintCellLookup` parameter from ContentPanel and returns a
+    /// lifetime-bound ctx for the VRVP compute path.
+    fn compute_ctx(&self) -> ComputeCtx<'static> {
         ComputeCtx {
             volume_unit: self.volume_unit,
+            footprint: None,
         }
     }
 
