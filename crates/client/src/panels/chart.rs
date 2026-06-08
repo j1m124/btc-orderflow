@@ -2892,20 +2892,30 @@ pub fn render(
     // downstream code can iterate freely.
     let symbol_str = state.symbol.as_ref();
     let tf_str = state.timeframe.as_str();
-    let (drawings_snapshot, selected_for_overlay) = {
+    let (drawings_snapshot, styles_snapshot, selected_for_overlay) = {
         let service = cx.global::<DrawingServiceHandle>().0.clone();
         let svc = service.read(cx);
-        let snapshot: Vec<Drawing> = svc
+        let visible: Vec<&crate::drawings::shapes::Drawing> = svc
             .for_symbol(symbol_str)
             .iter()
             .filter(|d| d.visible_on(tf_str))
+            .collect();
+        let snapshot: Vec<Drawing> = visible
+            .iter()
             .map(|d| drawings_view::shape_to_view(d, &state.candles, paint_candle_interval_ms))
+            .collect();
+        // Style map parallel to `snapshot` — keyed by drawing id so paint
+        // can look up per-shape colour/width overrides without threading
+        // the data into every match arm of `ViewDrawing`.
+        let styles: std::collections::HashMap<u64, drawings_view::DrawingStyle> = visible
+            .iter()
+            .map(|d| (d.id, drawings_view::style_from_shape(&d.shape)))
             .collect();
         let sel = svc
             .selected_drawing()
             .filter(|(sym, _)| sym.as_ref() == symbol_str)
             .map(|(_, d)| d.id);
-        (snapshot, sel)
+        (snapshot, styles, sel)
     };
     let creating_preview = state.creating.as_ref().map(|c| c.preview());
     // Reuse the y_range computed at the top of render — overlay anchors must
@@ -2936,6 +2946,7 @@ pub fn render(
     let candles_for_overlay = state.candles.clone();
     let drawings_overlay = render_drawings_overlay(
         drawings_snapshot.clone(),
+        styles_snapshot,
         creating_preview,
         selected_for_overlay,
         state.view_start,

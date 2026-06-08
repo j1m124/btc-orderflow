@@ -9,10 +9,70 @@
 //! boundary: snapshot service shapes into view-coords at render start; convert
 //! view-coords back to ms when the chart commits a create or edit.
 
+use gpui::Hsla;
+
 use crate::drawings::shapes::{Drawing as ServiceDrawing, DrawingShape};
 use crate::services::market_data::Candle;
 
 use super::Drawing as ViewDrawing;
+
+/// Per-drawing visual style snapshot. Lives parallel to the view-coord
+/// `Drawing` list because [`ViewDrawing`] is geometry-only — adding style
+/// fields to every variant would have rippled through ~140 destructuring
+/// sites. The chart's render path builds a `HashMap<DrawingId, DrawingStyle>`
+/// in the same scope it builds the drawings snapshot, and paint reads it
+/// per drawing.
+///
+/// All fields are optional / defaulted; paint applies them as overrides
+/// over the theme defaults, so absent values reproduce the pre-Phase-7
+/// visual exactly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrawingStyle {
+    /// Primary stroke / fill color override. `None` → keep theme default.
+    /// For position shapes this is unused (they consume `profit_color` /
+    /// `loss_color` instead).
+    pub color: Option<Hsla>,
+    /// TP-zone fill + line override for Long / Short.
+    pub profit_color: Option<Hsla>,
+    /// SL-zone fill + line override for Long / Short.
+    pub loss_color: Option<Hsla>,
+    /// Stroke width in pixels. `0.0` means "use the paint default" (so
+    /// in-flight create previews that don't have a style record still
+    /// paint with their original 1.5px).
+    pub width: f32,
+}
+
+/// Project the per-shape style fields into the parallel style record.
+/// Pre-Phase-1 blobs (and `Text`, which never had a stored width) map
+/// through unchanged — `width: 0.0` sentinel tells paint to keep its
+/// existing 1.5px floor.
+pub fn style_from_shape(shape: &DrawingShape) -> DrawingStyle {
+    use DrawingShape::*;
+    let mut s = DrawingStyle::default();
+    match shape {
+        Line(d) | Rect(d) | Arrow(d) | Fibonacci(d) => {
+            s.color = d.color.map(|c| c.into_hsla());
+            s.width = d.width;
+        }
+        HorizontalRay(d) => {
+            s.color = d.color.map(|c| c.into_hsla());
+            s.width = d.width;
+        }
+        AnchoredVwap(d) => {
+            s.color = d.color.map(|c| c.into_hsla());
+            s.width = d.width;
+        }
+        Text(d) => {
+            s.color = d.color.map(|c| c.into_hsla());
+        }
+        Long(p) | Short(p) => {
+            s.profit_color = p.profit_color.map(|c| c.into_hsla());
+            s.loss_color = p.loss_color.map(|c| c.into_hsla());
+            s.width = p.width;
+        }
+    }
+    s
+}
 
 /// Spacing in ms between bar `i` and bar `i+1`, falling back to
 /// `bar_duration_ms` at the edges of the loaded range. We use the actual

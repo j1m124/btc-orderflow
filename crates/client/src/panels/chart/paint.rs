@@ -1339,17 +1339,17 @@ fn format_cell_text(c: &FootprintCell, metric: TextMetric, bucket: f64, unit: Vo
 
 /// In-cell label for footprint volumes. When the user toggles "Truncate
 /// footprint decimals" on, fractional digits are dropped (cells render as
-/// whole numbers, rounded up; K/M suffix preserved). Otherwise the standard
-/// `K`/`M` shorthand at 1dp with a 2dp tail for sub-10 values.
+/// whole numbers, rounded to nearest; K/M suffix preserved). Otherwise the
+/// standard `K`/`M` shorthand at 1dp with a 2dp tail for sub-10 values.
 fn format_short(v: f64) -> String {
     let abs = v.abs();
     if crate::prefs::footprint_truncate_decimals() {
         if abs >= 1_000_000.0 {
-            return format!("{:.0}M", (v / 1_000_000.0).ceil());
+            return format!("{:.0}M", (v / 1_000_000.0).round());
         } else if abs >= 1_000.0 {
-            return format!("{:.0}K", (v / 1_000.0).ceil());
+            return format!("{:.0}K", (v / 1_000.0).round());
         }
-        return format!("{:.0}", v.ceil());
+        return format!("{:.0}", v.round());
     }
     if abs >= 1_000_000.0 {
         format!("{:.1}M", v / 1_000_000.0)
@@ -1368,6 +1368,7 @@ fn format_short(v: f64) -> String {
 /// x-axis-label band excluded so drawings don't paint over the axis area.
 pub(super) fn render_drawings_overlay(
     drawings: Vec<Drawing>,
+    styles: std::collections::HashMap<DrawingId, super::drawings_view::DrawingStyle>,
     creating_preview: Option<Drawing>,
     selected: Option<DrawingId>,
     view_start: f32,
@@ -1403,6 +1404,7 @@ pub(super) fn render_drawings_overlay(
                         paint_drawings_overlay(
                             bounds,
                             &drawings,
+                            &styles,
                             creating_preview.as_ref(),
                             selected,
                             view_start,
@@ -1427,6 +1429,7 @@ pub(super) fn render_drawings_overlay(
 fn paint_drawings_overlay(
     bounds: Bounds<Pixels>,
     drawings: &[Drawing],
+    styles: &std::collections::HashMap<DrawingId, super::drawings_view::DrawingStyle>,
     creating_preview: Option<&Drawing>,
     selected: Option<DrawingId>,
     view_start: f32,
@@ -1456,14 +1459,19 @@ fn paint_drawings_overlay(
         (x, y)
     };
 
-    let paint_line = |window: &mut Window, ax: f32, ay: f32, bx: f32, by: f32, color: Hsla| {
-        let mut pb = PathBuilder::stroke(px(1.5));
-        pb.move_to(point(px(ax) + origin.x, px(ay) + origin.y));
-        pb.line_to(point(px(bx) + origin.x, px(by) + origin.y));
-        if let Ok(path) = pb.build() {
-            window.paint_path(path, color);
-        }
-    };
+    let paint_line =
+        |window: &mut Window, ax: f32, ay: f32, bx: f32, by: f32, color: Hsla, width: f32| {
+            // `width <= 0.0` is the "no per-drawing override" sentinel
+            // (in-flight create previews, indicator-derived overlays). Keep
+            // the legacy 1.5 px so the visual matches pre-Phase-7 exactly.
+            let w = if width > 0.0 { width } else { 1.5 };
+            let mut pb = PathBuilder::stroke(px(w));
+            pb.move_to(point(px(ax) + origin.x, px(ay) + origin.y));
+            pb.line_to(point(px(bx) + origin.x, px(by) + origin.y));
+            if let Ok(path) = pb.build() {
+                window.paint_path(path, color);
+            }
+        };
 
     let paint_handle = |window: &mut Window, hx: f32, hy: f32| {
         let half = 4.0_f32;
@@ -1509,16 +1517,21 @@ fn paint_drawings_overlay(
                          tp: f64,
                          sl: f64,
                          is_selected: bool,
-                         _is_preview: bool| {
+                         _is_preview: bool,
+                         profit_override: Option<Hsla>,
+                         loss_override: Option<Hsla>,
+                         width: f32| {
         let (x0, _) = to_screen((t0, entry));
         let (x1, _) = to_screen((t1, entry));
         let (xmin, xmax) = (x0.min(x1), x0.max(x1));
         let (_, y_entry) = to_screen((t0, entry));
         let (_, y_tp) = to_screen((t0, tp));
         let (_, y_sl) = to_screen((t0, sl));
-        // TP zone always uses the bullish tint (profit zone), SL the bearish
-        // (loss zone). Direction matters only for which side of entry each
-        // sits on, which the caller already computed.
+        let profit_base = profit_override.unwrap_or(colors.bullish);
+        let loss_base = loss_override.unwrap_or(colors.bearish);
+        // TP zone always uses the profit tint, SL the loss tint. Direction
+        // (long vs short) only decides which side of entry each sits on —
+        // that's already encoded in the y values handed in.
         paint_filled_zone(
             window,
             xmin,
@@ -1527,7 +1540,7 @@ fn paint_drawings_overlay(
             y_entry.max(y_tp),
             Hsla {
                 a: 0.18,
-                ..colors.bullish
+                ..profit_base
             },
         );
         paint_filled_zone(
@@ -1538,28 +1551,22 @@ fn paint_drawings_overlay(
             y_entry.max(y_sl),
             Hsla {
                 a: 0.18,
-                ..colors.bearish
+                ..loss_base
             },
         );
-        // Three horizontal lines. Entry in muted, TP/SL in their zone colour.
+        // Three horizontal lines. Entry stays muted (not user-recolourable —
+        // it's a structural marker); TP/SL line colours track the zone tints
+        // with the user override applied above.
         let entry_color = if is_selected {
             colors.ring
         } else {
             colors.muted
         };
-        let tp_color = if is_selected {
-            colors.ring
-        } else {
-            colors.bullish
-        };
-        let sl_color = if is_selected {
-            colors.ring
-        } else {
-            colors.bearish
-        };
-        paint_line(window, xmin, y_entry, xmax, y_entry, entry_color);
-        paint_line(window, xmin, y_tp, xmax, y_tp, tp_color);
-        paint_line(window, xmin, y_sl, xmax, y_sl, sl_color);
+        let tp_color = if is_selected { colors.ring } else { profit_base };
+        let sl_color = if is_selected { colors.ring } else { loss_base };
+        paint_line(window, xmin, y_entry, xmax, y_entry, entry_color, width);
+        paint_line(window, xmin, y_tp, xmax, y_tp, tp_color, width);
+        paint_line(window, xmin, y_sl, xmax, y_sl, sl_color, width);
 
         if is_selected {
             // Price handles: dots at the horizontal middle of each price
@@ -1583,16 +1590,29 @@ fn paint_drawings_overlay(
                     d: &Drawing,
                     is_selected: bool,
                     is_preview: bool| {
+        // Preview drawings carry no style record (they live on the chart's
+        // `creating` state, not the service). Lookup returns the default
+        // style → paint falls back to the theme + the legacy 1.5 px stroke.
+        let style = styles.get(&d.id()).copied().unwrap_or_default();
+        let custom_stroke = style.color;
+        // Selection / preview always paints in the ring color so the affordance
+        // stays visible regardless of the user's custom stroke choice. Handles
+        // already mark selection separately; the colour flip is the cue while
+        // the cursor is mid-drag (no handles painted yet for a preview).
         let stroke = if is_selected || is_preview {
             colors.ring
         } else {
-            colors.line
+            custom_stroke.unwrap_or(colors.line)
         };
+        // Width override applies to committed drawings only; the preview
+        // sticks with the paint default so an in-flight line doesn't suddenly
+        // jump to a thicker stroke at mouse-up.
+        let line_w = if is_preview { 0.0 } else { style.width };
         match d {
             Drawing::Line { a, b, .. } => {
                 let (ax, ay) = to_screen(*a);
                 let (bx, by) = to_screen(*b);
-                paint_line(window, ax, ay, bx, by, stroke);
+                paint_line(window, ax, ay, bx, by, stroke, line_w);
                 if is_selected {
                     paint_handle(window, ax, ay);
                     paint_handle(window, bx, by);
@@ -1604,7 +1624,7 @@ fn paint_drawings_overlay(
                 // short to look like anything sensible (collapsed click).
                 let (ax, ay) = to_screen(*a);
                 let (bx, by) = to_screen(*b);
-                paint_line(window, ax, ay, bx, by, stroke);
+                paint_line(window, ax, ay, bx, by, stroke, line_w);
                 let dx = bx - ax;
                 let dy = by - ay;
                 let len = (dx * dx + dy * dy).sqrt();
@@ -1624,8 +1644,8 @@ fn paint_drawings_overlay(
                     let w1y = basey + py_ * wing;
                     let w2x = basex - px_ * wing;
                     let w2y = basey - py_ * wing;
-                    paint_line(window, bx, by, w1x, w1y, stroke);
-                    paint_line(window, bx, by, w2x, w2y, stroke);
+                    paint_line(window, bx, by, w1x, w1y, stroke, line_w);
+                    paint_line(window, bx, by, w2x, w2y, stroke, line_w);
                 }
                 if is_selected {
                     paint_handle(window, ax, ay);
@@ -1647,7 +1667,7 @@ fn paint_drawings_overlay(
                 let level_color = if is_selected || is_preview {
                     colors.ring
                 } else {
-                    colors.line
+                    custom_stroke.unwrap_or(colors.line)
                 };
                 let fade_color = Hsla {
                     a: 0.6,
@@ -1663,7 +1683,7 @@ fn paint_drawings_overlay(
                 for &level in LEVELS {
                     let price = price_b + (price_a - price_b) * level as f64;
                     let (_, y) = to_screen((a.0, price));
-                    paint_line(window, xmin, y, xmax, y, fade_color);
+                    paint_line(window, xmin, y, xmax, y, fade_color, line_w);
                     // Ratio label just outside the right edge of the level
                     // line. Format mirrors common charting platforms:
                     // integer percentages on whole ratios, three-decimal
@@ -1712,7 +1732,7 @@ fn paint_drawings_overlay(
                 // gutter even though the line itself is off-screen.
                 let line_visible = ay >= 0.0 && ay <= overlay_h;
                 if line_visible {
-                    paint_line(window, start_x, ay, right_edge, ay, stroke);
+                    paint_line(window, start_x, ay, right_edge, ay, stroke, line_w);
                     if is_selected {
                         paint_handle(window, ax, ay);
                     }
@@ -1787,7 +1807,7 @@ fn paint_drawings_overlay(
                             );
                             let sy = price_to_screen(y_lo, y_hi, num / den, chart_h_for_y);
                             if let Some((px_, py_)) = prev {
-                                paint_line(window, px_, py_, sx, sy, stroke);
+                                paint_line(window, px_, py_, sx, sy, stroke, line_w);
                             }
                             if first_visible.is_none() {
                                 first_visible = Some((sx, sy));
@@ -1859,6 +1879,9 @@ fn paint_drawings_overlay(
                     *stop_loss,
                     is_selected,
                     is_preview,
+                    style.profit_color,
+                    style.loss_color,
+                    line_w,
                 );
             }
             // Text painted as a positioned div outside the overlay.
@@ -1893,12 +1916,12 @@ fn paint_drawings_overlay(
     };
     if let Some(cx_local) = cross_x {
         if cx_local >= 0.0 && cx_local <= chart_w {
-            paint_line(window, cx_local, 0.0, cx_local, chart_h, cross_color);
+            paint_line(window, cx_local, 0.0, cx_local, chart_h, cross_color, 0.0);
         }
     }
     if let Some((_cx_local, cy_local)) = cursor {
         if cy_local >= 0.0 && cy_local <= chart_h {
-            paint_line(window, 0.0, cy_local, chart_w, cy_local, cross_color);
+            paint_line(window, 0.0, cy_local, chart_w, cy_local, cross_color, 0.0);
         }
     }
 }
@@ -2763,13 +2786,13 @@ fn format_compact(v: f64) -> String {
     let abs = v.abs();
     if crate::prefs::footprint_truncate_decimals() {
         if abs >= 1_000_000_000.0 {
-            return format!("{:.0}B", (v / 1_000_000_000.0).ceil());
+            return format!("{:.0}B", (v / 1_000_000_000.0).round());
         } else if abs >= 1_000_000.0 {
-            return format!("{:.0}M", (v / 1_000_000.0).ceil());
+            return format!("{:.0}M", (v / 1_000_000.0).round());
         } else if abs >= 1_000.0 {
-            return format!("{:.0}K", (v / 1_000.0).ceil());
+            return format!("{:.0}K", (v / 1_000.0).round());
         }
-        return format!("{:.0}", v.ceil());
+        return format!("{:.0}", v.round());
     }
     if abs >= 1_000_000_000.0 {
         format!("{:.2}B", v / 1_000_000_000.0)
