@@ -179,6 +179,7 @@ impl Render for IndicatorSettingsView {
             "volume_delta" => render_volume_delta(&snapshot, target.clone(), id, cx),
             "bar_stat" => render_bar_stat(&snapshot, target.clone(), id, cx),
             "vrvp" => render_vrvp(&snapshot, target.clone(), id, cx),
+            "liq_bars" => render_liq_bars(&snapshot, target.clone(), id, cx),
             _ => div()
                 .text_color(muted)
                 .child("Unknown indicator kind")
@@ -1104,6 +1105,121 @@ fn read_source(params: &serde_json::Value) -> Option<Source> {
 }
 
 /// Downcast the dynamic `kind` to a concrete params struct and apply a
+/// Liquidation-bars form: scale mode (Auto / Fixed) + cumulative-line
+/// toggle. Custom long/short color pickers + the Fixed cap input land in a
+/// later polish pass; for now Fixed without a positive cap silently falls
+/// back to Auto via the `y_range` guard.
+fn render_liq_bars(
+    snap: &InstanceSnapshot,
+    target: WeakEntity<ContentPanel>,
+    id: InstanceId,
+    cx: &mut Context<IndicatorSettingsView>,
+) -> gpui::AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let scale_is_fixed = snap
+        .params
+        .pointer("/scale")
+        .and_then(|v| v.get("Fixed"))
+        .is_some();
+    let show_cum = snap
+        .params
+        .pointer("/show_cumulative")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let auto_btn = {
+        let target = target.clone();
+        let mut b = Button::new(SharedString::from(format!("liqbars-scale-auto-{}", id)))
+            .label(SharedString::from("Auto"))
+            .small();
+        b = if !scale_is_fixed { b.primary() } else { b.ghost() };
+        b.on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target.upgrade() else { return; };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<crate::indicators::LiquidationBarsParams>(kind, |x| {
+                            x.scale = crate::indicators::LiqBarsScale::Auto;
+                        });
+                    });
+                    cx.notify();
+                    crate::panels::request_layout_save(cx);
+                }
+            });
+        }))
+    };
+    let fixed_btn = {
+        let target = target.clone();
+        let mut b = Button::new(SharedString::from(format!("liqbars-scale-fixed-{}", id)))
+            .label(SharedString::from("Fixed"))
+            .small();
+        b = if scale_is_fixed { b.primary() } else { b.ghost() };
+        b.on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target.upgrade() else { return; };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<crate::indicators::LiquidationBarsParams>(kind, |x| {
+                            // Seed cap from the current y-range if it's still
+                            // the default 0.0; otherwise keep whatever the
+                            // user already set.
+                            let prev_cap = match x.scale {
+                                crate::indicators::LiqBarsScale::Fixed { max } => max,
+                                _ => 0.0,
+                            };
+                            x.scale = crate::indicators::LiqBarsScale::Fixed { max: prev_cap };
+                        });
+                    });
+                    cx.notify();
+                    crate::panels::request_layout_save(cx);
+                }
+            });
+        }))
+    };
+
+    let cum_btn = {
+        let target = target.clone();
+        let label = if show_cum { "Cumulative: ON" } else { "Cumulative: OFF" };
+        let mut b = Button::new(SharedString::from(format!("liqbars-cum-{}", id)))
+            .label(SharedString::from(label))
+            .small();
+        b = if show_cum { b.primary() } else { b.ghost() };
+        b.on_click(cx.listener(move |_this, _ev, _w, cx| {
+            let Some(panel) = target.upgrade() else { return; };
+            panel.update(cx, |p, cx| {
+                if let Some(chart) = p.chart_state.as_mut() {
+                    chart.update_indicator(id, |kind| {
+                        mutate::<crate::indicators::LiquidationBarsParams>(kind, |x| {
+                            x.show_cumulative = !x.show_cumulative;
+                        });
+                    });
+                    cx.notify();
+                    crate::panels::request_layout_save(cx);
+                }
+            });
+        }))
+    };
+
+    v_flex()
+        .gap_2()
+        .child(label_row("Scale"))
+        .child(h_flex().gap_2().child(auto_btn).child(fixed_btn))
+        .child(label_row("Overlays"))
+        .child(h_flex().gap_2().child(cum_btn))
+        .child(
+            div()
+                .text_color(muted)
+                .text_size(px(11.))
+                .child(
+                    "Auto fits to the visible bars; Fixed locks a symmetric \
+                     y-range. Cumulative draws a running net line (short USD \
+                     − long USD across visible bars). Coin/USD axis follows \
+                     the chart's volume-unit toggle.",
+                ),
+        )
+        .into_any_element()
+}
+
 /// mutation. No-op if the downcast fails (kind id and concrete type don't
 /// match — should never happen unless persistence loaded the wrong type).
 fn mutate<T: 'static>(

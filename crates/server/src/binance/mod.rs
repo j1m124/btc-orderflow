@@ -32,4 +32,5 @@ pub struct BroadcastTxs {
     pub kline: tokio::sync::broadcast::Sender<parse::Tick>,
     pub trade: tokio::sync::broadcast::Sender<parse::TradeTick>,
     pub depth: tokio::sync::broadcast::Sender<parse::DepthDiff>,
+    pub liquidation: tokio::sync::broadcast::Sender<parse::LiquidationTick>,
 }

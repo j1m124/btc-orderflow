@@ -73,6 +73,13 @@ pub const TRADE_BROADCAST_CAPACITY: usize = 32_768;
 /// to `Lagged`.
 pub const DEPTH_BROADCAST_CAPACITY: usize = 4096;
 
+/// Capacity of the liquidation broadcast channel. Binance throttles
+/// `@forceOrder` to ≤1 event/sec per symbol, so 256 slots is ~4 minutes of
+/// buffering — far beyond any realistic consumer-pause window. Tiny vs
+/// trade/kline channels because the source rate is two orders of magnitude
+/// lower.
+pub const LIQUIDATION_BROADCAST_CAPACITY: usize = 256;
+
 /// Min/max wait between Binance WS reconnect attempts.
 const RECONNECT_MIN: StdDuration = StdDuration::from_secs(1);
 const RECONNECT_MAX: StdDuration = StdDuration::from_secs(30);
@@ -361,6 +368,70 @@ async fn flush_buffer(pool: &PgPool, buffer: &mut HashMap<String, Vec<TradeRow>>
         let count = trades.len();
         if let Err(e) = db::upsert_trades(pool, &symbol, &trades).await {
             warn!(symbol, count, error = ?e, "trade upsert failed");
+        }
+    }
+}
+
+// --- Liquidation writer -----------------------------------------------------
+
+/// Liquidation flush cadence. Binance throttles `@forceOrder` to ≤1
+/// event/sec/symbol, so on a typical second the buffer holds 0–1 rows.
+/// Even a flush every 1s would be fine — using 250ms gives the tape
+/// forwarder near-realtime DB visibility once Phase 5 lands without
+/// noticeable write amplification.
+const LIQUIDATION_WRITER_FLUSH: StdDuration = StdDuration::from_millis(250);
+
+/// Subscribe to the liquidation broadcast, buffer per-symbol, and bulk
+/// UPSERT into the `liquidations` hypertable on [`LIQUIDATION_WRITER_FLUSH`]
+/// intervals. Mirrors [`run_trade_writer`] — same Lagged handling, same
+/// drain-on-Closed shutdown.
+pub async fn run_liquidation_writer(
+    pool: PgPool,
+    mut rx: broadcast::Receiver<crate::binance::parse::LiquidationTick>,
+) -> Result<()> {
+    info!("liquidation writer task started");
+    let mut buffer: HashMap<String, Vec<crate::binance::parse::LiquidationRow>> = HashMap::new();
+    let mut flush_timer = tokio::time::interval(LIQUIDATION_WRITER_FLUSH);
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        // Liquidation channel is cool (≤1 ev/sec) so a biased select would
+        // not starve the timer here, but symmetric handling with the trade
+        // writer keeps reasoning simple.
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        buffer.entry(tick.symbol).or_default().push(tick.liq);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "liquidation writer lagged behind broadcast");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("liquidation broadcast closed; flushing and exiting");
+                        flush_liquidation_buffer(&pool, &mut buffer).await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ = flush_timer.tick() => {
+                flush_liquidation_buffer(&pool, &mut buffer).await;
+            }
+        }
+    }
+}
+
+async fn flush_liquidation_buffer(
+    pool: &PgPool,
+    buffer: &mut HashMap<String, Vec<crate::binance::parse::LiquidationRow>>,
+) {
+    for (symbol, rows) in buffer.drain() {
+        if rows.is_empty() {
+            continue;
+        }
+        let count = rows.len();
+        if let Err(e) = db::upsert_liquidations(pool, &symbol, &rows).await {
+            warn!(symbol, count, error = ?e, "liquidation upsert failed");
         }
     }
 }

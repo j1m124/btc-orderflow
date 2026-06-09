@@ -12,6 +12,7 @@ pub mod bar_stat;
 pub mod bb;
 pub mod instance;
 pub mod kind;
+pub mod liq_bars;
 pub mod math;
 pub mod output;
 pub mod trades;
@@ -21,6 +22,7 @@ pub mod vrvp;
 
 pub use bar_stat::{BarStatGrade, BarStatParams};
 pub use bb::BbParams;
+pub use liq_bars::{LiqBarsScale, LiquidationBarsParams};
 pub use instance::{
     COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, bump_next_id_past, default_pane_height,
     new_instance_id, palette_color_for,
@@ -104,6 +106,13 @@ pub fn kind_entries() -> Vec<KindEntry> {
             category: Category::Volume,
             spawn: || Box::new(VrvpParams::default()),
         },
+        KindEntry {
+            kind_id: "liq_bars",
+            name: "Liq Bars".into(),
+            description: "Per-bar liquidation histogram — long-liq below 0, short-liq above; axis unit follows the chart's Coin/USD toggle".into(),
+            category: Category::Volume,
+            spawn: || Box::new(LiquidationBarsParams::default()),
+        },
     ]
 }
 
@@ -129,6 +138,9 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "vrvp" => serde_json::from_value::<VrvpParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "liq_bars" => serde_json::from_value::<LiquidationBarsParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy

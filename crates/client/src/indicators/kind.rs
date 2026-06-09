@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::persistence::VolumeUnit;
-use crate::services::market_data::{Candle, FootprintCellLookup};
+use crate::services::market_data::{Candle, FootprintCellLookup, LiquidationBar};
 
 /// Cross-cutting per-compute context, threaded from `ChartState` into each
 /// `IndicatorKind::compute` call. Lets per-chart settings (e.g., the volume
@@ -42,6 +42,10 @@ pub struct ComputeCtx<'a> {
     /// is empty — VRVP falls back to "no data" in that case rather than
     /// aggregating the whole loaded buffer.
     pub view_time_range: Option<(i64, i64)>,
+    /// Pre-sorted (oldest-first) liquidation-bar cells for the chart's
+    /// current `(symbol, tf)`. `None` when no `liq_bars` indicator is live
+    /// on the chart — ChartState skips rebuilding the cache then.
+    pub liquidation_bars: Option<&'a [LiquidationBar]>,
 }
 
 impl<'a> Default for ComputeCtx<'a> {
@@ -50,6 +54,7 @@ impl<'a> Default for ComputeCtx<'a> {
             volume_unit: VolumeUnit::default(),
             footprint: None,
             view_time_range: None,
+            liquidation_bars: None,
         }
     }
 }

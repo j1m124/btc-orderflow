@@ -180,6 +180,15 @@ pub enum Channel {
     /// Live orderbook state + delta updates. `depth` is the top-N levels
     /// per side the client wants surfaced (the server may cap this).
     Book { depth: u16 },
+    /// Per-symbol liquidation tape (`<symbol>@forceOrder`). One event per
+    /// liquidation, throttled by Binance to ≤1/sec. Snapshot returns the
+    /// most-recent-N events; pagination via `HistoryPage` (`before_ms`).
+    Liquidations,
+    /// Per-bar liquidation aggregation: `SUM(qty)` and `SUM(quote_qty)`
+    /// split by side, bucketed by the subscription's tf via server-side
+    /// `time_bucket`. Snapshot returns the most-recent-N bars; pagination
+    /// via `HistoryPage`.
+    LiquidationBars { tf: Timeframe },
 }
 
 // --- Trade payload ----------------------------------------------------------
@@ -215,6 +224,57 @@ pub struct FootprintCell {
     pub price_bucket_low: f64,
     pub bid_vol: f64,
     pub ask_vol: f64,
+}
+
+// --- Liquidation payload ----------------------------------------------------
+
+/// Side of the *liquidated position* (not Binance's raw forced-order side).
+/// `Long` = a long position was liquidated → forced to sell → bearish event.
+/// `Short` = a short position was liquidated → forced to buy → bullish event.
+///
+/// Binance ships `S = "SELL"` for long-liqs and `S = "BUY"` for short-liqs;
+/// the server flips at the ingest boundary so every downstream consumer sees
+/// the position side directly. Inverting here once means nothing else has to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LiquidationSide {
+    Long,
+    Short,
+}
+
+/// One liquidation event. `ts_ms` is the trade timestamp; `price` is the
+/// average fill price (Binance `ap`) and `qty` is the filled qty (Binance
+/// `z`) — the *actuals*, not the limit-order price/orig-qty pair. `quote_qty`
+/// is `price * qty` precomputed server-side at ingest so per-bar SUM(quote)
+/// queries and client renderers don't redo the multiply per row.
+///
+/// Binance throttles the per-symbol `forceOrder` stream to ≤1 message/sec —
+/// only the latest liquidation in each 1-second window survives. Cascade
+/// detail is lost upstream; this is an irrecoverable property of the WS feed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Liquidation {
+    pub ts_ms: i64,
+    pub side: LiquidationSide,
+    pub price: f64,
+    pub qty: f64,
+    pub quote_qty: f64,
+}
+
+/// One per-bar liquidation cell: at `open_time` for the subscription's tf,
+/// the sums of long-side vs short-side liquidations within that bar.
+///
+/// Both coin qty and USD notional are shipped so the client can flip between
+/// units (via the chart panel's existing `VolumeUnit` toggle) without
+/// re-subscribing. Bars with zero liquidations on a given side ship as zero,
+/// not missing — the server emits a row for every bar in the range so the
+/// client can distinguish "no data" (no row) from "data, none" (zero row).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LiquidationBar {
+    pub open_time: i64,
+    pub long_qty: f64,
+    pub long_quote_qty: f64,
+    pub short_qty: f64,
+    pub short_quote_qty: f64,
 }
 
 // --- Book payload -----------------------------------------------------------
@@ -358,6 +418,52 @@ pub enum ServerFrame {
     BookHistoryPage {
         id: SubId,
         snapshots: Vec<BookSnapshotEntry>,
+    },
+
+    // --- Liquidations channel (tape) ---
+    /// Initial liquidation history on subscribe (most-recent-N events,
+    /// oldest first). N is server-capped (`LIQ_TAPE_SNAPSHOT_COUNT`).
+    LiquidationSnapshot {
+        id: SubId,
+        liquidations: Vec<Liquidation>,
+        server_v: u64,
+    },
+    /// Batch of new liquidation events. Server batches into ~100ms windows
+    /// for consistency with the trade-tick batching shape; given Binance's
+    /// 1/sec throttle most ticks will carry a single liquidation.
+    LiquidationTick {
+        id: SubId,
+        liquidations: Vec<Liquidation>,
+        v: u64,
+    },
+    /// Reply to a `HistoryPage` request on a liquidations subscription.
+    /// Chronological (oldest first), strictly older than the cursor.
+    LiquidationHistoryPage {
+        id: SubId,
+        liquidations: Vec<Liquidation>,
+    },
+
+    // --- LiquidationBars channel (per-bar aggregation) ---
+    /// Initial per-bar liquidation aggregation: cells for the most recent
+    /// N bars at the subscription's tf. Bars with zero liquidations on a
+    /// given side still ship as a zero row (one row per bar in range).
+    LiquidationBarSnapshot {
+        id: SubId,
+        bars: Vec<LiquidationBar>,
+        server_v: u64,
+    },
+    /// Incremental per-bar updates as new liquidations land in active bars.
+    /// Bars share `open_time` keys with the snapshot; clients overwrite.
+    LiquidationBarUpdate {
+        id: SubId,
+        bars: Vec<LiquidationBar>,
+        v: u64,
+    },
+    /// Reply to a `HistoryPage` request on a liquidation-bars subscription.
+    /// Chronological (oldest first), strictly older than the cursor.
+    LiquidationBarHistoryPage {
+        id: SubId,
+        bars: Vec<LiquidationBar>,
     },
 
     // --- Cross-channel control frames ---
@@ -505,6 +611,88 @@ mod tests {
         assert!(s.contains("\"type\":\"book_delta\""));
         assert!(s.contains("\"price\":16510.0"));
         assert!(s.contains("\"size\":0.0"));
+    }
+
+    #[test]
+    fn channel_liquidations_unit_variant() {
+        let s = serde_json::to_string(&Channel::Liquidations).unwrap();
+        assert_eq!(s, "{\"kind\":\"liquidations\"}");
+    }
+
+    #[test]
+    fn channel_liquidation_bars_with_tf() {
+        let s = serde_json::to_string(&Channel::LiquidationBars {
+            tf: Timeframe::M5,
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"liquidation_bars\""));
+        assert!(s.contains("\"tf\":\"5m\""));
+    }
+
+    #[test]
+    fn liquidation_side_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&LiquidationSide::Long).unwrap(),
+            "\"long\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LiquidationSide::Short).unwrap(),
+            "\"short\""
+        );
+    }
+
+    #[test]
+    fn liquidation_tick_frame_shape() {
+        let f = ServerFrame::LiquidationTick {
+            id: SubId(11),
+            liquidations: vec![Liquidation {
+                ts_ms: 1_700_000_000_000,
+                side: LiquidationSide::Long,
+                price: 16500.0,
+                qty: 0.5,
+                quote_qty: 8250.0,
+            }],
+            v: 4,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"type\":\"liquidation_tick\""));
+        assert!(s.contains("\"side\":\"long\""));
+        assert!(s.contains("\"quote_qty\":8250.0"));
+    }
+
+    #[test]
+    fn liquidation_bar_snapshot_frame_shape() {
+        let f = ServerFrame::LiquidationBarSnapshot {
+            id: SubId(12),
+            bars: vec![LiquidationBar {
+                open_time: 1_700_000_000_000,
+                long_qty: 1.5,
+                long_quote_qty: 25000.0,
+                short_qty: 0.25,
+                short_quote_qty: 4000.0,
+            }],
+            server_v: 0,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"type\":\"liquidation_bar_snapshot\""));
+        assert!(s.contains("\"long_qty\":1.5"));
+        assert!(s.contains("\"short_quote_qty\":4000.0"));
+    }
+
+    #[test]
+    fn liquidation_roundtrip() {
+        let l = Liquidation {
+            ts_ms: 1_700_000_001_234,
+            side: LiquidationSide::Short,
+            price: 16600.5,
+            qty: 0.123,
+            quote_qty: 2041.86,
+        };
+        let s = serde_json::to_string(&l).unwrap();
+        let back: Liquidation = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.ts_ms, l.ts_ms);
+        assert_eq!(back.side, LiquidationSide::Short);
+        assert!((back.price - l.price).abs() < 1e-9);
     }
 
     #[test]

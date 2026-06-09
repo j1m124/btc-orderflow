@@ -19,19 +19,20 @@ use std::net::SocketAddr;
 use tokio::sync::broadcast;
 use tracing::info;
 
-use crate::binance::parse::{DepthDiff, Tick, TradeTick};
+use crate::binance::parse::{DepthDiff, LiquidationTick, Tick, TradeTick};
 use crate::ingest::BookState;
 
 /// Shared state passed to each per-connection axum handler. The kline
 /// broadcast is the existing candles forwarder source; trade / depth /
-/// book_state are wired in for the orderflow channels (used by per-channel
-/// forwarders in a follow-up commit).
+/// book_state / liquidation are wired in for the orderflow channels (used
+/// by per-channel forwarders).
 #[derive(Clone)]
 pub struct GatewayState {
     pub pool: PgPool,
     pub broadcast_tx: broadcast::Sender<Tick>,
     pub trade_tx: broadcast::Sender<TradeTick>,
     pub depth_tx: broadcast::Sender<DepthDiff>,
+    pub liquidation_tx: broadcast::Sender<LiquidationTick>,
     pub book_state: BookState,
 }
 

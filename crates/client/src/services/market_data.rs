@@ -41,6 +41,13 @@ const HISTORY_PAGE_SIZE: u32 = 500;
 /// growth).
 const TRADES_BUFFER_CAP: usize = 200;
 
+/// Cap on the per-symbol liquidations tape buffer. Liquidations are sparse
+/// (≤1/sec from Binance) and the tape panel only paints what fits in the
+/// visible rows — but we hold extra so a filter-aware persist (e.g. "$1M+
+/// only") can keep showing the rare big print after a reconnect. Set higher
+/// than the trade tape because liquidations matter farther back in time.
+const LIQUIDATIONS_BUFFER_CAP: usize = 1000;
+
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
@@ -271,6 +278,39 @@ impl<'a> FootprintCellLookup<'a> {
     }
 }
 
+/// Side of the *liquidated position* — matches the wire-form, decoded
+/// server-side once at ingest. `Long` = a long position was liquidated
+/// (bearish event, taker forced to sell). `Short` = a short position was
+/// liquidated (bullish event, taker forced to buy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiquidationSide {
+    Long,
+    Short,
+}
+
+/// One liquidation event surfaced into the tape panel. Mirrors the wire
+/// shape; `quote_qty` is `price * qty` precomputed server-side at ingest.
+#[derive(Clone, Debug)]
+pub struct Liquidation {
+    pub ts_ms: i64,
+    pub side: LiquidationSide,
+    pub price: f64,
+    pub qty: f64,
+    pub quote_qty: f64,
+}
+
+/// One per-bar liquidation aggregation cell. Both qty and quote_qty are
+/// shipped on each side so the bar-stat indicator can flip Coin/USD axes
+/// without re-subscribing.
+#[derive(Clone, Debug)]
+pub struct LiquidationBar {
+    pub open_time: i64,
+    pub long_qty: f64,
+    pub long_quote_qty: f64,
+    pub short_qty: f64,
+    pub short_quote_qty: f64,
+}
+
 /// One book price level.
 #[derive(Clone, Debug)]
 pub struct BookLevel {
@@ -326,6 +366,60 @@ pub enum FootprintEvent {
         cells: Vec<FootprintCell>,
     },
     /// Older cells prepended.
+    Prepended {
+        symbol: SharedString,
+        tf: Timeframe,
+        added: usize,
+    },
+    HistoryCapped {
+        symbol: SharedString,
+        tf: Timeframe,
+    },
+    Resnap {
+        symbol: SharedString,
+        tf: Timeframe,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum LiquidationEvent {
+    /// Initial liquidations on subscribe (oldest-first, most-recent N).
+    Snapshot {
+        symbol: SharedString,
+        liquidations: Vec<Liquidation>,
+    },
+    /// Live batch (server emits at ~10 Hz; usually 0–1 events given the
+    /// 1/sec Binance throttle).
+    Tick {
+        symbol: SharedString,
+        liquidations: Vec<Liquidation>,
+    },
+    /// Older liquidations prepended in response to `load_older_liquidations`.
+    Prepended {
+        symbol: SharedString,
+        added: usize,
+    },
+    /// No older liquidations available — paginator should stop.
+    HistoryCapped { symbol: SharedString },
+    /// Server requested a reset; buffer cleared and re-Subscribe sent.
+    Resnap { symbol: SharedString },
+}
+
+#[derive(Clone, Debug)]
+pub enum LiquidationBarEvent {
+    /// Initial per-bar cells for the recent N bars.
+    Snapshot {
+        symbol: SharedString,
+        tf: Timeframe,
+        bars: Vec<LiquidationBar>,
+    },
+    /// Live per-bar update (compose by `open_time`).
+    Update {
+        symbol: SharedString,
+        tf: Timeframe,
+        bars: Vec<LiquidationBar>,
+    },
+    /// Older bars prepended.
     Prepended {
         symbol: SharedString,
         tf: Timeframe,
@@ -429,6 +523,34 @@ impl BookSubKey {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LiquidationsSubKey {
+    pub(crate) symbol: String,
+}
+
+impl LiquidationsSubKey {
+    fn new(symbol: &str) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LiquidationBarsSubKey {
+    pub(crate) symbol: String,
+    pub(crate) tf: Timeframe,
+}
+
+impl LiquidationBarsSubKey {
+    fn new(symbol: &str, tf: Timeframe) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            tf,
+        }
+    }
+}
+
 /// Discriminator on `by_id` so an incoming server frame can route to the
 /// right per-channel handler from just its `SubId`.
 #[derive(Clone)]
@@ -437,6 +559,8 @@ enum AnySubKey {
     Trades(TradeSubKey),
     Footprint(FootprintSubKey),
     Book(BookSubKey),
+    Liquidations(LiquidationsSubKey),
+    LiquidationBars(LiquidationBarsSubKey),
 }
 
 /// Used by the release pump to know which kind of refcount to decrement
@@ -447,6 +571,8 @@ enum ReleaseKey {
     Trades(TradeSubKey),
     Footprint(FootprintSubKey),
     Book(BookSubKey),
+    Liquidations(LiquidationsSubKey),
+    LiquidationBars(LiquidationBarsSubKey),
 }
 
 pub struct MarketDataService {
@@ -486,6 +612,19 @@ pub struct MarketDataService {
     book_refcounts: HashMap<BookSubKey, usize>,
     book_history_in_flight: HashSet<BookSubKey>,
 
+    // --- Liquidations (tape) channel state ---
+    liquidations: HashMap<LiquidationsSubKey, Vec<Liquidation>>,
+    liquidations_sub_ids: HashMap<LiquidationsSubKey, proto::SubId>,
+    liquidations_refcounts: HashMap<LiquidationsSubKey, usize>,
+    liquidations_history_in_flight: HashSet<LiquidationsSubKey>,
+
+    // --- LiquidationBars (per-bar) channel state ---
+    /// Bars keyed by `open_time` so live updates compose by overwriting.
+    liquidation_bars: HashMap<LiquidationBarsSubKey, HashMap<i64, LiquidationBar>>,
+    liquidation_bars_sub_ids: HashMap<LiquidationBarsSubKey, proto::SubId>,
+    liquidation_bars_refcounts: HashMap<LiquidationBarsSubKey, usize>,
+    liquidation_bars_history_in_flight: HashSet<LiquidationBarsSubKey>,
+
     // --- Shared routing / connection state ---
 
     /// Maps wire `SubId` → channel-tagged key. One counter is shared across
@@ -520,6 +659,8 @@ impl EventEmitter<KlineEvent> for MarketDataService {}
 impl EventEmitter<TradeEvent> for MarketDataService {}
 impl EventEmitter<FootprintEvent> for MarketDataService {}
 impl EventEmitter<BookEvent> for MarketDataService {}
+impl EventEmitter<LiquidationEvent> for MarketDataService {}
+impl EventEmitter<LiquidationBarEvent> for MarketDataService {}
 
 impl MarketDataService {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -537,6 +678,8 @@ impl MarketDataService {
                         ReleaseKey::Trades(k) => s.release_one_trades(k, cx),
                         ReleaseKey::Footprint(k) => s.release_one_footprint(k, cx),
                         ReleaseKey::Book(k) => s.release_one_book(k, cx),
+                        ReleaseKey::Liquidations(k) => s.release_one_liquidations(k, cx),
+                        ReleaseKey::LiquidationBars(k) => s.release_one_liquidation_bars(k, cx),
                     })
                     .is_err()
                 {
@@ -570,6 +713,14 @@ impl MarketDataService {
             book_sub_ids: HashMap::new(),
             book_refcounts: HashMap::new(),
             book_history_in_flight: HashSet::new(),
+            liquidations: HashMap::new(),
+            liquidations_sub_ids: HashMap::new(),
+            liquidations_refcounts: HashMap::new(),
+            liquidations_history_in_flight: HashSet::new(),
+            liquidation_bars: HashMap::new(),
+            liquidation_bars_sub_ids: HashMap::new(),
+            liquidation_bars_refcounts: HashMap::new(),
+            liquidation_bars_history_in_flight: HashSet::new(),
             by_id: HashMap::new(),
             next_sub_id: 0,
             to_ws,
@@ -716,6 +867,87 @@ impl MarketDataService {
         SubscriptionHandle {
             key: ReleaseKey::Book(key),
             release_tx: self.release_tx.clone(),
+        }
+    }
+
+    /// Refcounted subscribe for the liquidations tape channel.
+    pub fn ensure_liquidations(
+        &mut self,
+        symbol: &str,
+        _cx: &mut Context<Self>,
+    ) -> SubscriptionHandle {
+        let key = LiquidationsSubKey::new(symbol);
+        let count = self.liquidations_refcounts.entry(key.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            let sub_id = self.alloc_sub_id();
+            self.liquidations_sub_ids.insert(key.clone(), sub_id);
+            self.by_id.insert(sub_id, AnySubKey::Liquidations(key.clone()));
+            self.liquidations.insert(key.clone(), Vec::new());
+            let frame = proto::ClientFrame::Subscribe {
+                id: sub_id,
+                symbol: symbol.to_string(),
+                channel: proto::Channel::Liquidations,
+            };
+            let _ = self.to_ws.unbounded_send(frame);
+        }
+        SubscriptionHandle {
+            key: ReleaseKey::Liquidations(key),
+            release_tx: self.release_tx.clone(),
+        }
+    }
+
+    /// Refcounted subscribe for the per-bar liquidations channel.
+    pub fn ensure_liquidation_bars(
+        &mut self,
+        symbol: &str,
+        tf: Timeframe,
+        _cx: &mut Context<Self>,
+    ) -> SubscriptionHandle {
+        let key = LiquidationBarsSubKey::new(symbol, tf);
+        let count = self
+            .liquidation_bars_refcounts
+            .entry(key.clone())
+            .or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            let sub_id = self.alloc_sub_id();
+            self.liquidation_bars_sub_ids.insert(key.clone(), sub_id);
+            self.by_id
+                .insert(sub_id, AnySubKey::LiquidationBars(key.clone()));
+            self.liquidation_bars.insert(key.clone(), HashMap::new());
+            let frame = proto::ClientFrame::Subscribe {
+                id: sub_id,
+                symbol: symbol.to_string(),
+                channel: proto::Channel::LiquidationBars { tf: proto_tf(tf) },
+            };
+            let _ = self.to_ws.unbounded_send(frame);
+        }
+        SubscriptionHandle {
+            key: ReleaseKey::LiquidationBars(key),
+            release_tx: self.release_tx.clone(),
+        }
+    }
+
+    pub fn liquidations(&self, symbol: &str) -> Option<&[Liquidation]> {
+        self.liquidations
+            .get(&LiquidationsSubKey::new(symbol))
+            .map(|v| v.as_slice())
+    }
+
+    pub fn liquidation_bars(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+    ) -> Vec<LiquidationBar> {
+        let key = LiquidationBarsSubKey::new(symbol, tf);
+        match self.liquidation_bars.get(&key) {
+            Some(map) => {
+                let mut bars: Vec<LiquidationBar> = map.values().cloned().collect();
+                bars.sort_by_key(|b| b.open_time);
+                bars
+            }
+            None => Vec::new(),
         }
     }
 
@@ -882,6 +1114,56 @@ impl MarketDataService {
         let _ = self.to_ws.unbounded_send(frame);
     }
 
+    /// Request older liquidations. Cursor = `oldest held event.ts_ms`.
+    pub fn load_older_liquidations(&mut self, symbol: &str, _cx: &mut Context<Self>) {
+        let key = LiquidationsSubKey::new(symbol);
+        let Some(sub_id) = self.liquidations_sub_ids.get(&key).copied() else {
+            return;
+        };
+        if !self.liquidations_history_in_flight.insert(key.clone()) {
+            return;
+        }
+        let before_ms = self
+            .liquidations
+            .get(&key)
+            .and_then(|v| v.first())
+            .map(|l| l.ts_ms)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let frame = proto::ClientFrame::HistoryPage {
+            id: sub_id,
+            before_ms,
+            count: HISTORY_PAGE_SIZE,
+        };
+        let _ = self.to_ws.unbounded_send(frame);
+    }
+
+    /// Request older liquidation bars. Cursor = oldest held `open_time`.
+    pub fn load_older_liquidation_bars(
+        &mut self,
+        symbol: &str,
+        tf: Timeframe,
+        _cx: &mut Context<Self>,
+    ) {
+        let key = LiquidationBarsSubKey::new(symbol, tf);
+        let Some(sub_id) = self.liquidation_bars_sub_ids.get(&key).copied() else {
+            return;
+        };
+        if !self.liquidation_bars_history_in_flight.insert(key.clone()) {
+            return;
+        }
+        let before_ms = self
+            .liquidation_bars
+            .get(&key)
+            .and_then(|bars| bars.keys().min().copied())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let frame = proto::ClientFrame::HistoryPage {
+            id: sub_id,
+            before_ms,
+            count: HISTORY_PAGE_SIZE,
+        };
+        let _ = self.to_ws.unbounded_send(frame);
+    }
+
     // --- Internal: driven by the connection task ---------------------------
 
     /// Route an incoming server frame into per-subscription state.
@@ -923,6 +1205,32 @@ impl MarketDataService {
             }
             proto::ServerFrame::BookHistoryPage { id, snapshots } => {
                 self.on_book_history_page(id, snapshots, cx);
+            }
+            proto::ServerFrame::LiquidationSnapshot {
+                id,
+                liquidations,
+                server_v: _,
+            } => {
+                self.on_liquidation_snapshot(id, liquidations, cx);
+            }
+            proto::ServerFrame::LiquidationTick {
+                id,
+                liquidations,
+                v: _,
+            } => {
+                self.on_liquidation_tick(id, liquidations, cx);
+            }
+            proto::ServerFrame::LiquidationHistoryPage { id, liquidations } => {
+                self.on_liquidation_history_page(id, liquidations, cx);
+            }
+            proto::ServerFrame::LiquidationBarSnapshot { id, bars, server_v: _ } => {
+                self.on_liquidation_bar_snapshot(id, bars, cx);
+            }
+            proto::ServerFrame::LiquidationBarUpdate { id, bars, v: _ } => {
+                self.on_liquidation_bar_update(id, bars, cx);
+            }
+            proto::ServerFrame::LiquidationBarHistoryPage { id, bars } => {
+                self.on_liquidation_bar_history_page(id, bars, cx);
             }
             proto::ServerFrame::Resnap { id } => {
                 self.on_resnap(id, cx);
@@ -1080,6 +1388,32 @@ impl MarketDataService {
                     id,
                     symbol: key.symbol.clone(),
                     channel: proto::Channel::Book { depth: key.depth },
+                });
+            }
+            AnySubKey::Liquidations(key) => {
+                self.liquidations.insert(key.clone(), Vec::new());
+                self.liquidations_history_in_flight.remove(&key);
+                cx.emit(LiquidationEvent::Resnap {
+                    symbol: key.symbol.clone().into(),
+                });
+                let _ = self.to_ws.unbounded_send(proto::ClientFrame::Subscribe {
+                    id,
+                    symbol: key.symbol.clone(),
+                    channel: proto::Channel::Liquidations,
+                });
+            }
+            AnySubKey::LiquidationBars(key) => {
+                let tf = key.tf;
+                self.liquidation_bars.insert(key.clone(), HashMap::new());
+                self.liquidation_bars_history_in_flight.remove(&key);
+                cx.emit(LiquidationBarEvent::Resnap {
+                    symbol: key.symbol.clone().into(),
+                    tf,
+                });
+                let _ = self.to_ws.unbounded_send(proto::ClientFrame::Subscribe {
+                    id,
+                    symbol: key.symbol.clone(),
+                    channel: proto::Channel::LiquidationBars { tf: proto_tf(tf) },
                 });
             }
         }
@@ -1334,6 +1668,180 @@ impl MarketDataService {
         });
     }
 
+    // --- Liquidations handlers ---
+
+    fn on_liquidation_snapshot(
+        &mut self,
+        id: proto::SubId,
+        liquidations: Vec<proto::Liquidation>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::Liquidations(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        let mut domain: Vec<Liquidation> =
+            liquidations.into_iter().map(liquidation_from_proto).collect();
+        if domain.len() > LIQUIDATIONS_BUFFER_CAP {
+            let drop_n = domain.len() - LIQUIDATIONS_BUFFER_CAP;
+            domain.drain(0..drop_n);
+        }
+        self.liquidations.insert(key.clone(), domain.clone());
+        self.liquidations_history_in_flight.remove(&key);
+        cx.emit(LiquidationEvent::Snapshot {
+            symbol: key.symbol.clone().into(),
+            liquidations: domain,
+        });
+    }
+
+    fn on_liquidation_tick(
+        &mut self,
+        id: proto::SubId,
+        liquidations: Vec<proto::Liquidation>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::Liquidations(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        let domain: Vec<Liquidation> =
+            liquidations.into_iter().map(liquidation_from_proto).collect();
+        let buf = self.liquidations.entry(key.clone()).or_default();
+        for l in &domain {
+            buf.push(l.clone());
+        }
+        if buf.len() > LIQUIDATIONS_BUFFER_CAP {
+            let drop_n = buf.len() - LIQUIDATIONS_BUFFER_CAP;
+            buf.drain(0..drop_n);
+        }
+        cx.emit(LiquidationEvent::Tick {
+            symbol: key.symbol.clone().into(),
+            liquidations: domain,
+        });
+    }
+
+    fn on_liquidation_history_page(
+        &mut self,
+        id: proto::SubId,
+        liquidations: Vec<proto::Liquidation>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::Liquidations(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        self.liquidations_history_in_flight.remove(&key);
+        if liquidations.is_empty() {
+            cx.emit(LiquidationEvent::HistoryCapped {
+                symbol: key.symbol.clone().into(),
+            });
+            return;
+        }
+        let existing = self.liquidations.entry(key.clone()).or_default();
+        let cutoff = existing.first().map(|l| l.ts_ms);
+        let mut prepend: Vec<Liquidation> = liquidations
+            .into_iter()
+            .map(liquidation_from_proto)
+            .filter(|l| cutoff.map_or(true, |c| l.ts_ms < c))
+            .collect();
+        if prepend.is_empty() {
+            return;
+        }
+        let added = prepend.len();
+        let mut merged = Vec::with_capacity(prepend.len() + existing.len());
+        merged.append(&mut prepend);
+        merged.append(existing);
+        *existing = merged;
+        cx.emit(LiquidationEvent::Prepended {
+            symbol: key.symbol.clone().into(),
+            added,
+        });
+    }
+
+    fn on_liquidation_bar_snapshot(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::LiquidationBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::LiquidationBars(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        let domain: Vec<LiquidationBar> =
+            bars.into_iter().map(liquidation_bar_from_proto).collect();
+        let mut map: HashMap<i64, LiquidationBar> = HashMap::new();
+        for b in &domain {
+            map.insert(b.open_time, b.clone());
+        }
+        self.liquidation_bars.insert(key.clone(), map);
+        self.liquidation_bars_history_in_flight.remove(&key);
+        cx.emit(LiquidationBarEvent::Snapshot {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            bars: domain,
+        });
+    }
+
+    fn on_liquidation_bar_update(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::LiquidationBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::LiquidationBars(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        let domain: Vec<LiquidationBar> =
+            bars.into_iter().map(liquidation_bar_from_proto).collect();
+        let map = self.liquidation_bars.entry(key.clone()).or_default();
+        for b in &domain {
+            map.insert(b.open_time, b.clone());
+        }
+        cx.emit(LiquidationBarEvent::Update {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            bars: domain,
+        });
+    }
+
+    fn on_liquidation_bar_history_page(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::LiquidationBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::LiquidationBars(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        self.liquidation_bars_history_in_flight.remove(&key);
+        if bars.is_empty() {
+            cx.emit(LiquidationBarEvent::HistoryCapped {
+                symbol: key.symbol.clone().into(),
+                tf: key.tf,
+            });
+            return;
+        }
+        let domain: Vec<LiquidationBar> =
+            bars.into_iter().map(liquidation_bar_from_proto).collect();
+        let map = self.liquidation_bars.entry(key.clone()).or_default();
+        let mut added = 0;
+        for b in &domain {
+            // Server emits one row per bar in the covered range; insert as
+            // new only when we don't already have that open_time, otherwise
+            // a history page for an already-visible bar would clobber the
+            // live cumulative with a stale (snapshot-time) total.
+            if !map.contains_key(&b.open_time) {
+                map.insert(b.open_time, b.clone());
+                added += 1;
+            }
+        }
+        if added == 0 {
+            return;
+        }
+        cx.emit(LiquidationBarEvent::Prepended {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            added,
+        });
+    }
+
     fn set_conn_status(&mut self, status: LiveStatus, cx: &mut Context<Self>) {
         if self.conn_status == status {
             return;
@@ -1402,6 +1910,32 @@ impl MarketDataService {
                 id: sub_id,
                 symbol: key.symbol.clone(),
                 channel: proto::Channel::Book { depth: key.depth },
+            });
+        }
+        let liquidation_subs: Vec<(LiquidationsSubKey, proto::SubId)> = self
+            .liquidations_sub_ids
+            .iter()
+            .map(|(k, id)| (k.clone(), *id))
+            .collect();
+        for (key, sub_id) in liquidation_subs {
+            let _ = self.to_ws.unbounded_send(proto::ClientFrame::Subscribe {
+                id: sub_id,
+                symbol: key.symbol.clone(),
+                channel: proto::Channel::Liquidations,
+            });
+        }
+        let liquidation_bar_subs: Vec<(LiquidationBarsSubKey, proto::SubId)> = self
+            .liquidation_bars_sub_ids
+            .iter()
+            .map(|(k, id)| (k.clone(), *id))
+            .collect();
+        for (key, sub_id) in liquidation_bar_subs {
+            let _ = self.to_ws.unbounded_send(proto::ClientFrame::Subscribe {
+                id: sub_id,
+                symbol: key.symbol.clone(),
+                channel: proto::Channel::LiquidationBars {
+                    tf: proto_tf(key.tf),
+                },
             });
         }
     }
@@ -1491,6 +2025,56 @@ impl MarketDataService {
             self.book.remove(&key);
             self.book_history.remove(&key);
             self.book_history_in_flight.remove(&key);
+        }
+    }
+
+    fn release_one_liquidations(
+        &mut self,
+        key: LiquidationsSubKey,
+        _cx: &mut Context<Self>,
+    ) {
+        let zero = match self.liquidations_refcounts.get_mut(&key) {
+            Some(c) => {
+                *c = c.saturating_sub(1);
+                *c == 0
+            }
+            None => return,
+        };
+        if zero {
+            self.liquidations_refcounts.remove(&key);
+            if let Some(sub_id) = self.liquidations_sub_ids.remove(&key) {
+                self.by_id.remove(&sub_id);
+                let _ = self
+                    .to_ws
+                    .unbounded_send(proto::ClientFrame::Unsubscribe { id: sub_id });
+            }
+            self.liquidations.remove(&key);
+            self.liquidations_history_in_flight.remove(&key);
+        }
+    }
+
+    fn release_one_liquidation_bars(
+        &mut self,
+        key: LiquidationBarsSubKey,
+        _cx: &mut Context<Self>,
+    ) {
+        let zero = match self.liquidation_bars_refcounts.get_mut(&key) {
+            Some(c) => {
+                *c = c.saturating_sub(1);
+                *c == 0
+            }
+            None => return,
+        };
+        if zero {
+            self.liquidation_bars_refcounts.remove(&key);
+            if let Some(sub_id) = self.liquidation_bars_sub_ids.remove(&key) {
+                self.by_id.remove(&sub_id);
+                let _ = self
+                    .to_ws
+                    .unbounded_send(proto::ClientFrame::Unsubscribe { id: sub_id });
+            }
+            self.liquidation_bars.remove(&key);
+            self.liquidation_bars_history_in_flight.remove(&key);
         }
     }
 }
@@ -1751,6 +2335,29 @@ fn book_snapshot_entry_from_proto(e: proto::BookSnapshotEntry) -> BookSnapshotEn
         ts_ms: e.ts_ms,
         bids: e.bids.into_iter().map(book_level_from_proto).collect(),
         asks: e.asks.into_iter().map(book_level_from_proto).collect(),
+    }
+}
+
+fn liquidation_from_proto(l: proto::Liquidation) -> Liquidation {
+    Liquidation {
+        ts_ms: l.ts_ms,
+        side: match l.side {
+            proto::LiquidationSide::Long => LiquidationSide::Long,
+            proto::LiquidationSide::Short => LiquidationSide::Short,
+        },
+        price: l.price,
+        qty: l.qty,
+        quote_qty: l.quote_qty,
+    }
+}
+
+fn liquidation_bar_from_proto(b: proto::LiquidationBar) -> LiquidationBar {
+    LiquidationBar {
+        open_time: b.open_time,
+        long_qty: b.long_qty,
+        long_quote_qty: b.long_quote_qty,
+        short_qty: b.short_qty,
+        short_quote_qty: b.short_quote_qty,
     }
 }
 

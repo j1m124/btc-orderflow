@@ -2441,9 +2441,11 @@ pub(super) fn paint_overlay_indicators(
                     }
                 }
             }
-            IndicatorOutput::Macd { .. } | IndicatorOutput::BarStat { .. } => {
-                // MACD and BarStat are pane-only; ignore here. Pane render
-                // routes them to their own canvases in `paint_sub_pane`.
+            IndicatorOutput::Macd { .. }
+            | IndicatorOutput::BarStat { .. }
+            | IndicatorOutput::LiquidationBars { .. } => {
+                // MACD, BarStat, and LiquidationBars are pane-only; ignore
+                // here. Pane render routes them to `paint_sub_pane`.
             }
             IndicatorOutput::VolumeProfile { output, params } => {
                 // VP renders inside the same price band as the candles
@@ -2827,6 +2829,93 @@ pub(super) fn paint_sub_pane(
                     chart_top,
                     chart_bottom,
                     color,
+                    1.5,
+                    origin,
+                    window,
+                );
+            }
+        }
+        IndicatorOutput::LiquidationBars {
+            long_qty,
+            long_quote_qty,
+            short_qty,
+            short_quote_qty,
+            params,
+            unit,
+        } => {
+            // Two-sided histogram around the zero line. Long-liq plots
+            // *downward* (negative y) in bearish red; short-liq plots
+            // *upward* (positive y) in bullish green. Series unit follows
+            // the chart's VolumeUnit toggle — paint just reads whichever
+            // pair matches `unit`.
+            let (longs, shorts) = match unit {
+                crate::persistence::VolumeUnit::Coin => (long_qty, short_qty),
+                crate::persistence::VolumeUnit::Usd => (long_quote_qty, short_quote_qty),
+            };
+            let long_color = params.long_color.unwrap_or(Hsla { a: 0.78, ..bearish });
+            let short_color = params.short_color.unwrap_or(Hsla { a: 0.78, ..bullish });
+            let zero_y = band_y(y_lo, y_hi, 0.0, chart_top, chart_bottom);
+            for i in start_idx..visible_end.min(longs.len()) {
+                let cx_px =
+                    index_to_screen(view_start, view_size, i as f32, canvas_w, y_axis_gap);
+                if cx_px < -bar_w || cx_px > chart_w + bar_w {
+                    continue;
+                }
+                let bar_x = cx_px - bar_w * 0.5;
+                // Long-liq → negative slot (drawn downward from 0).
+                if let Some(v) = longs[i] {
+                    if v > 0.0 {
+                        let y_bot = band_y(y_lo, y_hi, -v, chart_top, chart_bottom);
+                        let h = (y_bot - zero_y).max(1.0);
+                        fill_rect(window, origin, bar_x, bar_w, zero_y, h, long_color);
+                    }
+                }
+                // Short-liq → positive slot (drawn upward from 0).
+                if let Some(v) = shorts[i] {
+                    if v > 0.0 {
+                        let y_top = band_y(y_lo, y_hi, v, chart_top, chart_bottom);
+                        let h = (zero_y - y_top).max(1.0);
+                        fill_rect(window, origin, bar_x, bar_w, y_top, h, short_color);
+                    }
+                }
+            }
+            // Zero baseline on top of the bars so the split is glance-able.
+            fill_rect(window, origin, 0.0, chart_w, zero_y, 1.0, grid);
+
+            // Optional cumulative-net overlay line: running sum of
+            // (short - long) across the visible bar slice. Zero-clamped at
+            // visible-window start so the line always begins at 0 and
+            // diverges based on visible activity (matches the way most
+            // liquidation dashboards render the metric).
+            if params.show_cumulative {
+                let cum_color = params.cumulative_color.unwrap_or(label_color);
+                let mut cum_series: Vec<Option<f64>> = vec![None; longs.len()];
+                let mut acc = 0.0_f64;
+                let mut seen_any = false;
+                for i in start_idx..visible_end.min(longs.len()) {
+                    let long_v = longs[i].unwrap_or(0.0);
+                    let short_v = shorts[i].unwrap_or(0.0);
+                    if longs[i].is_some() || shorts[i].is_some() {
+                        seen_any = true;
+                    }
+                    if seen_any {
+                        acc += short_v - long_v;
+                        cum_series[i] = Some(acc);
+                    }
+                }
+                paint_line_series(
+                    &cum_series,
+                    start_idx,
+                    visible_end,
+                    view_start,
+                    view_size,
+                    canvas_w,
+                    y_axis_gap,
+                    y_lo,
+                    y_hi,
+                    chart_top,
+                    chart_bottom,
+                    cum_color,
                     1.5,
                     origin,
                     window,

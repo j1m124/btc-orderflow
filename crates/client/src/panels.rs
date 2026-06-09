@@ -20,6 +20,7 @@ use gpui_component::{
 use serde::{Deserialize, Serialize};
 
 pub mod chart;
+pub mod liquidations;
 pub mod orderbook;
 pub mod trades;
 pub mod watchlist;
@@ -28,6 +29,7 @@ pub use chart::{
     ChangeChartRender, ChangeChartTimeframe, ChangeChartVolumeUnit, ChartRenderSettingsView,
     GoToLatest, OpenChartRenderSettings, ResetChartScale, ToggleChartRenderVisible,
 };
+pub use liquidations::{ChangeLiquidationsSideFilter, ChangeLiquidationsSizeMode};
 pub use orderbook::{ChangeOrderbookBucket, ChangeOrderbookSizeMode};
 pub use trades::ChangeTradesSizeMode;
 
@@ -43,6 +45,7 @@ pub enum Kind {
     Chart,
     Trades,
     Orderbook,
+    Liquidations,
 }
 
 impl Kind {
@@ -51,6 +54,7 @@ impl Kind {
         Kind::Chart,
         Kind::Trades,
         Kind::Orderbook,
+        Kind::Liquidations,
     ];
 
     pub fn id(self) -> &'static str {
@@ -59,6 +63,7 @@ impl Kind {
             Kind::Chart => "Chart",
             Kind::Trades => "Trades",
             Kind::Orderbook => "Orderbook",
+            Kind::Liquidations => "Liquidations",
         }
     }
 
@@ -358,6 +363,47 @@ struct OrderbookPrefs {
     size_mode: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LiquidationsPrefs {
+    symbol: String,
+    #[serde(default)]
+    min_size: Option<f64>,
+    #[serde(default)]
+    size_mode: Option<String>,
+    #[serde(default)]
+    side_filter: Option<String>,
+}
+
+fn liquidations_prefs_from_info(
+    info: &PanelInfo,
+) -> Option<(
+    SharedString,
+    Option<f64>,
+    liquidations::LiquidationsSizeMode,
+    liquidations::LiquidationsSideFilter,
+)> {
+    let PanelInfo::Panel(value) = info else {
+        return None;
+    };
+    let prefs: LiquidationsPrefs = serde_json::from_value(value.clone()).ok()?;
+    let size_mode = prefs
+        .size_mode
+        .as_deref()
+        .and_then(liquidations::LiquidationsSizeMode::from_id)
+        .unwrap_or_default();
+    let side_filter = prefs
+        .side_filter
+        .as_deref()
+        .and_then(liquidations::LiquidationsSideFilter::from_id)
+        .unwrap_or_default();
+    Some((
+        SharedString::from(prefs.symbol),
+        prefs.min_size,
+        size_mode,
+        side_filter,
+    ))
+}
+
 fn orderbook_prefs_from_info(
     info: &PanelInfo,
 ) -> Option<(
@@ -410,6 +456,11 @@ pub struct OrderbookState {
 /// a long session. ~5000 × ~50B/Trade ≈ 250 KB per panel.
 const TRADES_PERSIST_CAP: usize = 5_000;
 
+/// Same role as `TRADES_PERSIST_CAP` for the liquidations tape — a min-size
+/// threshold can hold rare big prints in the buffer indefinitely; capped so
+/// long sessions don't accumulate unbounded.
+const LIQUIDATIONS_PERSIST_CAP: usize = 5_000;
+
 fn default_symbol(cx: &App) -> SharedString {
     cx.global::<crate::services::symbols::SymbolsServiceHandle>()
         .0
@@ -460,6 +511,11 @@ pub struct ContentPanel {
     /// requests every paint frame the moment a response arrives. 200ms
     /// per the design grilling.
     vp_history_last_request_ms: HashMap<u64, i64>,
+    /// Throttle for the liquidation-bars history-fill loop. Single slot
+    /// (the bar indicator's sub is keyed only on `(symbol, tf)`, so there's
+    /// only ever one in-flight target at a time on this chart). Same 200ms
+    /// cadence as the footprint variant.
+    liq_bars_history_last_request_ms: Option<i64>,
     /// `(symbol, tf, bucket_bits)` for the **chart's own** footprint render
     /// (Cluster / Profile modes). The FootprintEvent subscription matches
     /// on this to know which sub's cells to copy into `state.footprint_cells`
@@ -467,6 +523,16 @@ pub struct ContentPanel {
     /// `footprint_subs` and read on demand by the VP compute / paint code.
     chart_footprint_key:
         Option<(SharedString, crate::services::market_data::Timeframe, u64)>,
+    /// `(symbol, tf, handle)` for the chart's liquidation-bars subscription.
+    /// Allocated lazily when at least one `liq_bars` instance is on the
+    /// chart; dropped when the last instance is removed or (symbol, tf)
+    /// changes. `MarketDataService::ensure_liquidation_bars` refcounts so
+    /// repeated reconciles are cheap.
+    chart_liq_bars_sub: Option<(
+        SharedString,
+        crate::services::market_data::Timeframe,
+        crate::services::market_data::SubscriptionHandle,
+    )>,
     watchlist_sub_handles: HashMap<SharedString, crate::services::market_data::SubscriptionHandle>,
     pub(crate) trades_symbol: Option<SharedString>,
     pub(crate) trades_min_usd: Option<Option<f64>>,
@@ -476,6 +542,15 @@ pub struct ContentPanel {
     _trades_sub_handle: Option<crate::services::market_data::SubscriptionHandle>,
     _trades_input_subscription: Option<gpui::Subscription>,
     pub(crate) orderbook_state: Option<OrderbookState>,
+    pub(crate) liquidations_symbol: Option<SharedString>,
+    pub(crate) liquidations_min_size: Option<Option<f64>>,
+    pub(crate) liquidations_size_mode: Option<liquidations::LiquidationsSizeMode>,
+    pub(crate) liquidations_side_filter: Option<liquidations::LiquidationsSideFilter>,
+    pub(crate) liquidations_filter_input: Option<Entity<InputState>>,
+    pub(crate) liquidations_persist:
+        Option<VecDeque<crate::services::market_data::Liquidation>>,
+    _liquidations_sub_handle: Option<crate::services::market_data::SubscriptionHandle>,
+    _liquidations_input_subscription: Option<gpui::Subscription>,
     /// Monotonic counter bumped by the trades + book event handlers.
     /// Subscribing only via `cx.notify()` empirically wasn't enough to mark
     /// the panel entity dirty under gpui_web — the working `chart` path
@@ -487,7 +562,7 @@ pub struct ContentPanel {
 
 impl ContentPanel {
     pub fn new(kind: Kind, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_inner(kind, None, None, None, window, cx)
+        Self::new_inner(kind, None, None, None, None, window, cx)
     }
 
     pub fn new_restored(
@@ -501,6 +576,7 @@ impl ContentPanel {
             chart_prefs_from_info(info),
             trades_prefs_from_info(info),
             orderbook_prefs_from_info(info),
+            liquidations_prefs_from_info(info),
             window,
             cx,
         )
@@ -514,6 +590,12 @@ impl ContentPanel {
             SharedString,
             orderbook::OrderbookBucket,
             orderbook::OrderbookSizeMode,
+        )>,
+        liquidations_prefs: Option<(
+            SharedString,
+            Option<f64>,
+            liquidations::LiquidationsSizeMode,
+            liquidations::LiquidationsSideFilter,
         )>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -796,6 +878,62 @@ impl ContentPanel {
                 },
             )
             .detach();
+            // LiquidationBarEvent → copy the per-bar cells into ChartState's
+            // liquidation_bars_cache. Same gating as the FootprintEvent
+            // subscription: events for a (symbol, tf) the chart isn't
+            // watching are dropped.
+            cx.subscribe_in(
+                &service,
+                window,
+                |this,
+                 _service,
+                 event: &crate::services::market_data::LiquidationBarEvent,
+                 _window,
+                 cx| {
+                    use crate::services::market_data::LiquidationBarEvent::*;
+                    let Some((chart_symbol, chart_tf)) = this
+                        .chart_state
+                        .as_ref()
+                        .map(|s| (s.symbol().clone(), s.timeframe()))
+                    else {
+                        return;
+                    };
+                    let matches = match event {
+                        Snapshot { symbol, tf, .. }
+                        | Update { symbol, tf, .. }
+                        | Prepended { symbol, tf, .. }
+                        | HistoryCapped { symbol, tf }
+                        | Resnap { symbol, tf } => {
+                            symbol.as_ref() == chart_symbol.as_ref() && *tf == chart_tf
+                        }
+                    };
+                    if !matches {
+                        return;
+                    }
+                    match event {
+                        Snapshot { .. } | Update { .. } | Prepended { .. } | Resnap { .. } => {
+                            let market = cx
+                                .global::<
+                                    crate::services::market_data::MarketDataServiceHandle,
+                                >()
+                                .0
+                                .clone();
+                            let bars = market
+                                .read(cx)
+                                .liquidation_bars(chart_symbol.as_ref(), chart_tf);
+                            if let Some(state) = this.chart_state.as_mut() {
+                                state.set_liquidation_bars_cache(bars);
+                                state.recompute_indicators();
+                            }
+                            cx.notify();
+                        }
+                        HistoryCapped { .. } => {
+                            cx.notify();
+                        }
+                    }
+                },
+            )
+            .detach();
             let pending = chart_tick_pending.clone();
             let last_ms = chart_tick_last_ms.clone();
             chart_tick_flush = Some(cx.spawn(async move |this, cx| {
@@ -1021,6 +1159,103 @@ impl ContentPanel {
         } else {
             (None, None, None, None, None, None, None)
         };
+        let (
+            liquidations_symbol,
+            liquidations_min_size,
+            liquidations_size_mode,
+            liquidations_side_filter,
+            liquidations_filter_input,
+            liquidations_persist,
+            _liquidations_sub_handle,
+            _liquidations_input_subscription,
+        ) = if matches!(kind, Kind::Liquidations) {
+            let (sym, min_size, size_mode, side_filter) = liquidations_prefs.unwrap_or_else(|| {
+                (
+                    default_symbol(cx),
+                    None,
+                    liquidations::LiquidationsSizeMode::default(),
+                    liquidations::LiquidationsSideFilter::default(),
+                )
+            });
+            let handle = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone()
+                .update(cx, |svc, cx| svc.ensure_liquidations(sym.as_ref(), cx));
+            let market = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone();
+            cx.subscribe_in(
+                &market,
+                window,
+                |this, _svc, ev: &crate::services::market_data::LiquidationEvent, _window, cx| {
+                    use crate::services::market_data::LiquidationEvent::*;
+                    match ev {
+                        Snapshot { symbol, .. } | Resnap { symbol } => {
+                            if this
+                                .liquidations_symbol
+                                .as_deref()
+                                .map_or(true, |s| s != symbol.as_ref())
+                            {
+                                return;
+                            }
+                            this.reseed_liquidations_persist(cx);
+                            this.tick_seq = this.tick_seq.wrapping_add(1);
+                            cx.notify();
+                        }
+                        Tick { symbol, liquidations } => {
+                            if this
+                                .liquidations_symbol
+                                .as_deref()
+                                .map_or(true, |s| s != symbol.as_ref())
+                            {
+                                return;
+                            }
+                            this.append_liquidations_persist(liquidations.iter().cloned(), cx);
+                            this.tick_seq = this.tick_seq.wrapping_add(1);
+                            cx.notify();
+                        }
+                        Prepended { .. } | HistoryCapped { .. } => {
+                            this.tick_seq = this.tick_seq.wrapping_add(1);
+                            cx.notify();
+                        }
+                    }
+                },
+            )
+            .detach();
+            let initial_text: SharedString = match min_size {
+                Some(v) if v > 0.0 => SharedString::from(format!("{:.0}", v)),
+                _ => SharedString::default(),
+            };
+            let input_state =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Min size"));
+            if !initial_text.is_empty() {
+                input_state.update(cx, |s, cx| s.set_value(initial_text, window, cx));
+            }
+            let input_sub = cx.subscribe_in(
+                &input_state,
+                window,
+                |this, input, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let text = input.read(cx).value();
+                        this.apply_liquidations_min_size_from_text(text.as_ref(), window, cx);
+                    }
+                },
+            );
+            (
+                Some(sym),
+                Some(min_size),
+                Some(size_mode),
+                Some(side_filter),
+                Some(input_state),
+                Some(VecDeque::new()),
+                Some(handle),
+                Some(input_sub),
+            )
+        } else {
+            (None, None, None, None, None, None, None, None)
+        };
         let mut new_self = Self {
             kind,
             focus_handle,
@@ -1033,7 +1268,9 @@ impl ContentPanel {
             chart_sub_handles: chart_handles,
             footprint_subs: HashMap::new(),
             vp_history_last_request_ms: HashMap::new(),
+            liq_bars_history_last_request_ms: None,
             chart_footprint_key: None,
+            chart_liq_bars_sub: None,
             watchlist_sub_handles: watchlist_handles,
             trades_symbol,
             trades_min_usd,
@@ -1043,6 +1280,14 @@ impl ContentPanel {
             _trades_sub_handle,
             _trades_input_subscription,
             orderbook_state,
+            liquidations_symbol,
+            liquidations_min_size,
+            liquidations_size_mode,
+            liquidations_side_filter,
+            liquidations_filter_input,
+            liquidations_persist,
+            _liquidations_sub_handle,
+            _liquidations_input_subscription,
             tick_seq: 0,
         };
         // Seed the trades persist with whatever passing prints are already
@@ -1051,11 +1296,15 @@ impl ContentPanel {
         if matches!(kind, Kind::Trades) {
             new_self.reseed_trades_persist(cx);
         }
+        if matches!(kind, Kind::Liquidations) {
+            new_self.reseed_liquidations_persist(cx);
+        }
         // Allocate the footprint sub for a restored chart whose persisted
         // render kind is Cluster / Profile. No-op for Candlestick (the
         // refresh helper short-circuits when needs_footprint_sub() is false).
         if matches!(kind, Kind::Chart) {
             new_self.refresh_chart_footprint_sub(cx);
+            new_self.refresh_chart_liq_bars_sub(cx);
         }
         new_self
     }
@@ -1148,6 +1397,109 @@ impl ContentPanel {
         request_layout_save(cx);
     }
 
+    // --- Liquidations panel helpers ---
+
+    pub fn apply_liquidations_min_size_from_text(
+        &mut self,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let parsed = liquidations::parse_min_size(text);
+        let Some(current) = self.liquidations_min_size.as_mut() else {
+            return;
+        };
+        if *current == parsed {
+            return;
+        }
+        *current = parsed;
+        self.reseed_liquidations_persist(cx);
+        cx.notify();
+        request_layout_save(cx);
+    }
+
+    pub fn reseed_liquidations_persist(&mut self, cx: &mut Context<Self>) {
+        let Some(symbol) = self.liquidations_symbol.clone() else {
+            return;
+        };
+        let Some(persist) = self.liquidations_persist.as_mut() else {
+            return;
+        };
+        let min_size = self.liquidations_min_size.unwrap_or(None);
+        let size_mode = self.liquidations_size_mode.unwrap_or_default();
+        persist.clear();
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        if let Some(snap) = market.read(cx).liquidations(symbol.as_ref()) {
+            for l in snap.iter() {
+                if liquidations::passes_min_size(l, min_size, size_mode) {
+                    persist.push_back(l.clone());
+                }
+            }
+            while persist.len() > LIQUIDATIONS_PERSIST_CAP {
+                persist.pop_front();
+            }
+        }
+    }
+
+    pub fn append_liquidations_persist<I>(&mut self, liqs: I, _cx: &mut Context<Self>)
+    where
+        I: IntoIterator<Item = crate::services::market_data::Liquidation>,
+    {
+        let min_size = self.liquidations_min_size.unwrap_or(None);
+        let size_mode = self.liquidations_size_mode.unwrap_or_default();
+        let Some(persist) = self.liquidations_persist.as_mut() else {
+            return;
+        };
+        for l in liqs {
+            if liquidations::passes_min_size(&l, min_size, size_mode) {
+                persist.push_back(l);
+            }
+        }
+        while persist.len() > LIQUIDATIONS_PERSIST_CAP {
+            persist.pop_front();
+        }
+    }
+
+    pub fn set_liquidations_size_mode(
+        &mut self,
+        mode: liquidations::LiquidationsSizeMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.liquidations_size_mode.as_mut() else {
+            return;
+        };
+        if *current == mode {
+            return;
+        }
+        *current = mode;
+        // Size mode change re-interprets the threshold against a new unit —
+        // reseed so the filter applies under the new interpretation.
+        self.reseed_liquidations_persist(cx);
+        cx.notify();
+        request_layout_save(cx);
+    }
+
+    pub fn set_liquidations_side_filter(
+        &mut self,
+        filter: liquidations::LiquidationsSideFilter,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.liquidations_side_filter.as_mut() else {
+            return;
+        };
+        if *current == filter {
+            return;
+        }
+        *current = filter;
+        // Side filter doesn't change the persist buffer (filter is applied
+        // at render time only) — just re-render and persist.
+        cx.notify();
+        request_layout_save(cx);
+    }
+
     /// Update the orderbook panel's bucket choice. Triggers re-render +
     /// persistence save. Bucket changes collapse / expand row counts and
     /// shift the spread row's index, so the previous scroll offset is
@@ -1215,6 +1567,7 @@ impl ContentPanel {
         // allocated. Cheap no-op for non-VP kinds (the desired set is
         // unchanged).
         self.refresh_chart_footprint_sub(cx);
+            self.refresh_chart_liq_bars_sub(cx);
         cx.notify();
         request_layout_save(cx);
     }
@@ -1229,6 +1582,7 @@ impl ContentPanel {
         let live = live_snapshot(target, tf, cx);
         if state.switch_symbol(target, live) {
             self.refresh_chart_footprint_sub(cx);
+            self.refresh_chart_liq_bars_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1267,6 +1621,7 @@ impl ContentPanel {
                 }
             }
             self.refresh_chart_footprint_sub(cx);
+            self.refresh_chart_liq_bars_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1311,6 +1666,7 @@ impl ContentPanel {
             // drop+reopen; cosmetic-only edits (wireframe / metric / scope)
             // are no-ops at the sub layer but still need a repaint.
             self.refresh_chart_footprint_sub(cx);
+            self.refresh_chart_liq_bars_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1330,6 +1686,7 @@ impl ContentPanel {
             // (candle bodies) shows while the new sub's snapshot arrives.
             state.clear_footprint_cells();
             self.refresh_chart_footprint_sub(cx);
+            self.refresh_chart_liq_bars_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1455,6 +1812,54 @@ impl ContentPanel {
         }
     }
 
+    /// Reconcile the chart's liquidation-bars subscription against current
+    /// indicator state. Liq_bars has only one keying dimension (the chart's
+    /// `(symbol, tf)`), so this is a single-slot allocate / drop rather than
+    /// the multi-bucket diff that footprint subs do.
+    pub(crate) fn refresh_chart_liq_bars_sub(&mut self, cx: &mut Context<Self>) {
+        let want = self.chart_state.as_ref().and_then(|state| {
+            let any_live = state
+                .indicators()
+                .iter()
+                .any(|i| i.kind_id == "liq_bars");
+            any_live.then(|| (state.symbol().clone(), state.timeframe()))
+        });
+        let cur = self
+            .chart_liq_bars_sub
+            .as_ref()
+            .map(|(s, t, _)| (s.clone(), *t));
+        if want == cur {
+            return;
+        }
+        // Drop the old sub (if any) before allocating so refcounts settle —
+        // same intent as the footprint refresh path.
+        if cur.is_some() {
+            self.chart_liq_bars_sub = None;
+            if let Some(state) = self.chart_state.as_mut() {
+                state.clear_liquidation_bars_cache();
+                state.recompute_indicators();
+            }
+        }
+        if let Some((symbol, tf)) = want {
+            let market = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone();
+            let handle = market.clone().update(cx, |svc, cx| {
+                svc.ensure_liquidation_bars(symbol.as_ref(), tf, cx)
+            });
+            // Seed cache from whatever the service already has.
+            let seeded = market
+                .read(cx)
+                .liquidation_bars(symbol.as_ref(), tf);
+            if let Some(state) = self.chart_state.as_mut() {
+                state.set_liquidation_bars_cache(seeded);
+                state.recompute_indicators();
+            }
+            self.chart_liq_bars_sub = Some((symbol, tf, handle));
+        }
+    }
+
     /// For each live VRVP, request older footprint cells if the visible
     /// window extends past the oldest loaded cell for the instance's
     /// bucket. Throttled per-bucket via `vp_history_last_request_ms` to
@@ -1562,6 +1967,52 @@ impl ContentPanel {
         }
     }
 
+    /// Liquidation-bars history fill — fires `load_older_liquidation_bars`
+    /// when the visible view extends past the oldest loaded bar. Single
+    /// 200ms throttle (only one sub per chart). No-op when no `liq_bars`
+    /// instance is live on the chart or coverage already reaches the view.
+    fn maybe_request_liq_bars_history(&mut self, cx: &mut Context<Self>) {
+        let Some((symbol, tf)) = self
+            .chart_state
+            .as_ref()
+            .map(|s| (s.symbol().clone(), s.timeframe()))
+        else {
+            return;
+        };
+        if self.chart_liq_bars_sub.is_none() {
+            return;
+        }
+        let view_lo = match self.chart_state.as_ref().and_then(|s| s.view_time_range()) {
+            Some((lo, _)) => lo,
+            None => return,
+        };
+        // Oldest loaded bar in the cache; coverage already reaches view if
+        // it's <= view_lo. Cache is sorted ascending by open_time, so the
+        // first entry is the oldest.
+        if let Some(state) = self.chart_state.as_ref() {
+            if let Some(oldest) = state.oldest_liquidation_bar_time() {
+                if oldest <= view_lo {
+                    return;
+                }
+            }
+        }
+        const THROTTLE_MS: i64 = 200;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(last) = self.liq_bars_history_last_request_ms {
+            if now_ms - last < THROTTLE_MS {
+                return;
+            }
+        }
+        self.liq_bars_history_last_request_ms = Some(now_ms);
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        market.update(cx, |svc, cx| {
+            svc.load_older_liquidation_bars(symbol.as_ref(), tf, cx)
+        });
+    }
+
     pub fn chart_timeframe(&self) -> Option<crate::services::market_data::Timeframe> {
         self.chart_state.as_ref().map(|s| s.timeframe())
     }
@@ -1665,6 +2116,30 @@ impl ContentPanel {
         self.set_trades_size_mode(mode, cx);
     }
 
+    fn on_change_liquidations_size_mode(
+        &mut self,
+        action: &liquidations::ChangeLiquidationsSizeMode,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mode) = liquidations::LiquidationsSizeMode::from_id(action.0.as_ref()) else {
+            return;
+        };
+        self.set_liquidations_size_mode(mode, cx);
+    }
+
+    fn on_change_liquidations_side_filter(
+        &mut self,
+        action: &liquidations::ChangeLiquidationsSideFilter,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(filter) = liquidations::LiquidationsSideFilter::from_id(action.0.as_ref()) else {
+            return;
+        };
+        self.set_liquidations_side_filter(filter, cx);
+    }
+
     fn on_change_orderbook_size_mode(
         &mut self,
         action: &ChangeOrderbookSizeMode,
@@ -1760,6 +2235,7 @@ impl ContentPanel {
             // If the removed instance was VRVP, its bucket may have left
             // the desired set — refresh drops the sub + cache entry.
             self.refresh_chart_footprint_sub(cx);
+            self.refresh_chart_liq_bars_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1861,6 +2337,7 @@ impl Panel for ContentPanel {
             Kind::Chart => self.chart_state.as_ref().map(|s| s.symbol().clone())?,
             Kind::Trades => self.trades_symbol.clone()?,
             Kind::Orderbook => self.orderbook_state.as_ref().map(|s| s.symbol.clone())?,
+            Kind::Liquidations => self.liquidations_symbol.clone()?,
             _ => return None,
         };
         Some(
@@ -1929,6 +2406,21 @@ impl Panel for ContentPanel {
                 state.info = PanelInfo::panel(value);
             }
         }
+        if matches!(self.kind, Kind::Liquidations) {
+            if let Some(sym) = &self.liquidations_symbol {
+                let min_size = self.liquidations_min_size.unwrap_or(None);
+                let size_mode = self.liquidations_size_mode.unwrap_or_default();
+                let side_filter = self.liquidations_side_filter.unwrap_or_default();
+                if let Ok(value) = serde_json::to_value(LiquidationsPrefs {
+                    symbol: sym.to_string(),
+                    min_size,
+                    size_mode: Some(size_mode.id().to_string()),
+                    side_filter: Some(side_filter.id().to_string()),
+                }) {
+                    state.info = PanelInfo::panel(value);
+                }
+            }
+        }
         state
     }
 
@@ -1973,6 +2465,7 @@ impl Render for ContentPanel {
                     chart.maybe_recompute_view_dependent_indicators();
                 }
                 self.maybe_request_vp_history(cx);
+                self.maybe_request_liq_bars_history(cx);
                 chart::render(
                     self.chart_state
                         .as_ref()
@@ -2023,10 +2516,44 @@ impl Render for ContentPanel {
                 cx,
             )
             .into_any_element(),
+            Kind::Liquidations => {
+                let symbol = self
+                    .liquidations_symbol
+                    .clone()
+                    .expect("liquidations_symbol set for Liquidations");
+                let size_mode = self
+                    .liquidations_size_mode
+                    .expect("liquidations_size_mode set for Liquidations");
+                let side_filter = self
+                    .liquidations_side_filter
+                    .expect("liquidations_side_filter set for Liquidations");
+                let min_size = self.liquidations_min_size.unwrap_or(None);
+                let input = self
+                    .liquidations_filter_input
+                    .clone()
+                    .expect("liquidations_filter_input set for Liquidations");
+                let persist_vec: Vec<crate::services::market_data::Liquidation> = self
+                    .liquidations_persist
+                    .as_ref()
+                    .map(|p| p.iter().cloned().collect())
+                    .unwrap_or_default();
+                liquidations::render(
+                    symbol,
+                    &persist_vec,
+                    size_mode,
+                    side_filter,
+                    min_size,
+                    &input,
+                    self.focus_handle.clone(),
+                    window,
+                    cx,
+                )
+                .into_any_element()
+            }
         };
         let body = if matches!(
             self.kind,
-            Kind::Chart | Kind::Trades | Kind::Orderbook
+            Kind::Chart | Kind::Trades | Kind::Orderbook | Kind::Liquidations
         ) {
             raw_body
         } else {
@@ -2081,6 +2608,12 @@ impl Render for ContentPanel {
                     .key_context("Orderbook")
                     .on_action(cx.listener(Self::on_change_orderbook_size_mode))
                     .on_action(cx.listener(Self::on_change_orderbook_bucket))
+            })
+            .when(matches!(self.kind, Kind::Liquidations), |this| {
+                this.track_focus(&self.focus_handle)
+                    .key_context("Liquidations")
+                    .on_action(cx.listener(Self::on_change_liquidations_size_mode))
+                    .on_action(cx.listener(Self::on_change_liquidations_side_filter))
             })
             .size_full()
             .border_2()

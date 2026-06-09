@@ -42,7 +42,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::GatewayState;
-use crate::binance::parse::{DepthDiff, KlineRow, Tick, TradeTick};
+use crate::binance::parse::{DepthDiff, KlineRow, LiquidationTick, Tick, TradeTick};
 use crate::ingest::BookState;
 use crate::db;
 
@@ -55,8 +55,27 @@ const TRADE_SNAPSHOT_LIMIT: i64 = 500;
 /// Number of recent bars (×all their price buckets) in a footprint snapshot.
 const FOOTPRINT_SNAPSHOT_BARS: i64 = 100;
 
-/// Server-side batching window for live trade / book / footprint frames.
+/// Number of recent events sent in a liquidations-tape snapshot. Lower than
+/// the trade snapshot (500) because liquidations are 1000-10000× sparser:
+/// at typical BTCUSDT-perp rates, 200 events is a few hours to a day of
+/// history — plenty to fill a panel on first paint without a giant initial
+/// scan. Client paginates further back via `HistoryPage`.
+const LIQ_TAPE_SNAPSHOT_COUNT: i64 = 200;
+
+/// Number of recent bars in a liquidation-bars snapshot. Matches the
+/// footprint snapshot depth — both are per-tf bar aggregations driving
+/// indicator paint, so consistent visual fill on first sub.
+const LIQ_BARS_SNAPSHOT_BARS: i64 = FOOTPRINT_SNAPSHOT_BARS;
+
+/// Server-side batching window for live trade / book / footprint / liquidation
+/// frames.
 const LIVE_BATCH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Cap on rows returned per HistoryPage call across all channels. Liquidation
+/// HistoryPage requests reuse this; even at 7-day retention × the worst-case
+/// liq rate the entire backstop is ~10k events, so a few clamped pages walk
+/// back to the wall.
+const HISTORY_PAGE_CAP: u32 = 500;
 
 /// Cadence of full-state `BookSnapshot` resends on the Book channel. Bounds
 /// how long any client-side drift can persist: the depth diff filter can
@@ -82,6 +101,8 @@ enum SubChannel {
     Trades,
     Footprint { tf: Timeframe, price_bucket: f64 },
     Book,
+    Liquidations,
+    LiquidationBars { tf: Timeframe },
 }
 
 impl Drop for SubMeta {
@@ -256,6 +277,39 @@ async fn handle_text(
                     );
                     (SubChannel::Book, h)
                 }
+                Channel::Liquidations => {
+                    let rx = state.liquidation_tx.subscribe();
+                    let h = spawn_forwarder(
+                        id,
+                        write_tx.clone(),
+                        "liquidations forwarder",
+                        run_liquidations_subscription(
+                            id,
+                            symbol.clone(),
+                            rx,
+                            state.pool.clone(),
+                            write_tx.clone(),
+                        ),
+                    );
+                    (SubChannel::Liquidations, h)
+                }
+                Channel::LiquidationBars { tf } => {
+                    let rx = state.liquidation_tx.subscribe();
+                    let h = spawn_forwarder(
+                        id,
+                        write_tx.clone(),
+                        "liquidation_bars forwarder",
+                        run_liquidation_bars_subscription(
+                            id,
+                            symbol.clone(),
+                            tf,
+                            rx,
+                            state.pool.clone(),
+                            write_tx.clone(),
+                        ),
+                    );
+                    (SubChannel::LiquidationBars { tf }, h)
+                }
             };
 
             subs.insert(
@@ -378,6 +432,27 @@ async fn history_page(
         SubChannel::Book => {
             let snapshots = db::fetch_book_history_page(&pool, &symbol, before_ms, count).await?;
             send_frame(write_tx, &ServerFrame::BookHistoryPage { id, snapshots }).await;
+        }
+        SubChannel::Liquidations => {
+            let capped = count.min(HISTORY_PAGE_CAP as i64);
+            let liquidations =
+                db::fetch_liquidations_history_page(&pool, &symbol, before_ms, capped).await?;
+            send_frame(
+                write_tx,
+                &ServerFrame::LiquidationHistoryPage { id, liquidations },
+            )
+            .await;
+        }
+        SubChannel::LiquidationBars { tf } => {
+            let capped = count.min(HISTORY_PAGE_CAP as i64);
+            let bars =
+                db::fetch_liquidation_bars_history_page(&pool, &symbol, tf, before_ms, capped)
+                    .await?;
+            send_frame(
+                write_tx,
+                &ServerFrame::LiquidationBarHistoryPage { id, bars },
+            )
+            .await;
         }
     }
     Ok(())
@@ -905,6 +980,257 @@ async fn emit_touched(
         v: *server_v,
     };
     let _ = write_tx.send(message_from_frame(&frame)).await;
+}
+
+// --- Liquidations forwarder ------------------------------------------------
+
+/// Liquidations-tape forwarder. Snapshot is the most recent
+/// `LIQ_TAPE_SNAPSHOT_COUNT` events from the DB; live events flow off the
+/// liquidation broadcast and are batched on the wire in
+/// `LIVE_BATCH_INTERVAL` windows.
+///
+/// Snapshot/live merge correctness: liquidations have no monotonic upstream
+/// ID (Binance ships no `agg_id`-equivalent). Dedup uses the snapshot tail's
+/// `ts_ms` as a watermark — any live event with `ts_ms <= snapshot_max_ts`
+/// was either already persisted (∴ in the snapshot) or is a Binance
+/// redelivery the DB upsert silently swallowed. Binance's 1/sec throttle
+/// makes ms-level boundary ties essentially impossible.
+async fn run_liquidations_subscription(
+    id: SubId,
+    symbol: String,
+    mut rx: broadcast::Receiver<LiquidationTick>,
+    pool: PgPool,
+    write_tx: mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    let snapshot =
+        db::fetch_liquidations_snapshot(&pool, &symbol, LIQ_TAPE_SNAPSHOT_COUNT).await?;
+    let dedupe_threshold_ms = snapshot.last().map(|l| l.ts_ms);
+
+    debug!(
+        ?id,
+        events = snapshot.len(),
+        "sending liquidations snapshot"
+    );
+    let mut server_v: u64 = 0;
+    send_frame(
+        &write_tx,
+        &ServerFrame::LiquidationSnapshot {
+            id,
+            liquidations: snapshot,
+            server_v,
+        },
+    )
+    .await;
+
+    let mut buffer: Vec<protocol::Liquidation> = Vec::with_capacity(16);
+    let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
+    batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    batch_timer.tick().await;
+
+    loop {
+        // Liquidations are cool enough (≤1/sec) that biased select wouldn't
+        // starve the timer, but symmetric handling with trades keeps the
+        // reasoning simple.
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        if tick.symbol != symbol {
+                            continue;
+                        }
+                        let ts_ms = tick.liq.ts.timestamp_millis();
+                        if let Some(thr) = dedupe_threshold_ms {
+                            if ts_ms <= thr {
+                                continue;
+                            }
+                        }
+                        buffer.push(protocol::Liquidation {
+                            ts_ms,
+                            side: tick.liq.side.as_proto(),
+                            price: tick.liq.price,
+                            qty: tick.liq.qty,
+                            quote_qty: tick.liq.quote_qty,
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(?id, skipped = n, "liquidations sub lagged; sending resnap");
+                        send_frame(&write_tx, &ServerFrame::Resnap { id }).await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!(?id, "liquidation broadcast closed; sub exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            _ = batch_timer.tick() => {
+                if buffer.is_empty() {
+                    continue;
+                }
+                server_v += 1;
+                let liquidations = std::mem::take(&mut buffer);
+                let frame = ServerFrame::LiquidationTick {
+                    id,
+                    liquidations,
+                    v: server_v,
+                };
+                if write_tx.send(message_from_frame(&frame)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+// --- Liquidation bars forwarder --------------------------------------------
+
+/// Liquidation-bars forwarder. Snapshot bucketed via SQL `time_bucket` over
+/// the `liquidations` hypertable. Live updates: per-bar cumulative state
+/// seeded from snapshot tail, fold in broadcast events whose `ts_ms` is
+/// strictly newer than `snapshot_max_ts`, emit a `LiquidationBarUpdate`
+/// every `LIVE_BATCH_INTERVAL` for any touched bar.
+///
+/// Bar rollover: when an event lands in a bucket beyond the current open
+/// bar, the prior bar's totals are NOT cleared — the cumulative is sticky
+/// (matches footprint semantics; the client overwrites by `open_time` and
+/// snapshots already contain the closed bar's true total). Old keys are
+/// dropped on bar rollover to bound memory.
+async fn run_liquidation_bars_subscription(
+    id: SubId,
+    symbol: String,
+    tf: Timeframe,
+    mut rx: broadcast::Receiver<LiquidationTick>,
+    pool: PgPool,
+    write_tx: mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    let snapshot =
+        db::fetch_liquidation_bars_snapshot(&pool, &symbol, tf, LIQ_BARS_SNAPSHOT_BARS).await?;
+    let snapshot_tail_open_time = snapshot.iter().map(|b| b.open_time).max();
+    // Watermark = newest ts in any liquidation row covered by the snapshot.
+    // Approximated by the snapshot tail bar's open_time + tf.duration_ms()
+    // (i.e. the snapshot covered up to the end of that bar). Live events
+    // strictly newer than that are net-new.
+    let snapshot_max_ts_ms = snapshot_tail_open_time.map(|t| t + tf.duration_ms() - 1);
+    let bar_ms = tf.duration_ms();
+
+    // Per-bar cumulative state. Seed the snapshot tail bar's totals so the
+    // first live event in that bar accumulates on top of the (already-counted)
+    // DB rows instead of resetting toward zero.
+    let mut bar_totals: HashMap<i64, protocol::LiquidationBar> = HashMap::new();
+    if let Some(tail) = snapshot_tail_open_time {
+        if let Some(tail_bar) = snapshot.iter().find(|b| b.open_time == tail) {
+            bar_totals.insert(tail, tail_bar.clone());
+        }
+    }
+
+    debug!(
+        ?id,
+        tf = tf.as_str(),
+        bars = snapshot.len(),
+        snapshot_max_ts_ms,
+        "sending liquidation bars snapshot"
+    );
+    let mut server_v: u64 = 0;
+    send_frame(
+        &write_tx,
+        &ServerFrame::LiquidationBarSnapshot {
+            id,
+            bars: snapshot,
+            server_v,
+        },
+    )
+    .await;
+
+    let mut touched: HashSet<i64> = HashSet::new();
+    let mut current_bar_open: Option<i64> = snapshot_tail_open_time;
+    let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
+    batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    batch_timer.tick().await;
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        if tick.symbol != symbol {
+                            continue;
+                        }
+                        let ts_ms = tick.liq.ts.timestamp_millis();
+                        if let Some(thr) = snapshot_max_ts_ms {
+                            if ts_ms <= thr {
+                                continue;
+                            }
+                        }
+                        // Floor-div to bar open_time. Negative ts is not a
+                        // concern in our domain (Binance ms timestamps are
+                        // always positive), so plain integer-div is correct.
+                        let bar_open = (ts_ms / bar_ms) * bar_ms;
+                        if let Some(prev) = current_bar_open {
+                            if bar_open > prev {
+                                // Bar rolled over — drop totals older than
+                                // the prior bar to bound memory. Keep prev
+                                // bar's totals for the in-flight emit (its
+                                // final cumulative may still be in `touched`).
+                                bar_totals.retain(|k, _| *k >= prev);
+                            }
+                        }
+                        current_bar_open = Some(bar_open);
+
+                        let cell = bar_totals.entry(bar_open).or_insert_with(|| {
+                            protocol::LiquidationBar {
+                                open_time: bar_open,
+                                long_qty: 0.0,
+                                long_quote_qty: 0.0,
+                                short_qty: 0.0,
+                                short_quote_qty: 0.0,
+                            }
+                        });
+                        match tick.liq.side {
+                            crate::binance::parse::LiquidatedSide::Long => {
+                                cell.long_qty += tick.liq.qty;
+                                cell.long_quote_qty += tick.liq.quote_qty;
+                            }
+                            crate::binance::parse::LiquidatedSide::Short => {
+                                cell.short_qty += tick.liq.qty;
+                                cell.short_quote_qty += tick.liq.quote_qty;
+                            }
+                        }
+                        touched.insert(bar_open);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(?id, skipped = n, "liquidation bars sub lagged; sending resnap");
+                        send_frame(&write_tx, &ServerFrame::Resnap { id }).await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!(?id, "liquidation broadcast closed; bars sub exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            _ = batch_timer.tick() => {
+                if touched.is_empty() {
+                    continue;
+                }
+                let bars: Vec<protocol::LiquidationBar> = touched
+                    .drain()
+                    .filter_map(|k| bar_totals.get(&k).cloned())
+                    .collect();
+                if bars.is_empty() {
+                    continue;
+                }
+                server_v += 1;
+                let frame = ServerFrame::LiquidationBarUpdate {
+                    id,
+                    bars,
+                    v: server_v,
+                };
+                if write_tx.send(message_from_frame(&frame)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 // --- Wire converters / IO helpers ------------------------------------------

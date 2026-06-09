@@ -56,6 +56,10 @@ async fn main() -> Result<()> {
         broadcast::channel::<binance::parse::TradeTick>(ingest::TRADE_BROADCAST_CAPACITY);
     let (depth_tx, _depth_bootstrap_rx) =
         broadcast::channel::<binance::parse::DepthDiff>(ingest::DEPTH_BROADCAST_CAPACITY);
+    let (liquidation_tx, _liquidation_bootstrap_rx) =
+        broadcast::channel::<binance::parse::LiquidationTick>(
+            ingest::LIQUIDATION_BROADCAST_CAPACITY,
+        );
 
     // Shared live book state. Maintainer writes; gateway readers borrow
     // briefly to populate initial BookSnapshot frames.
@@ -79,6 +83,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = ingest::run_trade_writer(pool, rx).await {
                 warn!(error = ?e, "trade writer task exited with error");
+            }
+        })
+    };
+    let liquidation_writer = {
+        let rx = liquidation_tx.subscribe();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ingest::run_liquidation_writer(pool, rx).await {
+                warn!(error = ?e, "liquidation writer task exited with error");
             }
         })
     };
@@ -112,6 +125,7 @@ async fn main() -> Result<()> {
             kline: kline_tx.clone(),
             trade: trade_tx.clone(),
             depth: depth_tx.clone(),
+            liquidation: liquidation_tx.clone(),
         };
         let book_state = book_state.clone();
         tokio::spawn(async move {
@@ -134,6 +148,7 @@ async fn main() -> Result<()> {
     drop(_kline_bootstrap_rx);
     drop(_trade_bootstrap_rx);
     drop(_depth_bootstrap_rx);
+    drop(_liquidation_bootstrap_rx);
 
     let ingest_handle = {
         let pool = pool.clone();
@@ -142,6 +157,7 @@ async fn main() -> Result<()> {
             kline: kline_tx.clone(),
             trade: trade_tx.clone(),
             depth: depth_tx.clone(),
+            liquidation: liquidation_tx.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = ingest::run_binance_ingest(
@@ -168,6 +184,7 @@ async fn main() -> Result<()> {
         broadcast_tx: kline_tx.clone(),
         trade_tx: trade_tx.clone(),
         depth_tx: depth_tx.clone(),
+        liquidation_tx: liquidation_tx.clone(),
         book_state: book_state.clone(),
     };
     let gateway_handle = tokio::spawn(async move {
@@ -186,6 +203,7 @@ async fn main() -> Result<()> {
     ingest_handle.abort();
     book_maintainer.abort();
     subsec_aggregator.abort();
+    liquidation_writer.abort();
     trade_writer.abort();
     kline_writer.abort();
     Ok(())

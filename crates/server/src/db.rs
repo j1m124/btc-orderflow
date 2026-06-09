@@ -230,6 +230,211 @@ fn build_trades(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Trade>> {
         .collect()
 }
 
+// --- liquidations -----------------------------------------------------------
+
+/// Read the most recent `limit` liquidations for `symbol`, chronological
+/// (oldest first). Used by the liquidations-channel forwarder for the
+/// initial snapshot.
+pub async fn fetch_liquidations_snapshot(
+    pool: &PgPool,
+    symbol: &str,
+    limit: i64,
+) -> Result<Vec<protocol::Liquidation>> {
+    let rows = sqlx::query(
+        "SELECT ts, side, price, qty, quote_qty \
+         FROM liquidations \
+         WHERE symbol = $1 \
+         ORDER BY ts DESC, price DESC, qty DESC \
+         LIMIT $2",
+    )
+    .bind(symbol)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut liqs = build_liquidations(rows)?;
+    liqs.reverse();
+    Ok(liqs)
+}
+
+/// Read up to `count` liquidations strictly older than `before_ms`,
+/// chronological (oldest first).
+pub async fn fetch_liquidations_history_page(
+    pool: &PgPool,
+    symbol: &str,
+    before_ms: i64,
+    count: i64,
+) -> Result<Vec<protocol::Liquidation>> {
+    let before = Utc
+        .timestamp_millis_opt(before_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
+    let rows = sqlx::query(
+        "SELECT ts, side, price, qty, quote_qty \
+         FROM liquidations \
+         WHERE symbol = $1 AND ts < $2 \
+         ORDER BY ts DESC, price DESC, qty DESC \
+         LIMIT $3",
+    )
+    .bind(symbol)
+    .bind(before)
+    .bind(count)
+    .fetch_all(pool)
+    .await?;
+
+    let mut liqs = build_liquidations(rows)?;
+    liqs.reverse();
+    Ok(liqs)
+}
+
+fn build_liquidations(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<protocol::Liquidation>> {
+    rows.into_iter()
+        .map(|r| -> Result<protocol::Liquidation> {
+            let ts: DateTime<Utc> = r.try_get("ts")?;
+            let side_str: String = r.try_get("side")?;
+            let side = match side_str.as_str() {
+                "long" => protocol::LiquidationSide::Long,
+                "short" => protocol::LiquidationSide::Short,
+                other => return Err(anyhow::anyhow!("unknown liquidation side {other:?} in DB")),
+            };
+            Ok(protocol::Liquidation {
+                ts_ms: ts.timestamp_millis(),
+                side,
+                price: r.try_get("price")?,
+                qty: r.try_get("qty")?,
+                quote_qty: r.try_get("quote_qty")?,
+            })
+        })
+        .collect()
+}
+
+/// Per-bar liquidation aggregation for the most recent `bars` bars at the
+/// given `tf`. Returns chronological (oldest first). Every bar in the
+/// covered range emits a row even if its long/short totals are zero — the
+/// client distinguishes "no data" (missing row) from "data, none" (zero row).
+pub async fn fetch_liquidation_bars_snapshot(
+    pool: &PgPool,
+    symbol: &str,
+    tf: Timeframe,
+    bars: i64,
+) -> Result<Vec<protocol::LiquidationBar>> {
+    let interval = liquidation_bucket_interval(tf);
+
+    let sql = format!(
+        "WITH range_bars AS ( \
+            SELECT DISTINCT time_bucket(INTERVAL '{interval}', ts) AS bar \
+            FROM liquidations \
+            WHERE symbol = $1 \
+            ORDER BY bar DESC \
+            LIMIT $2 \
+         ) \
+         SELECT rb.bar AS open_time, \
+            COALESCE(SUM(CASE WHEN l.side = 'long'  THEN l.qty       END), 0) AS long_qty, \
+            COALESCE(SUM(CASE WHEN l.side = 'long'  THEN l.quote_qty END), 0) AS long_quote_qty, \
+            COALESCE(SUM(CASE WHEN l.side = 'short' THEN l.qty       END), 0) AS short_qty, \
+            COALESCE(SUM(CASE WHEN l.side = 'short' THEN l.quote_qty END), 0) AS short_quote_qty \
+         FROM range_bars rb \
+         LEFT JOIN liquidations l \
+            ON time_bucket(INTERVAL '{interval}', l.ts) = rb.bar \
+            AND l.symbol = $1 \
+         GROUP BY rb.bar \
+         ORDER BY rb.bar"
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(bars)
+        .fetch_all(pool)
+        .await?;
+
+    build_liquidation_bars(rows)
+}
+
+/// Per-bar liquidation aggregation for up to `bars` bars older than
+/// `before_ms`. Same row-shape rules as the snapshot.
+pub async fn fetch_liquidation_bars_history_page(
+    pool: &PgPool,
+    symbol: &str,
+    tf: Timeframe,
+    before_ms: i64,
+    bars: i64,
+) -> Result<Vec<protocol::LiquidationBar>> {
+    let interval = liquidation_bucket_interval(tf);
+    let before = Utc
+        .timestamp_millis_opt(before_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
+    let sql = format!(
+        "WITH range_bars AS ( \
+            SELECT DISTINCT time_bucket(INTERVAL '{interval}', ts) AS bar \
+            FROM liquidations \
+            WHERE symbol = $1 \
+              AND time_bucket(INTERVAL '{interval}', ts) < $2 \
+            ORDER BY bar DESC \
+            LIMIT $3 \
+         ) \
+         SELECT rb.bar AS open_time, \
+            COALESCE(SUM(CASE WHEN l.side = 'long'  THEN l.qty       END), 0) AS long_qty, \
+            COALESCE(SUM(CASE WHEN l.side = 'long'  THEN l.quote_qty END), 0) AS long_quote_qty, \
+            COALESCE(SUM(CASE WHEN l.side = 'short' THEN l.qty       END), 0) AS short_qty, \
+            COALESCE(SUM(CASE WHEN l.side = 'short' THEN l.quote_qty END), 0) AS short_quote_qty \
+         FROM range_bars rb \
+         LEFT JOIN liquidations l \
+            ON time_bucket(INTERVAL '{interval}', l.ts) = rb.bar \
+            AND l.symbol = $1 \
+         GROUP BY rb.bar \
+         ORDER BY rb.bar"
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(before)
+        .bind(bars)
+        .fetch_all(pool)
+        .await?;
+
+    build_liquidation_bars(rows)
+}
+
+fn build_liquidation_bars(
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> Result<Vec<protocol::LiquidationBar>> {
+    rows.into_iter()
+        .map(|r| -> Result<protocol::LiquidationBar> {
+            let bar: DateTime<Utc> = r.try_get("open_time")?;
+            Ok(protocol::LiquidationBar {
+                open_time: bar.timestamp_millis(),
+                long_qty: r.try_get("long_qty")?,
+                long_quote_qty: r.try_get("long_quote_qty")?,
+                short_qty: r.try_get("short_qty")?,
+                short_quote_qty: r.try_get("short_quote_qty")?,
+            })
+        })
+        .collect()
+}
+
+/// `time_bucket` interval literal for liquidation-bar aggregation.
+/// Liquidation bars cover the same TFs the chart supports; S1/S5 derive
+/// from the raw liquidations table (no separate ingest, just finer-grained
+/// `time_bucket` windows).
+fn liquidation_bucket_interval(tf: Timeframe) -> &'static str {
+    match tf {
+        Timeframe::S1 => "1 second",
+        Timeframe::S5 => "5 seconds",
+        Timeframe::M1 => "1 minute",
+        Timeframe::M5 => "5 minutes",
+        Timeframe::M15 => "15 minutes",
+        Timeframe::M30 => "30 minutes",
+        Timeframe::H1 => "1 hour",
+        Timeframe::H2 => "2 hours",
+        Timeframe::H4 => "4 hours",
+        Timeframe::H6 => "6 hours",
+        Timeframe::D1 => "1 day",
+    }
+}
+
 // --- footprint (computed on read from `trades`) ----------------------------
 
 /// Pick the time_bucket interval literal for any TF (sub-second OR native).
@@ -489,6 +694,39 @@ pub async fn upsert_trades(pool: &PgPool, symbol: &str, rows: &[TradeRow]) -> Re
     });
 
     qb.push(" ON CONFLICT (symbol, ts, agg_id) DO NOTHING");
+    qb.build().execute(pool).await?;
+    Ok(())
+}
+
+/// Bulk-UPSERT a window of liquidation rows. PK is `(symbol, ts, price,
+/// qty)`; `ON CONFLICT DO NOTHING` absorbs redelivery on reconnect.
+///
+/// 6 params/row × 10900 ≈ row cap before the 65535 Postgres-parameter
+/// ceiling matters. Liquidations are sparse (≤1/sec/symbol upstream), so
+/// per-flush batches are tiny — the cap is purely defensive.
+pub async fn upsert_liquidations(
+    pool: &PgPool,
+    symbol: &str,
+    rows: &[crate::binance::parse::LiquidationRow],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "INSERT INTO liquidations (symbol, ts, price, qty, quote_qty, side) ",
+    );
+
+    qb.push_values(rows.iter(), |mut b, row| {
+        b.push_bind(symbol)
+            .push_bind(row.ts)
+            .push_bind(row.price)
+            .push_bind(row.qty)
+            .push_bind(row.quote_qty)
+            .push_bind(row.side.as_db_str());
+    });
+
+    qb.push(" ON CONFLICT (symbol, ts, price, qty) DO NOTHING");
     qb.build().execute(pool).await?;
     Ok(())
 }

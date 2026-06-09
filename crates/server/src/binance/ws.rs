@@ -26,9 +26,14 @@ use super::{
 /// per family and fan into the shared `BroadcastTxs`.
 ///
 /// Build the combined-stream URL for the market endpoint:
-/// `(symbol × native-kline TFs) ∪ aggTrade`. S1/S5 are excluded — Binance
-/// USD-M futures doesn't publish `kline_1s` / `kline_5s`, so those bars are
-/// synthesized from the aggTrade stream by the sub-second aggregator.
+/// `(symbol × native-kline TFs) ∪ aggTrade ∪ forceOrder`. S1/S5 are excluded
+/// — Binance USD-M futures doesn't publish `kline_1s` / `kline_5s`, so those
+/// bars are synthesized from the aggTrade stream by the sub-second aggregator.
+///
+/// `@forceOrder` is throttled by Binance to ≤1 message/sec per symbol — the
+/// stream silently drops every liquidation but the latest in each 1-second
+/// window. No REST endpoint exists to back-fill what we miss; this is an
+/// upstream property we accept.
 pub fn market_combined_url(symbol: &str) -> String {
     let s = symbol.to_lowercase();
     let mut streams: Vec<String> = Timeframe::ALL
@@ -37,6 +42,7 @@ pub fn market_combined_url(symbol: &str) -> String {
         .map(|tf| format!("{s}@kline_{}", tf.as_str()))
         .collect();
     streams.push(format!("{s}@aggTrade"));
+    streams.push(format!("{s}@forceOrder"));
     format!("{}/market/stream?streams={}", WS_BASE, streams.join("/"))
 }
 
@@ -142,6 +148,16 @@ fn handle_text(txt: &str, txs: &BroadcastTxs) -> Result<()> {
                 "depth diff"
             );
             let _ = txs.depth.send(diff);
+        }
+        InboundEvent::Liquidation(tick) => {
+            debug!(
+                symbol = %tick.symbol,
+                side = ?tick.liq.side,
+                price = tick.liq.price,
+                qty = tick.liq.qty,
+                "liquidation"
+            );
+            let _ = txs.liquidation.send(tick);
         }
     }
     Ok(())

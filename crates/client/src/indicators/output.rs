@@ -80,6 +80,25 @@ pub enum IndicatorOutput {
         output: crate::volume_profile::VolumeProfileOutput,
         params: crate::volume_profile::VolumeProfileParams,
     },
+
+    /// Per-bar liquidation cells aligned to candle index. `long_qty[i]`
+    /// (and friends) are `None` for bars where no liquidations occurred —
+    /// distinct from `Some(0.0)` for bars that *did* exist but had zero
+    /// liquidations (rare; only happens at the snapshot/history boundary
+    /// where the server's `LEFT JOIN range_bars` emits zero rows). Paint
+    /// reads `params.scale` + the chart's `VolumeUnit` (via `ComputeCtx`)
+    /// to decide axis units and y-fit.
+    LiquidationBars {
+        long_qty: Series,
+        long_quote_qty: Series,
+        short_qty: Series,
+        short_quote_qty: Series,
+        params: crate::indicators::LiquidationBarsParams,
+        /// Whether the underlying source is in coin or USD — sampled from
+        /// `ComputeCtx.volume_unit` at compute time so paint doesn't need
+        /// the ctx threaded through it.
+        unit: crate::persistence::VolumeUnit,
+    },
 }
 
 impl IndicatorOutput {
@@ -95,6 +114,7 @@ impl IndicatorOutput {
             // sensible bar-count to report. Callers that special-case VP
             // (e.g., the VP paint arm) don't go through `len()`.
             IndicatorOutput::VolumeProfile { .. } => 0,
+            IndicatorOutput::LiquidationBars { long_qty, .. } => long_qty.len(),
         }
     }
 

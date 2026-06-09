@@ -764,6 +764,12 @@ pub struct ChartState {
         u64,
         Vec<crate::services::market_data::FootprintCell>,
     >,
+    /// Per-bar liquidation cells for this chart's `(symbol, tf)`, sorted
+    /// oldest-first. Refilled by ContentPanel from `MarketDataService::
+    /// liquidation_bars` on every `LiquidationBarEvent` for the active tf.
+    /// Empty when no `liq_bars` indicator is live — the sub stays
+    /// unallocated and the cache never grows.
+    liquidation_bars_cache: Vec<crate::services::market_data::LiquidationBar>,
     /// View-time-range snapshot captured at the last
     /// [`Self::recompute_indicators`] call. Drives the cheap dirty-check in
     /// [`Self::maybe_recompute_view_dependent_indicators`] — pan/zoom that
@@ -994,6 +1000,7 @@ impl ChartState {
             Vec<crate::services::market_data::FootprintCell>,
         >,
         view_time_range: Option<(i64, i64)>,
+        liquidation_bars: Option<&'a [crate::services::market_data::LiquidationBar]>,
     ) -> ComputeCtx<'a> {
         ComputeCtx {
             volume_unit,
@@ -1001,6 +1008,7 @@ impl ChartState {
                 footprint_cache,
             )),
             view_time_range,
+            liquidation_bars,
         }
     }
 
@@ -1059,6 +1067,27 @@ impl ChartState {
     /// is stale at that point.
     pub fn clear_footprint_cache(&mut self) {
         self.footprint_cache.clear();
+    }
+
+    /// Replace the per-bar liquidation cache wholesale. Caller passes a
+    /// vector already sorted ascending by `open_time`. Called whenever the
+    /// service emits a `LiquidationBarEvent` for the chart's `(symbol, tf)`.
+    pub fn set_liquidation_bars_cache(
+        &mut self,
+        bars: Vec<crate::services::market_data::LiquidationBar>,
+    ) {
+        self.liquidation_bars_cache = bars;
+    }
+
+    pub fn clear_liquidation_bars_cache(&mut self) {
+        self.liquidation_bars_cache.clear();
+    }
+
+    /// Oldest `open_time` (ms) in the liquidation-bars cache, if any. Used
+    /// by `ContentPanel::maybe_request_liq_bars_history` to decide whether
+    /// the visible view extends past loaded coverage.
+    pub fn oldest_liquidation_bar_time(&self) -> Option<i64> {
+        self.liquidation_bars_cache.first().map(|b| b.open_time)
     }
 
     /// Read-only slice into the per-bucket footprint cache. `None` when no
@@ -1282,7 +1311,15 @@ impl ChartState {
         let instance = IndicatorInstance::new(kind, color);
         let id = instance.id;
         let view_range = self.view_time_range();
-        let ctx = Self::make_compute_ctx(self.volume_unit, &self.footprint_cache, view_range);
+        let liq_bars: Option<&[crate::services::market_data::LiquidationBar]> =
+            (!self.liquidation_bars_cache.is_empty())
+                .then(|| self.liquidation_bars_cache.as_slice());
+        let ctx = Self::make_compute_ctx(
+            self.volume_unit,
+            &self.footprint_cache,
+            view_range,
+            liq_bars,
+        );
         let output = instance.kind.compute(&self.candles, ctx);
         self.indicators.push(instance);
         self.indicator_outputs.push(output);
@@ -1326,7 +1363,15 @@ impl ChartState {
         // see a consistent shape.
         self.indicators[idx].sync_colors();
         let view_range = self.view_time_range();
-        let ctx = Self::make_compute_ctx(self.volume_unit, &self.footprint_cache, view_range);
+        let liq_bars: Option<&[crate::services::market_data::LiquidationBar]> =
+            (!self.liquidation_bars_cache.is_empty())
+                .then(|| self.liquidation_bars_cache.as_slice());
+        let ctx = Self::make_compute_ctx(
+            self.volume_unit,
+            &self.footprint_cache,
+            view_range,
+            liq_bars,
+        );
         let new_output = self.indicators[idx].kind.compute(&self.candles, ctx);
         self.indicator_outputs[idx] = new_output;
         true
@@ -1341,7 +1386,15 @@ impl ChartState {
             return false;
         };
         let view_range = self.view_time_range();
-        let ctx = Self::make_compute_ctx(self.volume_unit, &self.footprint_cache, view_range);
+        let liq_bars: Option<&[crate::services::market_data::LiquidationBar]> =
+            (!self.liquidation_bars_cache.is_empty())
+                .then(|| self.liquidation_bars_cache.as_slice());
+        let ctx = Self::make_compute_ctx(
+            self.volume_unit,
+            &self.footprint_cache,
+            view_range,
+            liq_bars,
+        );
         let inst = &mut self.indicators[idx];
         inst.kind_id = kind.kind_id();
         inst.kind = kind;
@@ -1502,7 +1555,15 @@ impl ChartState {
                 .resize_with(self.indicators.len(), || IndicatorOutput::Line(Vec::new()));
         }
         let view_range = self.view_time_range();
-        let ctx = Self::make_compute_ctx(self.volume_unit, &self.footprint_cache, view_range);
+        let liq_bars: Option<&[crate::services::market_data::LiquidationBar]> =
+            (!self.liquidation_bars_cache.is_empty())
+                .then(|| self.liquidation_bars_cache.as_slice());
+        let ctx = Self::make_compute_ctx(
+            self.volume_unit,
+            &self.footprint_cache,
+            view_range,
+            liq_bars,
+        );
         for (i, inst) in self.indicators.iter().enumerate() {
             self.indicator_outputs[i] = inst.kind.compute(&self.candles, ctx);
         }
@@ -1601,6 +1662,7 @@ impl ChartState {
             profile_params: FootprintParams::profile_default(),
             footprint_cells: Vec::new(),
             footprint_cache: std::collections::HashMap::new(),
+            liquidation_bars_cache: Vec::new(),
             last_recomputed_view_range: None,
             volume_unit: VolumeUnit::default(),
         };

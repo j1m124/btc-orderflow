@@ -95,6 +95,63 @@ pub enum InboundEvent {
     Kline(Tick),
     AggTrade(TradeTick),
     Depth(DepthDiff),
+    Liquidation(LiquidationTick),
+}
+
+// --- Liquidation event ------------------------------------------------------
+
+/// Side of the *liquidated position* — decoded from Binance's raw forced-
+/// order side at the ingest boundary. Binance ships `S = "SELL"` for a
+/// long-pos liq (forced to sell to close) and `S = "BUY"` for a short-pos
+/// liq (forced to buy to close). Doing the flip here once means every
+/// downstream consumer reads "the position that died", not "the order side
+/// that the engine submitted on its behalf".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiquidatedSide {
+    Long,
+    Short,
+}
+
+impl LiquidatedSide {
+    /// Database column literal for the `side` column.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            LiquidatedSide::Long => "long",
+            LiquidatedSide::Short => "short",
+        }
+    }
+
+    /// Wire-form for the protocol crate.
+    pub fn as_proto(self) -> protocol::LiquidationSide {
+        match self {
+            LiquidatedSide::Long => protocol::LiquidationSide::Long,
+            LiquidatedSide::Short => protocol::LiquidationSide::Short,
+        }
+    }
+}
+
+/// One decoded liquidation row, with the side already flipped from
+/// Binance's raw order side to the *liquidated position* side. `price` is
+/// the average fill price (Binance `ap`); `qty` is the filled accumulated
+/// qty (Binance `z`). `quote_qty = price * qty` is precomputed here so the
+/// DB writer ships a complete row and the bar-stat queries can `SUM(quote)`
+/// directly.
+#[derive(Clone, Debug)]
+pub struct LiquidationRow {
+    pub ts: DateTime<Utc>,
+    pub side: LiquidatedSide,
+    pub price: f64,
+    pub qty: f64,
+    pub quote_qty: f64,
+}
+
+/// A liquidation event traveling on the internal broadcast. Mirrors
+/// [`TradeTick`] in shape — the DB writer + per-client forwarder subscribe
+/// to this, never to the raw Binance payload.
+#[derive(Clone, Debug)]
+pub struct LiquidationTick {
+    pub symbol: String,
+    pub liq: LiquidationRow,
 }
 
 // --- Depth diff event -------------------------------------------------------
@@ -262,6 +319,37 @@ struct AggTradeEventRaw {
     is_buyer_maker: bool,
 }
 
+/// `data` shape for `forceOrder` WS events. The Binance schema nests the
+/// liquidation detail inside an `o` object using single-letter field names.
+/// Only the fields we persist are decoded — order type, time-in-force,
+/// status, original qty, etc. are dropped.
+#[derive(Debug, Deserialize)]
+struct ForceOrderEventRaw {
+    #[serde(rename = "e")]
+    event: String,
+    #[serde(rename = "o")]
+    o: ForceOrderInner,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForceOrderInner {
+    #[serde(rename = "s")]
+    symbol: String,
+    /// Raw forced-order side from Binance: "SELL" (long-pos liq) or "BUY"
+    /// (short-pos liq). Flipped to [`LiquidatedSide`] at parse time.
+    #[serde(rename = "S")]
+    side: String,
+    /// Average fill price as a decimal string.
+    #[serde(rename = "ap")]
+    avg_price: String,
+    /// Filled accumulated qty as a decimal string (Binance `z`).
+    #[serde(rename = "z")]
+    filled_qty: String,
+    /// Order trade time in ms (Binance `T`).
+    #[serde(rename = "T")]
+    ts_ms: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct KlineInner {
     #[serde(rename = "t")]
@@ -316,8 +404,42 @@ impl CombinedStreamMsg {
             "kline" => Ok(self.parse_kline_event()?.map(InboundEvent::Kline)),
             "aggTrade" => Ok(self.parse_agg_trade_event()?.map(InboundEvent::AggTrade)),
             "depthUpdate" => Ok(self.parse_depth_event()?.map(InboundEvent::Depth)),
+            "forceOrder" => Ok(self.parse_force_order_event()?.map(InboundEvent::Liquidation)),
             _ => Ok(None),
         }
+    }
+
+    fn parse_force_order_event(&self) -> Result<Option<LiquidationTick>> {
+        let raw: ForceOrderEventRaw =
+            serde_json::from_value(self.data.clone()).context("decode forceOrder payload")?;
+        if raw.event != "forceOrder" {
+            return Ok(None);
+        }
+        let o = raw.o;
+        // Side-flip happens HERE — once, at the ingest boundary. Downstream
+        // never sees the raw Binance order side. "SELL" = a long pos was
+        // forced to sell to close → long-pos liq.
+        let side = match o.side.as_str() {
+            "SELL" => LiquidatedSide::Long,
+            "BUY" => LiquidatedSide::Short,
+            other => {
+                return Err(anyhow!(
+                    "unknown forceOrder side {other:?} (expected SELL or BUY)"
+                ));
+            }
+        };
+        let price = parse_decimal_str(&o.avg_price, "forceOrder.ap")?;
+        let qty = parse_decimal_str(&o.filled_qty, "forceOrder.z")?;
+        Ok(Some(LiquidationTick {
+            symbol: o.symbol,
+            liq: LiquidationRow {
+                ts: ms_to_utc(o.ts_ms),
+                side,
+                price,
+                qty,
+                quote_qty: price * qty,
+            },
+        }))
     }
 
     fn parse_depth_event(&self) -> Result<Option<DepthDiff>> {
@@ -556,6 +678,102 @@ mod tests {
             }
             _ => panic!("expected Depth variant"),
         }
+    }
+
+    #[test]
+    fn parses_a_force_order_long_liq() {
+        // Binance forceOrder payload: S=SELL means a LONG position was
+        // liquidated (forced to sell to close).
+        let raw = serde_json::json!({
+            "stream": "btcusdt@forceOrder",
+            "data": {
+                "e": "forceOrder",
+                "E": 1568014460893_i64,
+                "o": {
+                    "s": "BTCUSDT",
+                    "S": "SELL",
+                    "o": "LIMIT",
+                    "f": "IOC",
+                    "q": "0.014",
+                    "p": "9910.00",
+                    "ap": "9910.00",
+                    "X": "FILLED",
+                    "l": "0.014",
+                    "z": "0.014",
+                    "T": 1568014460893_i64
+                }
+            }
+        });
+        let env: CombinedStreamMsg = serde_json::from_value(raw).unwrap();
+        let evt = env.parse_event().unwrap().expect("liquidation decoded");
+        match evt {
+            InboundEvent::Liquidation(tick) => {
+                assert_eq!(tick.symbol, "BTCUSDT");
+                assert_eq!(tick.liq.side, LiquidatedSide::Long);
+                assert!((tick.liq.price - 9910.00).abs() < 1e-9);
+                assert!((tick.liq.qty - 0.014).abs() < 1e-9);
+                // quote_qty = price * qty, precomputed at ingest.
+                assert!((tick.liq.quote_qty - (9910.00 * 0.014)).abs() < 1e-6);
+                assert_eq!(tick.liq.ts.timestamp_millis(), 1568014460893);
+            }
+            _ => panic!("expected Liquidation variant"),
+        }
+    }
+
+    #[test]
+    fn parses_a_force_order_short_liq() {
+        // Binance forceOrder payload: S=BUY means a SHORT position was
+        // liquidated (forced to buy to close).
+        let raw = serde_json::json!({
+            "stream": "btcusdt@forceOrder",
+            "data": {
+                "e": "forceOrder",
+                "E": 1568014461000_i64,
+                "o": {
+                    "s": "BTCUSDT",
+                    "S": "BUY",
+                    "o": "LIMIT",
+                    "f": "IOC",
+                    "q": "0.500",
+                    "p": "10100.00",
+                    "ap": "10105.50",
+                    "X": "FILLED",
+                    "l": "0.500",
+                    "z": "0.500",
+                    "T": 1568014461000_i64
+                }
+            }
+        });
+        let env: CombinedStreamMsg = serde_json::from_value(raw).unwrap();
+        let evt = env.parse_event().unwrap().expect("liquidation decoded");
+        match evt {
+            InboundEvent::Liquidation(tick) => {
+                assert_eq!(tick.liq.side, LiquidatedSide::Short);
+                // Decodes the actual avg fill price (ap), NOT the limit price (p).
+                assert!((tick.liq.price - 10105.50).abs() < 1e-9);
+                assert!((tick.liq.qty - 0.500).abs() < 1e-9);
+            }
+            _ => panic!("expected Liquidation variant"),
+        }
+    }
+
+    #[test]
+    fn force_order_unknown_side_errors() {
+        let raw = serde_json::json!({
+            "stream": "btcusdt@forceOrder",
+            "data": {
+                "e": "forceOrder",
+                "o": {
+                    "s": "BTCUSDT",
+                    "S": "WAT",
+                    "ap": "1.0",
+                    "z": "1.0",
+                    "T": 0_i64
+                }
+            }
+        });
+        let env: CombinedStreamMsg = serde_json::from_value(raw).unwrap();
+        assert!(env.parse_event().is_err());
     }
 
     #[test]
