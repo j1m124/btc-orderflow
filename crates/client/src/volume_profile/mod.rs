@@ -11,15 +11,15 @@
 //! - [`compute`]: pure aggregation + Steidlmayer value-area expansion.
 //! - [`paint`]: bar + reference-line rendering, shared by overlay paint
 //!   (VRVP) and drawing paint (FRVP).
-//! - [`settings_view`]: the four-section UI form (Layout / Reference levels /
-//!   Colors / Reset) hosted by both the indicator-settings and drawing-
-//!   settings floating windows.
+//!
+//! The VP settings UI (form fields for buckets / levels / colors) is
+//! declared inline on the VRVP indicator and the FRVP drawing kind via
+//! the shared `crate::settings_form` framework — no per-VP shell module.
 
 pub mod compute;
 pub mod output;
 pub mod paint;
 pub mod params;
-pub mod settings_view;
 
 pub use compute::compute_volume_profile;
 pub use output::{VolumeProfileOutput, VpBucket};

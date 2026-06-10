@@ -11,12 +11,15 @@
 
 use std::any::Any;
 
-use gpui::SharedString;
+use gpui::{SharedString, WeakEntity};
 use serde::{Deserialize, Serialize};
 
+use super::instance::InstanceId;
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
 use crate::services::market_data::{Candle, FootprintCellLookup, LiquidationBar};
+use crate::settings_form::SettingsForm;
 
 /// Cross-cutting per-compute context, threaded from `ChartState` into each
 /// `IndicatorKind::compute` call. Lets per-chart settings (e.g., the volume
@@ -171,18 +174,19 @@ pub trait IndicatorKind: Any + Send + Sync {
     /// by the `Any` supertrait.
     fn as_any(&self) -> &dyn Any;
 
-    /// Names of the color slots this kind exposes. The settings panel
-    /// renders one color picker per slot, and `IndicatorInstance.colors`
-    /// is sized to match (slot 0 = primary line, slot 1+ = additional
-    /// series). Empty Vec means "no color controls" — Volume's bullish
-    /// and bearish bars are theme-driven and don't carry a configurable
-    /// color. Default: one "Color" slot, which matches every single-line
-    /// indicator (BB, RSI).
+    /// Declarative settings form for this kind. Returning `None` means the
+    /// per-kind dispatcher in `indicator_settings.rs` falls back to the
+    /// legacy per-kind render function. As each kind migrates the form
+    /// here, the legacy fn can be deleted.
     ///
-    /// Owned `Vec<SharedString>` (rather than `&'static`) so kinds whose
-    /// slot count is data-driven (MA Suite — one slot per user-added
-    /// MA entry) can return labels derived from `self`.
-    fn color_slots(&self) -> Vec<SharedString> {
-        vec![SharedString::from("Color")]
+    /// `panel` + `id` are passed so the kind can build `IndicatorTarget<P>`
+    /// closures inside the form declaration that route mutations through
+    /// `chart.update_indicator(id, ...)`.
+    fn settings_form(
+        &self,
+        _panel: WeakEntity<ContentPanel>,
+        _id: InstanceId,
+    ) -> Option<SettingsForm> {
+        None
     }
 }

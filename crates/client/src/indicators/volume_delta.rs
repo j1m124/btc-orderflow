@@ -18,13 +18,16 @@
 
 use std::any::Any;
 
-use gpui::SharedString;
+use gpui::{SharedString, WeakEntity};
 use serde::{Deserialize, Serialize};
 
+use super::instance::InstanceId;
 use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
+use crate::settings_form::{DropdownOption, Field, IndicatorTarget, SettingsForm, SettingsGroup};
 
 /// Scale a delta value (`2*tbv - volume`) into the global volume unit.
 /// USD multiplies by `c.close` so the histogram, y-range, and readout
@@ -218,14 +221,36 @@ impl IndicatorKind for VolumeDeltaParams {
         self
     }
 
-    fn color_slots(&self) -> Vec<SharedString> {
-        // Only the CVD line is user-colorable. Histogram bars use the theme's
-        // bull/bear colors driven by per-bar sign (paint-time decision), so
-        // Histogram-only mode has no configurable slot.
-        if self.shows_cvd() {
-            vec!["CVD".into()]
-        } else {
-            Vec::new()
-        }
+    fn settings_form(
+        &self,
+        panel: WeakEntity<ContentPanel>,
+        id: InstanceId,
+    ) -> Option<SettingsForm> {
+        let target: IndicatorTarget<VolumeDeltaParams> = IndicatorTarget::new(panel, id);
+        let form_id = SharedString::from(format!("volume-delta-{}", id));
+        Some(SettingsForm::new(form_id).group(
+            SettingsGroup::new("General").item(
+                Field::dropdown(
+                    "Mode",
+                    vec![
+                        DropdownOption::new("Histogram", "Histogram"),
+                        DropdownOption::new("Cvd", "CVD"),
+                    ],
+                    target.getter(SharedString::from("Histogram"), |p: &VolumeDeltaParams| {
+                        match p.mode {
+                            VolumeDeltaMode::Histogram => SharedString::from("Histogram"),
+                            VolumeDeltaMode::Cvd => SharedString::from("Cvd"),
+                        }
+                    }),
+                    target.setter(|p: &mut VolumeDeltaParams, v: SharedString| {
+                        p.mode = match v.as_ref() {
+                            "Cvd" => VolumeDeltaMode::Cvd,
+                            _ => VolumeDeltaMode::Histogram,
+                        };
+                    }),
+                )
+                .description("Histogram: per-bar signed delta. CVD: running cumulative line."),
+            ),
+        ))
     }
 }

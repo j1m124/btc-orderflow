@@ -12,13 +12,18 @@
 
 use std::any::Any;
 
-use gpui::{Hsla, SharedString};
+use gpui::{Hsla, SharedString, WeakEntity};
 use serde::{Deserialize, Serialize};
 
+use super::instance::InstanceId;
 use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
+use crate::settings_form::{
+    DropdownOption, Field, IndicatorTarget, NumberOpts, SettingsForm, SettingsGroup,
+};
 
 /// Sub-pane y-axis scaling mode.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -186,9 +191,77 @@ impl IndicatorKind for LiquidationBarsParams {
         self
     }
 
-    fn color_slots(&self) -> Vec<SharedString> {
-        // Long / short color overrides land in Phase 11; for now the paint
-        // arm reads theme defaults and `IndicatorInstance.colors` is empty.
-        Vec::new()
+    fn settings_form(
+        &self,
+        panel: WeakEntity<ContentPanel>,
+        id: InstanceId,
+    ) -> Option<SettingsForm> {
+        let target: IndicatorTarget<LiquidationBarsParams> = IndicatorTarget::new(panel, id);
+        let form_id = SharedString::from(format!("liq-bars-{}", id));
+
+        let is_fixed_for_field = target.clone();
+
+        let scale_field = Field::dropdown(
+            "Scale",
+            vec![
+                DropdownOption::new("Auto", "Auto fit"),
+                DropdownOption::new("Fixed", "Fixed cap"),
+            ],
+            target.getter(SharedString::from("Auto"), |p: &LiquidationBarsParams| {
+                match p.scale {
+                    LiqBarsScale::Auto => SharedString::from("Auto"),
+                    LiqBarsScale::Fixed { .. } => SharedString::from("Fixed"),
+                }
+            }),
+            target.setter(|p: &mut LiquidationBarsParams, v: SharedString| {
+                p.scale = match v.as_ref() {
+                    "Fixed" => {
+                        let prev_cap = match p.scale {
+                            LiqBarsScale::Fixed { max } => max,
+                            _ => 0.0,
+                        };
+                        LiqBarsScale::Fixed { max: prev_cap }
+                    }
+                    _ => LiqBarsScale::Auto,
+                };
+            }),
+        )
+        .description("Auto fits to the visible bars; Fixed locks a symmetric y-range.");
+
+        let max_field = Field::number(
+            "Fixed cap",
+            NumberOpts::float(0.0, 1.0e12, 1.0),
+            target.getter(0.0, |p: &LiquidationBarsParams| match p.scale {
+                LiqBarsScale::Fixed { max } => max,
+                _ => 0.0,
+            }),
+            target.setter(|p: &mut LiquidationBarsParams, v: f64| {
+                if let LiqBarsScale::Fixed { max } = &mut p.scale {
+                    *max = v.max(0.0);
+                }
+            }),
+        )
+        .description("Symmetric y-axis cap (Coin or USD, follows the chart's unit toggle).")
+        .visible_if(move |cx| {
+            is_fixed_for_field
+                .read(cx, |p| matches!(p.scale, LiqBarsScale::Fixed { .. }))
+                .unwrap_or(false)
+        });
+
+        let cumulative_field = Field::switch(
+            "Cumulative line",
+            target.getter(false, |p: &LiquidationBarsParams| p.show_cumulative),
+            target.setter(|p: &mut LiquidationBarsParams, v: bool| p.show_cumulative = v),
+        )
+        .description("Running net (short USD − long USD across visible bars).");
+
+        Some(
+            SettingsForm::new(form_id).group(
+                SettingsGroup::new("General")
+                    .item(scale_field)
+                    .item(max_field)
+                    .item(cumulative_field),
+            ),
+        )
     }
 }

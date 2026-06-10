@@ -17,6 +17,7 @@ pub mod persistence;
 pub mod prefs;
 pub mod services;
 pub mod settings;
+pub mod settings_form;
 pub mod symbol_picker;
 pub mod themes;
 pub mod top_bar;

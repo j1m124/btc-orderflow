@@ -85,10 +85,10 @@ impl IndicatorInstance {
             Placement::Pane => Some(default_pane_height(kind_id)),
             Placement::Overlay => None,
         };
-        let slot_count = kind.color_slots().len();
-        let colors = (0..slot_count)
-            .map(|i| derive_slot_default(primary_color, i))
-            .collect();
+        // Single primary slot, seeded from the per-kind palette rotation.
+        // Multi-line kinds (none in v1; MA Suite when it lands) will store
+        // their per-line colors in typed params and ignore this slot.
+        let colors = vec![primary_color];
         Self {
             id,
             kind_id,
@@ -100,14 +100,14 @@ impl IndicatorInstance {
         }
     }
 
-    /// Read the color for `slot`, falling back to a hue-shifted default
-    /// when the slot is out of bounds (defensive — shouldn't happen since
-    /// `colors.len() == kind.color_slots().len()`).
+    /// Read the color for `slot`, falling back to the primary slot when
+    /// the requested index is out of bounds. Defensive — paint code
+    /// typically reads slot 0 only.
     pub fn color_at(&self, slot: usize) -> Hsla {
         self.colors
             .get(slot)
             .copied()
-            .unwrap_or_else(|| derive_slot_default(self.primary_color(), slot))
+            .unwrap_or_else(|| self.primary_color())
     }
 
     /// Shortcut for slot 0 — the most common case. Returns a sensible
@@ -120,41 +120,15 @@ impl IndicatorInstance {
             .unwrap_or_else(|| palette_color_for(0))
     }
 
-    /// Resize `colors` to match the kind's current `color_slots()` count.
-    /// Slots beyond the new count are dropped; new slots are seeded via
-    /// `derive_slot_default` from the primary color. Used by mutators
-    /// that can change the slot count (MA Suite's add/remove entry).
-    /// Existing slot colors are preserved at their indices — only the
-    /// shape changes.
-    pub fn sync_colors(&mut self) {
-        let target = self.kind.color_slots().len();
-        if target == self.colors.len() {
-            return;
-        }
-        let primary = self.primary_color();
-        if target < self.colors.len() {
-            self.colors.truncate(target);
-        } else {
-            for slot in self.colors.len()..target {
-                self.colors.push(derive_slot_default(primary, slot));
-            }
-        }
-    }
+    /// Resize hook retained as a no-op for callers that still invoke it
+    /// (`chart.update_indicator` runs it after each typed mutation). With
+    /// the per-kind slot count now driven by the settings_form
+    /// declaration, the instance just stores a single primary color slot;
+    /// no resizing happens here.
+    pub fn sync_colors(&mut self) {}
 }
 
-/// Deterministic per-slot default color: slot 0 returns the primary
-/// untouched, slot N adds N × half-rotations on the hue wheel with a
-/// gentle alpha decay so secondary lines read as "supporting".
-fn derive_slot_default(primary: Hsla, slot: usize) -> Hsla {
-    if slot == 0 {
-        return primary;
-    }
-    Hsla {
-        h: (primary.h + 0.5 * slot as f32) % 1.0,
-        a: primary.a * (0.85_f32).powi(slot as i32),
-        ..primary
-    }
-}
+// (derive_slot_default removed — only one slot is allocated now.)
 
 /// Per-kind default sub-pane height (px). Histogram panes (volume, trades)
 /// get a slim 90px slot; anything else falls back to 140px. Used only when

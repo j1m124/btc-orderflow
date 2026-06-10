@@ -2634,10 +2634,19 @@ pub(super) fn paint_sub_pane(
     // vertical guide still useful for time alignment with neighbouring panes.
     if let IndicatorOutput::BarStat {
         grade,
+        show_volume,
+        show_delta,
+        show_long_liq,
+        show_short_liq,
+        show_oi_delta,
         volume,
         delta,
+        long_liq,
+        short_liq,
         daily_max_vol,
         daily_max_delta,
+        daily_max_long_liq,
+        daily_max_short_liq,
     } = &item.output
     {
         let slot_w = (chart_w / view_size.max(1.0)).max(0.5);
@@ -2653,10 +2662,21 @@ pub(super) fn paint_sub_pane(
             chart_bottom,
             slot_w,
             *grade,
+            BarStatShow {
+                volume: *show_volume,
+                delta: *show_delta,
+                long_liq: *show_long_liq,
+                short_liq: *show_short_liq,
+                oi_delta: *show_oi_delta,
+            },
             volume,
             delta,
+            long_liq,
+            short_liq,
             daily_max_vol,
             daily_max_delta,
+            daily_max_long_liq,
+            daily_max_short_liq,
             bullish,
             bearish,
             cell_text_color,
@@ -3046,10 +3066,35 @@ pub(super) fn paint_sub_pane(
     }
 }
 
-/// Paint the BarStat pane: one cell per visible bar, two text rows
-/// (volume on top, signed delta below), optional heatmap fill keyed by
-/// `grade`. Cell width follows the candle gap policy so the cells line up
-/// with their candles on the main pane.
+/// Which BarStat rows the paint pass should draw (mirrored from the
+/// indicator's `show_*` flags via the output variant).
+#[derive(Clone, Copy)]
+struct BarStatShow {
+    volume: bool,
+    delta: bool,
+    long_liq: bool,
+    short_liq: bool,
+    oi_delta: bool,
+}
+
+/// One row of the BarStat pane. `signed` = use bull/bear tint by data
+/// sign (delta only); otherwise the row uses its fixed `base` color.
+/// `daily_max` is `None` for the placeholder OI-delta row (no data).
+/// `header` is a short row tag painted in the right-edge gutter so the
+/// user can identify which row is which without remembering the order.
+struct BarStatRow<'a> {
+    values: &'a [Option<f64>],
+    daily_max: Option<&'a [Option<f64>]>,
+    base: Hsla,
+    signed: bool,
+    formatter: fn(f64) -> String,
+    header: &'static str,
+}
+
+/// Paint the BarStat pane: one cell per visible bar, dynamic number of
+/// stacked rows (count = `show.visible_row_count()`), optional heatmap
+/// fill keyed by `grade`. Cell width follows the candle gap policy so
+/// cells line up with their candles on the main pane.
 #[allow(clippy::too_many_arguments)]
 fn paint_bar_stat_pane(
     start_idx: usize,
@@ -3063,10 +3108,15 @@ fn paint_bar_stat_pane(
     chart_bottom: f32,
     slot_w: f32,
     grade: crate::indicators::BarStatGrade,
+    show: BarStatShow,
     volume: &[Option<f64>],
     delta: &[Option<f64>],
+    long_liq: &[Option<f64>],
+    short_liq: &[Option<f64>],
     daily_max_vol: &[Option<f64>],
     daily_max_delta: &[Option<f64>],
+    daily_max_long_liq: &[Option<f64>],
+    daily_max_short_liq: &[Option<f64>],
     bullish: Hsla,
     bearish: Hsla,
     text_color: Hsla,
@@ -3076,33 +3126,91 @@ fn paint_bar_stat_pane(
 ) {
     use crate::indicators::BarStatGrade;
 
+    // Fixed blue base for the volume row — keeps it visually distinct
+    // from the bull/bear-tinted delta cell so the eye can read each row
+    // as a separate metric. Liq rows reuse the bull/bear theme colors
+    // directly (long-liq = bearish, short-liq = bullish), so they share
+    // visual vocabulary with the dedicated liq_bars indicator.
+    let volume_base = gpui::hsla(0.61, 0.80, 0.55, 1.0);
+
+    // Assemble the row list in fixed display order, skipping any row
+    // whose show-flag is off. Placeholder OI-delta row is built from an
+    // empty values slice so the row slot is allocated but no cell paints.
+    const EMPTY_F64: &[Option<f64>] = &[];
+    let mut rows: Vec<BarStatRow<'_>> = Vec::with_capacity(5);
+    if show.volume {
+        rows.push(BarStatRow {
+            values: volume,
+            daily_max: Some(daily_max_vol),
+            base: volume_base,
+            signed: false,
+            formatter: format_compact,
+            header: "VOL",
+        });
+    }
+    if show.delta {
+        rows.push(BarStatRow {
+            values: delta,
+            daily_max: Some(daily_max_delta),
+            base: bullish, // overridden per cell when `signed`
+            signed: true,
+            formatter: format_signed_compact,
+            header: "Δ",
+        });
+    }
+    if show.long_liq {
+        rows.push(BarStatRow {
+            values: long_liq,
+            daily_max: Some(daily_max_long_liq),
+            base: bearish,
+            signed: false,
+            formatter: format_compact,
+            header: "L LIQ",
+        });
+    }
+    if show.short_liq {
+        rows.push(BarStatRow {
+            values: short_liq,
+            daily_max: Some(daily_max_short_liq),
+            base: bullish,
+            signed: false,
+            formatter: format_compact,
+            header: "S LIQ",
+        });
+    }
+    if show.oi_delta {
+        rows.push(BarStatRow {
+            values: EMPTY_F64,
+            daily_max: None,
+            base: volume_base,
+            signed: false,
+            formatter: format_compact,
+            header: "OI Δ",
+        });
+    }
+
+    let n_rows = rows.len();
+    if n_rows == 0 {
+        return;
+    }
+
     let pane_h = (chart_bottom - chart_top).max(1.0);
-    let row_h = pane_h * 0.5;
-    let vol_y_top = chart_top;
-    let delta_y_top = chart_top + row_h;
+    let row_h = pane_h / n_rows as f32;
     // Cell fill width — fill the full slot so adjacent heatmap cells touch
     // (no gap stripe between bars in the pane). Text still centres in the
     // slot so it aligns with the candle above.
     let cell_w = slot_w.max(1.0);
 
     // VisibleRange mode normalises to the max absolute value across the
-    // visible bar slice. Computed once up front so the per-bar loop is
+    // visible bar slice — precomputed per-row once so the per-bar loop is
     // a single division.
-    let visible_max_vol = if matches!(grade, BarStatGrade::VisibleRange) {
-        slice_max_abs(volume, start_idx, visible_end)
+    let visible_max: Vec<f64> = if matches!(grade, BarStatGrade::VisibleRange) {
+        rows.iter()
+            .map(|r| slice_max_abs(r.values, start_idx, visible_end))
+            .collect()
     } else {
-        0.0
+        vec![0.0; n_rows]
     };
-    let visible_max_delta = if matches!(grade, BarStatGrade::VisibleRange) {
-        slice_max_abs(delta, start_idx, visible_end)
-    } else {
-        0.0
-    };
-
-    // Fixed blue base for the volume row — keeps the volume cell visually
-    // distinct from the bull/bear-tinted delta cell so the eye can read
-    // the two rows as separate metrics rather than a single coloured bar.
-    let volume_base = gpui::hsla(0.61, 0.80, 0.55, 1.0);
 
     // Auto-hide threshold for the per-cell text: when bars get narrower
     // than ~24px the K/M-formatted values stop being readable, so we drop
@@ -3111,35 +3219,50 @@ fn paint_bar_stat_pane(
     const TEXT_MIN_CELL_W: f32 = 24.0;
     let show_text = cell_w >= TEXT_MIN_CELL_W;
 
-    for i in start_idx..visible_end.min(volume.len()) {
+    // Longest visible series length — bounds the per-bar loop without
+    // assuming any single row spans the full candle window.
+    let max_len = rows.iter().map(|r| r.values.len()).max().unwrap_or(0);
+    for i in start_idx..visible_end.min(max_len) {
         let cx_px = index_to_screen(view_start, view_size, i as f32, canvas_w, y_axis_gap);
         if cx_px < -cell_w || cx_px > chart_w + cell_w {
             continue;
         }
         let cell_x = cx_px - cell_w * 0.5;
-        let vol_v = volume.get(i).copied().flatten();
-        let delta_v = delta.get(i).copied().flatten();
 
-        // -- volume cell (top row) --
-        if let Some(v) = vol_v {
+        for (row_idx, row) in rows.iter().enumerate() {
+            let y_top = chart_top + row_h * row_idx as f32;
+            let v = match row.values.get(i).copied().flatten() {
+                Some(v) => v,
+                None => continue,
+            };
             let intensity = match grade {
                 BarStatGrade::Off => 0.0,
                 BarStatGrade::Bar => 1.0,
                 BarStatGrade::VisibleRange => {
-                    if visible_max_vol > 0.0 {
-                        (v.abs() / visible_max_vol) as f32
+                    let mx = visible_max[row_idx];
+                    if mx > 0.0 {
+                        (v.abs() / mx) as f32
                     } else {
                         0.0
                     }
                 }
-                BarStatGrade::Daily => match daily_max_vol.get(i).copied().flatten() {
+                BarStatGrade::Daily => match row.daily_max.and_then(|s| s.get(i).copied().flatten())
+                {
                     Some(mx) if mx > 0.0 => (v.abs() / mx) as f32,
                     _ => 0.0,
                 },
             };
             if intensity > 0.0 {
-                let color = grade_color(volume_base, intensity);
-                fill_rect(window, origin, cell_x, cell_w, vol_y_top, row_h, color);
+                // Signed rows (delta) flip base by data sign; the
+                // disagreement between candle and cell tint is itself the
+                // signal, so this stays independent of the candle color.
+                let base = if row.signed {
+                    if v >= 0.0 { bullish } else { bearish }
+                } else {
+                    row.base
+                };
+                let color = grade_color(base, intensity);
+                fill_rect(window, origin, cell_x, cell_w, y_top, row_h, color);
             }
             if show_text {
                 paint_centred_text(
@@ -3148,52 +3271,43 @@ fn paint_bar_stat_pane(
                     origin,
                     cell_x,
                     cell_w,
-                    vol_y_top,
+                    y_top,
                     row_h,
                     text_color,
-                    &format_compact(v),
+                    &(row.formatter)(v),
                 );
             }
         }
+    }
 
-        // -- delta cell (bottom row) --
-        if let Some(v) = delta_v {
-            let intensity = match grade {
-                BarStatGrade::Off => 0.0,
-                BarStatGrade::Bar => 1.0,
-                BarStatGrade::VisibleRange => {
-                    if visible_max_delta > 0.0 {
-                        (v.abs() / visible_max_delta) as f32
-                    } else {
-                        0.0
-                    }
+    // Per-row tag in the right-edge gutter. Painted last so it sits on
+    // top of any cell fills that bled to the edge. Color follows the
+    // row's base tint so VOL/L LIQ/S LIQ read at a glance — except the
+    // delta row, which is sign-tinted per cell and has no fixed color,
+    // so its header falls back to the neutral axis-label color.
+    let gutter_w = y_axis_gap.max(0.0);
+    if gutter_w > 4.0 {
+        for (row_idx, row) in rows.iter().enumerate() {
+            let y_top = chart_top + row_h * row_idx as f32;
+            let header_color = if row.signed {
+                text_color
+            } else {
+                Hsla {
+                    a: 0.95,
+                    ..row.base
                 }
-                BarStatGrade::Daily => match daily_max_delta.get(i).copied().flatten() {
-                    Some(mx) if mx > 0.0 => (v.abs() / mx) as f32,
-                    _ => 0.0,
-                },
             };
-            // Delta tint follows the sign of the delta itself, not the
-            // candle. A bull candle with a sell-side delta still paints
-            // bearish here — that disagreement is the signal.
-            if intensity > 0.0 {
-                let base = if v >= 0.0 { bullish } else { bearish };
-                let color = grade_color(base, intensity);
-                fill_rect(window, origin, cell_x, cell_w, delta_y_top, row_h, color);
-            }
-            if show_text {
-                paint_centred_text(
-                    window,
-                    cx,
-                    origin,
-                    cell_x,
-                    cell_w,
-                    delta_y_top,
-                    row_h,
-                    text_color,
-                    &format_signed_compact(v),
-                );
-            }
+            paint_centred_text(
+                window,
+                cx,
+                origin,
+                chart_w,
+                gutter_w,
+                y_top,
+                row_h,
+                header_color,
+                row.header,
+            );
         }
     }
 }

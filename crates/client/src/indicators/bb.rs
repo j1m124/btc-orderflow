@@ -2,13 +2,19 @@
 //! lower = middle − N⋅σ. Population stddev. Paint draws three lines and
 //! optionally a low-alpha fill between upper and lower.
 
-use gpui::SharedString;
+use gpui::{SharedString, WeakEntity};
 use serde::{Deserialize, Serialize};
 
+use super::instance::InstanceId;
 use super::kind::{ComputeCtx, IndicatorKind, PaneKind, Source};
 use super::math::{extract_source, rolling_sma, rolling_stddev};
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::panels::ContentPanel;
 use crate::services::market_data::Candle;
+use crate::settings_form::{
+    DropdownOption, Field, IndicatorTarget, NumberOpts, SettingsForm, SettingsGroup,
+    inst_color_field,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BbParams {
@@ -106,4 +112,78 @@ impl IndicatorKind for BbParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn settings_form(
+        &self,
+        panel: WeakEntity<ContentPanel>,
+        id: InstanceId,
+    ) -> Option<SettingsForm> {
+        let target: IndicatorTarget<BbParams> = IndicatorTarget::new(panel.clone(), id);
+        let form_id = SharedString::from(format!("bb-{}", id));
+        let source_options: Vec<DropdownOption> = Source::ALL
+            .iter()
+            .map(|s| DropdownOption::new(source_value(*s), s.label()))
+            .collect();
+        Some(SettingsForm::new(form_id).group(
+            SettingsGroup::new("General")
+                .item(
+                    Field::number(
+                        "Period",
+                        NumberOpts::int(2, 2000),
+                        target.getter(20.0, |p: &BbParams| p.period as f64),
+                        target.setter(|p: &mut BbParams, v: f64| {
+                            p.period = v.round().clamp(2.0, 2000.0) as usize;
+                        }),
+                    )
+                    .description("SMA window length for the middle band."),
+                )
+                .item(
+                    Field::number(
+                        "Std Dev",
+                        NumberOpts::float(0.5, 5.0, 0.5),
+                        target.getter(2.0, |p: &BbParams| p.stddev),
+                        target.setter(|p: &mut BbParams, v: f64| {
+                            p.stddev = v.clamp(0.5, 5.0);
+                        }),
+                    )
+                    .description("Width of the upper/lower bands in σ."),
+                )
+                .item(Field::dropdown(
+                    "Source",
+                    source_options,
+                    target.getter(SharedString::from("Close"), |p: &BbParams| {
+                        SharedString::from(source_value(p.source))
+                    }),
+                    target.setter(|p: &mut BbParams, v: SharedString| {
+                        if let Some(s) = source_from_value(v.as_ref()) {
+                            p.source = s;
+                        }
+                    }),
+                ))
+                .item(inst_color_field("Line color", panel, id, 0)),
+        ))
+    }
+}
+
+fn source_value(s: Source) -> &'static str {
+    match s {
+        Source::Close => "Close",
+        Source::Open => "Open",
+        Source::High => "High",
+        Source::Low => "Low",
+        Source::Hl2 => "Hl2",
+        Source::Ohlc4 => "Ohlc4",
+    }
+}
+
+fn source_from_value(s: &str) -> Option<Source> {
+    Some(match s {
+        "Close" => Source::Close,
+        "Open" => Source::Open,
+        "High" => Source::High,
+        "Low" => Source::Low,
+        "Hl2" => Source::Hl2,
+        "Ohlc4" => Source::Ohlc4,
+        _ => return None,
+    })
 }

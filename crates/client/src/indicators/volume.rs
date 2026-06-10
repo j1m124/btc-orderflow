@@ -11,13 +11,16 @@
 //! the unit triggers an immediate recompute (no need to wait for the next
 //! candle tick).
 
-use gpui::SharedString;
+use gpui::{SharedString, WeakEntity};
 use serde::{Deserialize, Serialize};
 
+use super::instance::InstanceId;
 use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
+use crate::settings_form::{SettingsForm, SettingsGroup, placement_field};
 
 fn convert_volume(c: &Candle, unit: VolumeUnit) -> f64 {
     match unit {
@@ -87,9 +90,16 @@ impl IndicatorKind for VolumeParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    fn color_slots(&self) -> Vec<SharedString> {
-        // Volume bars use the theme's bullish/bearish colors per-bar; the
-        // settings panel exposes no configurable color.
-        Vec::new()
+    fn settings_form(
+        &self,
+        panel: WeakEntity<ContentPanel>,
+        id: InstanceId,
+    ) -> Option<SettingsForm> {
+        let form_id = SharedString::from(format!("volume-{}", id));
+        Some(
+            SettingsForm::new(form_id).group(
+                SettingsGroup::new("General").item(placement_field(panel, id)),
+            ),
+        )
     }
 }

@@ -67,7 +67,4 @@ impl IndicatorKind for TradesParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    fn color_slots(&self) -> Vec<SharedString> {
-        Vec::new()
-    }
 }

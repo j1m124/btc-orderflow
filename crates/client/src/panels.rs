@@ -1818,10 +1818,24 @@ impl ContentPanel {
     /// the multi-bucket diff that footprint subs do.
     pub(crate) fn refresh_chart_liq_bars_sub(&mut self, cx: &mut Context<Self>) {
         let want = self.chart_state.as_ref().and_then(|state| {
-            let any_live = state
-                .indicators()
-                .iter()
-                .any(|i| i.kind_id == "liq_bars");
+            // Active when there's a dedicated liq_bars instance, OR a
+            // bar_stat instance with a liquidation row enabled. The
+            // bar_stat consumer reads the same per-bar series via
+            // `ComputeCtx.liquidation_bars`, so a single refcounted sub
+            // covers both.
+            let any_live = state.indicators().iter().any(|i| {
+                if i.kind_id == "liq_bars" {
+                    return true;
+                }
+                if let Some(bs) = i
+                    .kind
+                    .as_any()
+                    .downcast_ref::<crate::indicators::BarStatParams>()
+                {
+                    return bs.show_long_liq || bs.show_short_liq;
+                }
+                false
+            });
             any_live.then(|| (state.symbol().clone(), state.timeframe()))
         });
         let cur = self

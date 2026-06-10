@@ -15,14 +15,24 @@
 
 use std::any::Any;
 
-use gpui::SharedString;
+use gpui::{Hsla, SharedString, WeakEntity};
 use serde::{Deserialize, Serialize};
 
+use super::instance::InstanceId;
 use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
+use crate::panels::ContentPanel;
 use crate::services::market_data::Candle;
+use crate::settings_form::{
+    AfterChange, DropdownOption, Field, IndicatorTarget, NumberOpts, SettingsForm, SettingsGroup,
+};
 use crate::volume_profile::{
-    VolumeProfileOutput, VolumeProfileParams, compute_volume_profile,
+    AnchorEdge, VolumeProfileOutput, VolumeProfileParams, VpDeltaScale, VpRenderMode,
+    compute_volume_profile,
+    params::{
+        BTCUSDT_TICK_SIZE, BUCKET_TICKS_MAX, BUCKET_TICKS_MIN, ColorBlob, VA_PERCENT_MAX,
+        VA_PERCENT_MIN, WIDTH_PCT_MAX, WIDTH_PCT_MIN,
+    },
 };
 
 /// One VRVP instance. Single field: the shared params struct (FRVP uses the
@@ -109,14 +119,258 @@ impl IndicatorKind for VrvpParams {
         self
     }
 
-    fn color_slots(&self) -> Vec<SharedString> {
-        // VRVP's user-facing colors live inside `params.color_*` (not in
-        // `IndicatorInstance.colors`) so the settings form can drive
-        // mode-conditional pickers without colliding with the generic
-        // `set_indicator_color` plumbing. Empty here skips the generic
-        // color section in `IndicatorSettingsView`; the chip strip falls
-        // back to a palette default which is fine for v1.
-        Vec::new()
+    fn settings_form(
+        &self,
+        panel: WeakEntity<ContentPanel>,
+        id: InstanceId,
+    ) -> Option<SettingsForm> {
+        let target: IndicatorTarget<VrvpParams> =
+            IndicatorTarget::new(panel, id).with_after_change(AfterChange::footprint());
+        let form_id = SharedString::from(format!("vrvp-{}", id));
+
+        // ── visibility predicates ──
+        let target_for_is_delta = target.clone();
+        let is_delta_mode = move |cx: &gpui::App| -> bool {
+            target_for_is_delta
+                .read(cx, |p| !matches!(p.params.render_mode, VpRenderMode::Volume))
+                .unwrap_or(false)
+        };
+        let target_for_show_poc = target.clone();
+        let show_poc_pred = move |cx: &gpui::App| -> bool {
+            target_for_show_poc
+                .read(cx, |p| p.params.show_poc)
+                .unwrap_or(true)
+        };
+        let target_for_show_va = target.clone();
+        let show_va_pred = move |cx: &gpui::App| -> bool {
+            target_for_show_va
+                .read(cx, |p| p.params.show_va)
+                .unwrap_or(true)
+        };
+
+        // ── General ──
+        let bucket_field = Field::number(
+            "Bucket",
+            NumberOpts::int(BUCKET_TICKS_MIN as i64, BUCKET_TICKS_MAX as i64).with_step(10.0),
+            target.getter(100.0, |p: &VrvpParams| p.params.bucket_ticks as f64),
+            target.setter(|p: &mut VrvpParams, v: f64| {
+                let cur = v.round().clamp(BUCKET_TICKS_MIN as f64, BUCKET_TICKS_MAX as f64);
+                p.params.bucket_ticks = cur as u32;
+            }),
+        )
+        .description("Price bucket size in ticks ($0.10 each).");
+
+        let mode_field = Field::dropdown(
+            "Render mode",
+            VpRenderMode::ALL
+                .iter()
+                .map(|m| DropdownOption::new(render_mode_value(*m), m.label()))
+                .collect(),
+            target.getter(SharedString::from("volume"), |p: &VrvpParams| {
+                SharedString::from(render_mode_value(p.params.render_mode))
+            }),
+            target.setter(|p: &mut VrvpParams, v: SharedString| {
+                if let Some(m) = render_mode_from_value(v.as_ref()) {
+                    p.params.render_mode = m;
+                }
+            }),
+        );
+
+        let scale_field = Field::dropdown(
+            "Delta scaling",
+            VpDeltaScale::ALL
+                .iter()
+                .map(|s| DropdownOption::new(delta_scale_value(*s), s.label()))
+                .collect(),
+            target.getter(SharedString::from("per_row"), |p: &VrvpParams| {
+                SharedString::from(delta_scale_value(p.params.delta_scale))
+            }),
+            target.setter(|p: &mut VrvpParams, v: SharedString| {
+                if let Some(s) = delta_scale_from_value(v.as_ref()) {
+                    p.params.delta_scale = s;
+                }
+            }),
+        )
+        .visible_if(is_delta_mode.clone());
+
+        let width_field = Field::number(
+            "Width",
+            NumberOpts::int(WIDTH_PCT_MIN as i64, WIDTH_PCT_MAX as i64).with_step(5.0)
+                .format(|v| SharedString::from(format!("{}%", v.round() as i64))),
+            target.getter(30.0, |p: &VrvpParams| p.params.width_pct as f64),
+            target.setter(|p: &mut VrvpParams, v: f64| {
+                let cur = v.round().clamp(WIDTH_PCT_MIN as f64, WIDTH_PCT_MAX as f64);
+                p.params.width_pct = cur as u8;
+            }),
+        )
+        .description("Profile width as a percentage of the chart pane.");
+
+        let anchor_field = Field::dropdown(
+            "Anchor",
+            AnchorEdge::ALL
+                .iter()
+                .map(|a| DropdownOption::new(anchor_value(*a), a.label()))
+                .collect(),
+            target.getter(SharedString::from("right"), |p: &VrvpParams| {
+                SharedString::from(anchor_value(p.params.anchor))
+            }),
+            target.setter(|p: &mut VrvpParams, v: SharedString| {
+                if let Some(a) = anchor_from_value(v.as_ref()) {
+                    p.params.anchor = a;
+                }
+            }),
+        );
+
+        let volume_color = make_color_field("Volume color", target.clone(), |p| &mut p.params.color_volume, |p| p.params.color_volume);
+        let bull_color = make_color_field("Bull color", target.clone(), |p| &mut p.params.color_bull, |p| p.params.color_bull)
+            .visible_if(is_delta_mode.clone());
+        let bear_color = make_color_field("Bear color", target.clone(), |p| &mut p.params.color_bear, |p| p.params.color_bear)
+            .visible_if(is_delta_mode);
+
+        // ── POC group ──
+        let show_poc_field = Field::switch(
+            "Show POC",
+            target.getter(true, |p: &VrvpParams| p.params.show_poc),
+            target.setter(|p: &mut VrvpParams, v: bool| p.params.show_poc = v),
+        );
+        let poc_color = make_color_field("POC color", target.clone(), |p| &mut p.params.color_poc, |p| p.params.color_poc)
+            .visible_if(show_poc_pred);
+
+        // ── VA group ──
+        let show_va_field = Field::switch(
+            "Show VA",
+            target.getter(true, |p: &VrvpParams| p.params.show_va),
+            target.setter(|p: &mut VrvpParams, v: bool| p.params.show_va = v),
+        );
+        let va_pct_field = Field::number(
+            "VA %",
+            NumberOpts::int(VA_PERCENT_MIN as i64, VA_PERCENT_MAX as i64).with_step(5.0)
+                .format(|v| SharedString::from(format!("{}%", v.round() as i64))),
+            target.getter(70.0, |p: &VrvpParams| p.params.va_percent as f64),
+            target.setter(|p: &mut VrvpParams, v: f64| {
+                let cur = v.round().clamp(VA_PERCENT_MIN as f64, VA_PERCENT_MAX as f64);
+                p.params.va_percent = cur as u8;
+            }),
+        );
+        let show_va_hl_field = Field::switch(
+            "Show VA highlight",
+            target.getter(true, |p: &VrvpParams| p.params.show_va_highlight),
+            target.setter(|p: &mut VrvpParams, v: bool| p.params.show_va_highlight = v),
+        );
+        let labels_field = Field::switch(
+            "Show labels",
+            target.getter(true, |p: &VrvpParams| p.params.show_labels),
+            target.setter(|p: &mut VrvpParams, v: bool| p.params.show_labels = v),
+        );
+        let va_color = make_color_field("VA color", target.clone(), |p| &mut p.params.color_va, |p| p.params.color_va)
+            .visible_if(show_va_pred);
+
+        let _ = BTCUSDT_TICK_SIZE;
+
+        Some(
+            SettingsForm::new(form_id)
+                .group(
+                    SettingsGroup::new("General")
+                        .item(bucket_field)
+                        .item(mode_field)
+                        .item(scale_field)
+                        .item(width_field)
+                        .item(anchor_field)
+                        .item(volume_color)
+                        .item(bull_color)
+                        .item(bear_color),
+                )
+                .group(
+                    SettingsGroup::new("POC")
+                        .item(show_poc_field)
+                        .item(poc_color),
+                )
+                .group(
+                    SettingsGroup::new("VA")
+                        .item(show_va_field)
+                        .item(va_pct_field)
+                        .item(show_va_hl_field)
+                        .item(labels_field)
+                        .item(va_color),
+                ),
+        )
     }
+}
+
+fn make_color_field<F, G>(
+    label: &'static str,
+    target: IndicatorTarget<VrvpParams>,
+    set_field: F,
+    get_field: G,
+) -> Field
+where
+    F: Fn(&mut VrvpParams) -> &mut ColorBlob + 'static + Clone,
+    G: Fn(&VrvpParams) -> ColorBlob + 'static + Clone,
+{
+    let get_clone = get_field.clone();
+    let get_default = get_field.clone();
+    let target_for_get = target.clone();
+    let target_for_set = target;
+    Field::color(
+        label,
+        move |cx: &gpui::App| -> Hsla {
+            target_for_get
+                .read(cx, |p| get_clone(p).into_hsla())
+                .unwrap_or_else(|| get_default(&VrvpParams::default()).into_hsla())
+        },
+        move |color: Hsla, cx: &mut gpui::App| {
+            let set_field = set_field.clone();
+            target_for_set.write(cx, move |p| {
+                *set_field(p) = ColorBlob::from_hsla(color);
+            });
+        },
+    )
+}
+
+fn render_mode_value(m: VpRenderMode) -> &'static str {
+    match m {
+        VpRenderMode::Volume => "volume",
+        VpRenderMode::Delta => "delta",
+        VpRenderMode::VolDeltaOutline => "vol_delta_outline",
+    }
+}
+
+fn render_mode_from_value(s: &str) -> Option<VpRenderMode> {
+    Some(match s {
+        "volume" => VpRenderMode::Volume,
+        "delta" => VpRenderMode::Delta,
+        "vol_delta_outline" => VpRenderMode::VolDeltaOutline,
+        _ => return None,
+    })
+}
+
+fn delta_scale_value(s: VpDeltaScale) -> &'static str {
+    match s {
+        VpDeltaScale::PerRow => "per_row",
+        VpDeltaScale::WholeProfile => "whole_profile",
+    }
+}
+
+fn delta_scale_from_value(s: &str) -> Option<VpDeltaScale> {
+    Some(match s {
+        "per_row" => VpDeltaScale::PerRow,
+        "whole_profile" => VpDeltaScale::WholeProfile,
+        _ => return None,
+    })
+}
+
+fn anchor_value(a: AnchorEdge) -> &'static str {
+    match a {
+        AnchorEdge::Right => "right",
+        AnchorEdge::Left => "left",
+    }
+}
+
+fn anchor_from_value(s: &str) -> Option<AnchorEdge> {
+    Some(match s {
+        "right" => AnchorEdge::Right,
+        "left" => AnchorEdge::Left,
+        _ => return None,
+    })
 }
 

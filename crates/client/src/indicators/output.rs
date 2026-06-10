@@ -45,22 +45,34 @@ pub enum IndicatorOutput {
         histogram: Series,
     },
 
-    /// Per-bar statistic row: total volume + signed delta stacked as two
-    /// text rows inside one cell per bar. Volume cell paints with a fixed
-    /// blue base tint; delta cell paints bull/bear based on the sign of
-    /// the delta itself. `daily_max_vol`/`daily_max_delta` are per-bar
-    /// rolling 24h maxima of the same series (precomputed so the paint
-    /// pass doesn't recompute every frame); paint divides into them to
-    /// derive the "Daily" gradient intensity. `grade` is mirrored into
-    /// the output so the paint pass picks up grading-mode changes via the
-    /// normal `update_indicator` → `recompute_indicators` flow without
-    /// PanePaintItem needing a new field.
+    /// Per-bar statistic rows stacked vertically inside one cell per bar.
+    /// Up to five rows: total volume, signed delta, long-liq total,
+    /// short-liq total, and an OI-delta placeholder (rendered as an empty
+    /// row pending future wiring). Volume cell paints with a fixed blue
+    /// base tint; delta cell paints bull/bear based on the sign of the
+    /// delta itself; liq rows paint bearish (long-liq) / bullish
+    /// (short-liq) full intensity. `daily_max_*` are per-bar rolling 24h
+    /// maxima precomputed so paint doesn't recompute every frame; paint
+    /// divides into them to derive the "Daily" gradient intensity.
+    /// `grade` and the `show_*` flags are mirrored into the output so the
+    /// paint pass picks up edits via the normal `update_indicator` →
+    /// `recompute_indicators` flow without PanePaintItem needing a new
+    /// field.
     BarStat {
         grade: crate::indicators::BarStatGrade,
+        show_volume: bool,
+        show_delta: bool,
+        show_long_liq: bool,
+        show_short_liq: bool,
+        show_oi_delta: bool,
         volume: Series,
         delta: Series,
+        long_liq: Series,
+        short_liq: Series,
         daily_max_vol: Series,
         daily_max_delta: Series,
+        daily_max_long_liq: Series,
+        daily_max_short_liq: Series,
     },
 
     /// Visible-range volume profile: aggregated bid/ask per price bucket
