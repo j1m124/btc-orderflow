@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 use chrono::Duration as ChronoDuration;
 use sqlx::postgres::PgPoolOptions;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -179,6 +179,21 @@ async fn main() -> Result<()> {
         .parse()
         .context("parse LISTEN_ADDR")?;
 
+    // Optional Origin-header allowlist for WS upgrades. `None` = no check
+    // (local-dev default). Set `ALLOWED_ORIGINS=https://orderflow.j1mdev.net`
+    // in prod (Dokploy env). Multiple values can be comma-separated.
+    let allowed_origins = std::env::var("ALLOWED_ORIGINS").ok().map(|raw| {
+        Arc::new(
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>(),
+        )
+    });
+    if let Some(list) = allowed_origins.as_ref() {
+        info!(?list, "WS Origin allowlist active");
+    }
+
     let gateway_state = gateway::GatewayState {
         pool: pool.clone(),
         broadcast_tx: kline_tx.clone(),
@@ -186,6 +201,7 @@ async fn main() -> Result<()> {
         depth_tx: depth_tx.clone(),
         liquidation_tx: liquidation_tx.clone(),
         book_state: book_state.clone(),
+        allowed_origins,
     };
     let gateway_handle = tokio::spawn(async move {
         if let Err(e) = gateway::serve(listen_addr, gateway_state).await {

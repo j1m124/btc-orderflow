@@ -17,7 +17,7 @@ futures = "0.3"
 
 # HTTP/WS server + middleware
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
 
 # WS client (Binance combined-stream)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

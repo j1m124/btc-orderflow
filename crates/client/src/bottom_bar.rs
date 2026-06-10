@@ -8,6 +8,9 @@ use crate::prefs;
 use crate::services::market_data::{LiveStatus, MarketDataServiceHandle};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Short commit SHA stamped in by `build.rs` (populated from the GHA env
+/// `BUILD_SHA` at image build time). Empty string when built locally.
+const BUILD_SHA: &str = env!("BUILD_SHA");
 
 pub struct BottomBar {
     /// Number of `render()` calls observed since the last FPS sample.
@@ -137,10 +140,17 @@ impl Render for BottomBar {
         // never gets confused with the deployed release. `debug_assertions`
         // is on for `cargo build` and off for `cargo build --release`, so
         // the suffix flips at the same boundary as the build profile.
+        //
+        // In release builds, append the short commit SHA when `build.rs`
+        // populated `BUILD_SHA` (GHA path). Locally-built release WASM
+        // (no SHA) shows plain `v<version>`.
         let version_str = if cfg!(debug_assertions) {
             format!("v{VERSION} (debug)")
-        } else {
+        } else if BUILD_SHA.is_empty() {
             format!("v{VERSION}")
+        } else {
+            let short: String = BUILD_SHA.chars().take(7).collect();
+            format!("v{VERSION}-{short}")
         };
         let version = div()
             .text_xs()

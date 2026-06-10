@@ -25,9 +25,28 @@ use gpui::{
 };
 use ws_stream_wasm::{WsMessage, WsMeta};
 
-/// WS endpoint of the local server. Hardcoded for v1 (Q13d). Promote to a
-/// build-time env var when the cloud-server path lands.
-const SERVER_WS_URL: &str = "ws://127.0.0.1:8787/ws";
+/// Fallback WS endpoint when `window.location` isn't available (shouldn't
+/// happen on the web target, but `server_ws_url()` defends against it).
+const FALLBACK_WS_URL: &str = "ws://127.0.0.1:8787/ws";
+
+/// Derive the WS endpoint from `window.location`: `wss://<host>/ws` on
+/// HTTPS pages, `ws://<host>/ws` otherwise. In dev (Vite on :3001) the
+/// `/ws` path proxies to the local server (see `www/vite.config.js`); in
+/// prod the client and server share an origin, so the same code path
+/// works in both environments without env-var plumbing.
+fn server_ws_url() -> String {
+    let Some(window) = web_sys::window() else {
+        return FALLBACK_WS_URL.to_string();
+    };
+    let loc = window.location();
+    let protocol = loc.protocol().unwrap_or_else(|_| "http:".into());
+    let host = match loc.host() {
+        Ok(h) if !h.is_empty() => h,
+        _ => return FALLBACK_WS_URL.to_string(),
+    };
+    let ws_proto = if protocol == "https:" { "wss" } else { "ws" };
+    format!("{ws_proto}://{host}/ws")
+}
 
 /// Page size for `HistoryPage` requests (Q9c).
 const HISTORY_PAGE_SIZE: u32 = 500;
@@ -2120,10 +2139,11 @@ async fn run_connection(
         // Defer to a fresh tick — see the deeper comment in `pump`.
         defer_update(&this, cx, move |s, cx| s.set_conn_status(status, cx));
 
-        match WsMeta::connect(SERVER_WS_URL, None).await {
+        let url = server_ws_url();
+        match WsMeta::connect(&url, None).await {
             Ok((_meta, stream)) => {
                 attempts = 0;
-                log::info!("ws connected to {SERVER_WS_URL}");
+                log::info!("ws connected to {url}");
                 // Drop any stale Subscribes that piled up during the outage;
                 // resubscribe_all re-issues the canonical set.
                 drain_pending(&mut outbound_rx);

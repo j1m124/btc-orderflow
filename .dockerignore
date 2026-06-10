@@ -1,0 +1,38 @@
+# Same exclusions as .gitignore, plus .git itself + dev artefacts that
+# would bloat the build context. .dockerignore semantics are subtly
+# different (gitignore-style globs without all the negation chains).
+
+.git
+.gitignore
+.dockerignore
+
+# Rust build artefacts (target/ is the dominant chunk — multi-GB)
+target/
+**/target/
+
+# Frontend build outputs / deps (regenerated inside the image)
+www/node_modules/
+www/dist/
+www/src/wasm/
+www/bun.lock
+
+# Secrets
+.env
+.env.*
+
+# Editor / OS
+.DS_Store
+**/.DS_Store
+.vscode/
+.idea/
+.claude/
+*.swp
+
+# Logs
+*.log
+scripts/smoke-test-server.log
+scripts/smoke-test.log
+
+# Docs / repo-only
+README.md
+CLAUDE.md

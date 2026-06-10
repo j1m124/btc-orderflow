@@ -30,6 +30,17 @@ export default defineConfig({
       'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cross-Origin-Opener-Policy': 'same-origin',
     },
+    // Proxy /ws to the Rust server on :8787 so the client can derive its
+    // WS URL from `window.location` unconditionally — same code path in dev
+    // (Vite on :3001) and prod (axum serves /ws and the static SPA on one
+    // origin).
+    proxy: {
+      '/ws': {
+        target: 'ws://127.0.0.1:8787',
+        ws: true,
+        changeOrigin: true,
+      },
+    },
   },
   optimizeDeps: {
     exclude: ['./src/wasm'],
