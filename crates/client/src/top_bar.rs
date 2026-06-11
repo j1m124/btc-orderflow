@@ -322,6 +322,17 @@ impl TopBar {
             .child(objects_dropdown)
     }
 
+    fn render_screenshot_button(&self) -> impl IntoElement {
+        Button::new("topbar-screenshot")
+            .icon(IconName::Frame)
+            .small()
+            .ghost()
+            .tooltip("Screenshot")
+            .on_click(|_, window, cx| {
+                crate::screenshot::open(window, cx);
+            })
+    }
+
     fn render_settings_button(&self) -> impl IntoElement {
         Button::new("topbar-settings")
             .icon(IconName::Settings)
@@ -342,6 +353,7 @@ impl Render for TopBar {
         };
         let left_controls = self.render_left_controls(cx);
         let right_controls = self.render_right_controls();
+        let screenshot_btn = self.render_screenshot_button();
         let settings_btn = self.render_settings_button();
 
         div()
@@ -359,6 +371,7 @@ impl Render for TopBar {
             .child(left_controls)
             .child(div().flex_1())
             .child(right_controls)
+            .child(screenshot_btn)
             .child(settings_btn)
     }
 }

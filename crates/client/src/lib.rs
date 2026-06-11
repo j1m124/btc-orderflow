@@ -15,6 +15,7 @@ pub mod indicators;
 pub mod panels;
 pub mod persistence;
 pub mod prefs;
+pub mod screenshot;
 pub mod services;
 pub mod settings;
 pub mod settings_form;
