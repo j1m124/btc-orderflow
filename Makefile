@@ -1,4 +1,7 @@
-.PHONY: help dev build build-wasm build-wasm-dev build-web check check-client check-protocol check-server server db-up db-down db-reset db-psql db-migration clean install
+.PHONY: help dev dev-vps build build-wasm build-wasm-dev build-web check check-client check-protocol check-server server db-up db-down db-reset db-psql db-migration clean install
+
+# Prod VPS WebSocket endpoint — see `dev-vps` target.
+VPS_BACKEND := wss://orderflow.j1mdev.net
 
 # wasm-bindgen-cli MUST match the wasm-bindgen crate version pulled by
 # Cargo.lock. Drift here = the JS bindings reference symbols the WASM blob
@@ -76,6 +79,12 @@ build: build-wasm build-web ## Build complete project (WASM + frontend)
 
 dev: build-wasm-dev ## Start client dev server (WASM + Vite at localhost:3001)
 	@cd www && bun install && bun run dev
+
+dev-vps: build-wasm-dev ## Start client dev server pointed at the prod VPS backend ($(VPS_BACKEND))
+	@# Runs under Node (not Bun) because Bun's socket impl is missing
+	@# `destroySoon`, which Vite 8's WS proxy needs when bridging the
+	@# browser to a wss:// upstream. Node 20.19+ required (see CLAUDE.md).
+	@cd www && bun install && BACKEND_TARGET=$(VPS_BACKEND) node ./node_modules/vite/bin/vite.js
 
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."

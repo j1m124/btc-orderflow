@@ -33,6 +33,9 @@ make install                          # one-time: wasm-bindgen-cli + sqlx-cli + 
 make db-up                            # start TimescaleDB (Docker)
 make server                           # cargo run -p server (gap-heals + ingests + serves WS)
 make dev                              # debug WASM + Vite at localhost:3001
+make dev-vps                          # same as `dev` but proxies /ws to the prod VPS backend
+                                      #   (BACKEND_TARGET=$(VPS_BACKEND) — see Makefile);
+                                      #   runs Vite under Node to dodge a Bun WS-proxy bug.
 
 make check                            # cargo check for every crate (per-target)
 make check-{protocol,client,server}   # individual checks
