@@ -52,9 +52,15 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
 
-      # cache-from/cache-to use the GHA cache backend; combined with the
-      # BuildKit cache mounts in the Dockerfile, this keeps the cargo
-      # registry + the workspace target/ across runs.
+      # cache-from/cache-to use the GHA cache backend. This caches image
+      # LAYERS only — BuildKit `RUN --mount=type=cache` mounts do NOT
+      # persist across GHA runs (they live in runner-local BuildKit state).
+      # The Dockerfile is structured around that fact: cargo-chef cooks all
+      # dependencies into a layer keyed on the manifests + lockfile, so
+      # app-only commits skip the expensive dependency build entirely.
+      # mode=max exports intermediate-stage layers (the cook layer is the
+      # point). If the ~10GB GHA cache cap ever starts evicting it, switch
+      # to `type=registry,ref=ghcr.io/<repo>:buildcache`.
       - name: Build & push image
         uses: docker/build-push-action@v6
         with:

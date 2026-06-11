@@ -2,12 +2,32 @@
 #
 # Multi-stage build → single runtime image.
 #
-#   Stage 1 (rust-builder)     compiles the server binary + WASM client
-#                              and runs wasm-bindgen.
-#   Stage 2 (frontend-builder) runs Vite + Bun against the wasm-bindgen
+#   Stage 1 (chef)             pinned rust + cargo-chef base; installs the
+#                              rust-toolchain.toml nightly once.
+#   Stage 2 (planner)          `cargo chef prepare` — distills the workspace
+#                              to recipe.json (manifests + lockfile only).
+#   Stage 3 (rust-builder)     `cargo chef cook` builds ALL dependencies in a
+#                              layer keyed on recipe.json, so app-only commits
+#                              reuse it via the GHA layer cache. Then the real
+#                              `cargo build` compiles just the workspace
+#                              crates + runs wasm-bindgen.
+#   Stage 4 (frontend-builder) runs Vite + Bun against the wasm-bindgen
 #                              output to produce dist/.
-#   Stage 3 (runtime)          debian-slim with the server binary + dist/,
+#   Stage 5 (runtime)          debian-slim with the server binary + dist/,
 #                              ca-certificates, tini, curl-for-healthcheck.
+#
+# Layer-caching rationale (this is what makes CI fast — don't break it):
+#   - BuildKit `RUN --mount=type=cache` does NOT persist on GitHub Actions
+#     (mounts live in runner-local BuildKit state, wiped per job). Everything
+#     cacheable must live in image layers, which `cache-to: type=gha` exports.
+#   - The cook layer holds CARGO_HOME (crate registry + the multi-GB zed git
+#     checkout) AND target/ with every dependency compiled for both the
+#     native and wasm targets. It only rebuilds when recipe.json changes,
+#     i.e. on Cargo.toml/Cargo.lock edits — not on source edits.
+#   - BUILD_SHA/BUILD_REF change every commit, so they are declared AFTER
+#     the cook layer; declaring them earlier would invalidate it every push.
+#   - The base image is digest-pinned: an upstream `rust:bookworm` rebuild
+#     would otherwise re-key every layer mid-week. Bump deliberately.
 #
 # GHA passes BUILD_SHA / BUILD_REF as build args; build.rs in crates/client
 # threads them into the bottom-bar version string. STATIC_DIR + LISTEN_ADDR
@@ -15,30 +35,19 @@
 # and ALLOWED_ORIGINS.
 
 # ============================================================================
-# Stage 1: Rust + WASM build
+# Stage 1: chef base (pinned rust:bookworm + cargo-chef preinstalled)
 # ============================================================================
-# The official rust image ships rustup. `rust-toolchain.toml` in the source
-# (channel = nightly-2026-05-29, targets = wasm32-unknown-unknown, components
-# = rustfmt + clippy) triggers rustup to install the pinned nightly on the
-# first cargo invocation inside the workspace.
-FROM rust:bookworm AS rust-builder
+# The digest pins BOTH the cargo-chef version (0.1.77) and the rust:bookworm
+# base it's built on. `rust-toolchain.toml` (channel = nightly, targets =
+# wasm32-unknown-unknown) makes rustup install the real toolchain on the
+# first cargo/rustc invocation — the image's stable rust is irrelevant.
+FROM lukemathwalker/cargo-chef:0.1.77-rust-bookworm@sha256:fa7281503a177bd5af6261f4041ca6b36d9f0de8d3090886c33cbd8e65b88ca9 AS chef
 
-# Match the Makefile's pinned wasm-bindgen-cli. Drift between this and the
-# wasm-bindgen crate in Cargo.lock = JS shim references symbols the WASM
-# blob didn't export. Bump both together.
-ARG WASM_BINDGEN_VERSION=0.2.120
-
-# Build-time version tags surfaced through crates/client/build.rs into the
-# bottom-bar version string ("v0.1.0-abc1234"). Empty on local builds.
-ARG BUILD_SHA=""
-ARG BUILD_REF=""
-ENV BUILD_SHA=${BUILD_SHA} \
-    BUILD_REF=${BUILD_REF} \
-    # Use the system `git` binary for cargo's git-dep fetches instead of the
-    # bundled libgit2. libgit2 emits no progress during fetch, which makes
-    # large repos (zed-industries/zed is multi-GB) look hung for 10+ min on
-    # first build. The CLI path is generally faster and prints progress.
-    CARGO_NET_GIT_FETCH_WITH_CLI=true
+# Use the system `git` binary for cargo's git-dep fetches instead of the
+# bundled libgit2. libgit2 emits no progress during fetch, which makes
+# large repos (zed-industries/zed is multi-GB) look hung for 10+ min on
+# first build. The CLI path is generally faster and prints progress.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 WORKDIR /build
 
@@ -47,23 +56,59 @@ WORKDIR /build
 COPY rust-toolchain.toml ./
 RUN rustc --version
 
-# Install wasm-bindgen-cli once. The cargo registry / git caches persist
-# across image builds via BuildKit cache mounts.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    cargo install --locked wasm-bindgen-cli --version ${WASM_BINDGEN_VERSION}
+# ============================================================================
+# Stage 2: planner — produce the dependency recipe
+# ============================================================================
+# Re-runs on every commit (COPY . . invalidates), but takes ~2s. When no
+# manifest changed, the emitted recipe.json is byte-identical, so the
+# builder's `COPY --from=planner` layer — and the expensive cook layer
+# behind it — stay cache hits.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Bring the rest of the workspace. `.dockerignore` filters target/,
-# www/node_modules/, www/dist/, www/src/wasm/, .env, etc.
+# ============================================================================
+# Stage 3: Rust + WASM build
+# ============================================================================
+FROM chef AS rust-builder
+
+COPY --from=planner /build/recipe.json recipe.json
+
+# The vendored gpui-component fork is path-patched in the workspace
+# Cargo.toml, but chef's recipe only captures workspace-member manifests —
+# without the real vendor/ tree, cook can't resolve the [patch] and fails.
+# Copying it in ALSO means the fork compiles during cook, so this layer
+# holds every dependency (gpui, the fork, registry crates) for both
+# targets; it re-keys only when recipe.json or vendor/ change.
+COPY vendor/ vendor/
+
+RUN cargo chef cook --release --recipe-path recipe.json --package server \
+ && cargo chef cook --release --recipe-path recipe.json --package client \
+        --target wasm32-unknown-unknown
+
+# Prebuilt wasm-bindgen instead of `cargo install` (~3s vs ~90s compile).
+# Must match the wasm-bindgen crate version in Cargo.lock — drift = the JS
+# shim references symbols the WASM blob doesn't export. The Makefile pins
+# the same value; bump together.
+ARG WASM_BINDGEN_VERSION=0.2.120
+RUN curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/wasm-bindgen-${WASM_BINDGEN_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    | tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/wasm-bindgen' \
+ && wasm-bindgen --version
+
+# Bring the real source. `.dockerignore` filters target/, www/node_modules/,
+# www/dist/, www/src/wasm/, .env, etc.
 COPY . .
 
-# Build server (host = linux/amd64) and WASM client in release mode, run
-# wasm-bindgen, and copy the binary OUT of the cache-mounted target/ within
-# the same RUN so it survives the mount teardown.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    cargo build -p server --release \
+# Build-time version tags surfaced through crates/client/build.rs into the
+# bottom-bar version string ("v0.1.0-abc1234"). Empty on local builds.
+# Declared HERE (not at the top) because they change every commit — see the
+# layer-caching rationale above.
+ARG BUILD_SHA=""
+ARG BUILD_REF=""
+
+# Only the workspace crates + the vendored gpui-component compile here; all
+# other deps come precompiled from the cook layer.
+RUN cargo build -p server --release \
  && cargo build -p client --lib --target wasm32-unknown-unknown --release \
  && wasm-bindgen \
         /build/target/wasm32-unknown-unknown/release/client.wasm \
@@ -74,7 +119,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp /build/target/release/server /artifacts/server
 
 # ============================================================================
-# Stage 2: Frontend build (Vite + Bun)
+# Stage 4: Frontend build (Vite + Bun)
 # ============================================================================
 # `bun --bun vite build` matches the dev workflow in www/package.json — the
 # `--bun` flag forces Bun's runtime instead of shelling out to Node (Bun's
@@ -90,7 +135,7 @@ RUN bun install \
  && bun --bun vite build
 
 # ============================================================================
-# Stage 3: Runtime
+# Stage 5: Runtime
 # ============================================================================
 FROM debian:bookworm-slim AS runtime
 
