@@ -39,13 +39,15 @@ After Rust client changes during `make dev`, re-run `./scripts/build-wasm.sh` an
 
 ## Architecture
 
-**Server.** Single tokio binary. Three tasks: Binance WS ingest (9 timeframes via combined stream, exp-backoff reconnect + REST gap-heal on every connect attempt), DB writer (UPSERTs closed bars into a TimescaleDB hypertable), and an axum WS gateway on `:8787`. Per-client forwarders subscribe-before-snapshot to avoid the obvious tick/snapshot race.
+The deep dive lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The short version:
 
-**Protocol.** Tagged-enum serde frames (`ClientFrame.op`, `ServerFrame.type`). Forward-compat `Channel` slot — v1 only handles candles; trades / footprint / book are additive on both ends.
+**Server.** Single tokio binary. Binance ingest over two WebSocket connections (9 kline streams + aggTrade + forceOrder on one, depth@100ms on the other), exp-backoff reconnect with REST gap-heal on every connect attempt. Four broadcast channels fan out to batched DB writers, a sub-second aggregator (1s/5s bars synthesized from aggTrades — Binance futures has no sub-minute klines), a sequence-checked orderbook maintainer, and an axum WS gateway. Per-client forwarders subscribe-before-snapshot, dedupe against the snapshot tail, and conflate live streams into 100ms batches.
 
-**Client.** One persistent WebSocket opened at boot. Refcounted per-`SubKey` subscriptions, id-routed inbound frames, exp-backoff reconnect, local-storage persistence. Panels (chart, watchlist, trades, liquidations, orderbook, footprint) all consume the same `KlineEvent` / `TradeEvent` / `LiquidationEvent` streams.
+**Protocol.** Tagged-enum serde frames (`ClientFrame.op`, `ServerFrame.type`). Six `Channel` kinds: candles, trades, footprint, book, liquidations, liquidation bars — each with the same snapshot / tick / history-page frame triple, plus `Resnap` for gap recovery.
 
-**Storage.** Single `candles` hypertable, PK `(symbol, tf, open_time)`, 1-day chunks, 7-day retention. `quote_volume / trades / taker_buy_vol` persisted from day one to unlock delta + VWAP later without a trade tape.
+**Client.** One persistent WebSocket opened at boot. Refcounted per-`SubKey` subscriptions, id-routed inbound frames, exp-backoff reconnect, local-storage persistence. Five panel kinds (chart, watchlist, trades, orderbook, liquidations) plus chart-level footprint render modes, an indicator plugin framework, drawing tools, and a declarative settings system — all consuming per-channel event streams, never the wire types.
+
+**Storage.** Four TimescaleDB hypertables: `candles` (1-day chunks, 7-day retention), `trades` (1-hour, 48h), `book_snapshots` (1-hour, 48h), `liquidations` (1-day, 7-day). Only raw events are persisted — footprint cells, sub-second bars, and liquidation bars are `time_bucket` queries on read, so any bucket size or timeframe works retroactively.
 
 ## Deploy
 
