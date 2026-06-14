@@ -2096,7 +2096,6 @@ fn paint_drawings_overlay(
                         if !out.buckets.is_empty() && frvp_w > 1.0 {
                             crate::volume_profile::paint::paint_volume_profile(
                                 window,
-                                cx,
                                 origin,
                                 xmin,
                                 frvp_w,
@@ -2106,7 +2105,6 @@ fn paint_drawings_overlay(
                                 y_hi,
                                 out,
                                 params,
-                                colors.muted,
                             );
                         }
                     }
@@ -2291,9 +2289,7 @@ pub(super) fn paint_overlay_indicators(
     items: &[OverlayPaintItem],
     bullish: Hsla,
     bearish: Hsla,
-    label_color: Hsla,
     window: &mut Window,
-    cx: &mut App,
 ) {
     let canvas_w = bounds.size.width.as_f32();
     let canvas_h = bounds.size.height.as_f32();
@@ -2455,7 +2451,6 @@ pub(super) fn paint_overlay_indicators(
                 // excludes the y-axis gutter on the right.
                 crate::volume_profile::paint::paint_volume_profile(
                     window,
-                    cx,
                     origin,
                     0.0,
                     chart_w,
@@ -2465,7 +2460,6 @@ pub(super) fn paint_overlay_indicators(
                     y_hi,
                     output,
                     params,
-                    label_color,
                 );
             }
         }
@@ -2769,18 +2763,11 @@ pub(super) fn paint_sub_pane(
             );
         }
         IndicatorOutput::Histogram { values, up } => {
-            // Volume-as-pane: full-pane histogram anchored at zero. Higher
-            // alpha than the overlay-mode variant since there are no candles
-            // to share the band with.
-            let alpha = 0.7_f32;
-            let up_color = Hsla {
-                a: alpha,
-                ..bullish
-            };
-            let down_color = Hsla {
-                a: alpha,
-                ..bearish
-            };
+            // Volume-as-pane: full-pane histogram anchored at zero. Fully
+            // opaque in pane mode — there are no candles to share the band
+            // with, so transparency would only wash the bars out.
+            let up_color = Hsla { a: 1.0, ..bullish };
+            let down_color = Hsla { a: 1.0, ..bearish };
             let zero_y = band_y(y_lo, y_hi, 0.0, chart_top, chart_bottom);
             for i in start_idx..visible_end.min(values.len()) {
                 let Some(v) = values[i] else { continue };
@@ -2808,11 +2795,11 @@ pub(super) fn paint_sub_pane(
             histogram,
         } => {
             // Histogram first (behind lines). Sign drives color: positive bars
-            // bullish-tinted, negative bars bearish-tinted, both at reduced
-            // alpha so the macd/signal lines on top stay legible.
+            // bullish-tinted, negative bars bearish-tinted, fully opaque in
+            // pane mode; the macd/signal lines are drawn on top afterwards.
             let zero_y = band_y(y_lo, y_hi, 0.0, chart_top, chart_bottom);
-            let up_color = Hsla { a: 0.65, ..bullish };
-            let down_color = Hsla { a: 0.65, ..bearish };
+            let up_color = Hsla { a: 1.0, ..bullish };
+            let down_color = Hsla { a: 1.0, ..bearish };
             for i in start_idx..visible_end.min(histogram.len()) {
                 let Some(v) = histogram[i] else { continue };
                 let cx_px = index_to_screen(view_start, view_size, i as f32, canvas_w, y_axis_gap);
@@ -2872,8 +2859,10 @@ pub(super) fn paint_sub_pane(
                 crate::persistence::VolumeUnit::Coin => (long_qty, short_qty),
                 crate::persistence::VolumeUnit::Usd => (long_quote_qty, short_quote_qty),
             };
-            let long_color = params.long_color.unwrap_or(Hsla { a: 0.78, ..bearish });
-            let short_color = params.short_color.unwrap_or(Hsla { a: 0.78, ..bullish });
+            // Default to fully opaque bars in pane mode; a user-picked custom
+            // color keeps whatever alpha they chose.
+            let long_color = params.long_color.unwrap_or(Hsla { a: 1.0, ..bearish });
+            let short_color = params.short_color.unwrap_or(Hsla { a: 1.0, ..bullish });
             let zero_y = band_y(y_lo, y_hi, 0.0, chart_top, chart_bottom);
             for i in start_idx..visible_end.min(longs.len()) {
                 let cx_px =
@@ -3222,60 +3211,103 @@ fn paint_bar_stat_pane(
     // Longest visible series length — bounds the per-bar loop without
     // assuming any single row spans the full candle window.
     let max_len = rows.iter().map(|r| r.values.len()).max().unwrap_or(0);
-    for i in start_idx..visible_end.min(max_len) {
-        let cx_px = index_to_screen(view_start, view_size, i as f32, canvas_w, y_axis_gap);
-        if cx_px < -cell_w || cx_px > chart_w + cell_w {
-            continue;
-        }
-        let cell_x = cx_px - cell_w * 0.5;
+    // Cull predicate shared by both paths: drop cells fully off the left edge,
+    // and — critically — any cell whose right edge would cross into the
+    // right-axis gutter where the per-row headers (VOL/Δ/…) live. That
+    // rightmost cell is the most-recent bar that's only partially on the
+    // chart; painting its column would draw a phantom stat past the last
+    // fully-visible bar, overlapping the headers.
+    let on_screen = |cx_px: f32| cx_px + cell_w * 0.5 >= 0.0 && cx_px + cell_w * 0.5 <= chart_w;
 
-        for (row_idx, row) in rows.iter().enumerate() {
-            let y_top = chart_top + row_h * row_idx as f32;
-            let v = match row.values.get(i).copied().flatten() {
-                Some(v) => v,
-                None => continue,
-            };
-            let intensity = match grade {
-                BarStatGrade::Off => 0.0,
-                BarStatGrade::Bar => 1.0,
-                BarStatGrade::VisibleRange => {
-                    let mx = visible_max[row_idx];
-                    if mx > 0.0 {
-                        (v.abs() / mx) as f32
-                    } else {
-                        0.0
-                    }
-                }
-                BarStatGrade::Daily => match row.daily_max.and_then(|s| s.get(i).copied().flatten())
-                {
-                    Some(mx) if mx > 0.0 => (v.abs() / mx) as f32,
-                    _ => 0.0,
-                },
-            };
-            if intensity > 0.0 {
-                // Signed rows (delta) flip base by data sign; the
-                // disagreement between candle and cell tint is itself the
-                // signal, so this stays independent of the candle color.
+    if slot_w < 1.0 {
+        // Zoomed out past one bar per pixel: drawing every cell would emit
+        // thousands of overlapping 1px quads each frame (the pan/zoom FPS
+        // sink). Collapse each screen column to a single cell per row, keeping
+        // the max intensity so volume/liq spikes still register. Text is
+        // already off at this width, so there's nothing else to draw per bar.
+        let mut pend_col = vec![i32::MIN; n_rows];
+        let mut pend_intensity = vec![0.0_f32; n_rows];
+        let mut pend_base = vec![bullish; n_rows];
+        let flush = |window: &mut Window, row_idx: usize, col: i32, intensity: f32, base: Hsla| {
+            if col != i32::MIN && intensity > 0.0 {
+                let y_top = chart_top + row_h * row_idx as f32;
+                let color = grade_color(base, intensity);
+                fill_rect(window, origin, col as f32, 1.0, y_top, row_h, color);
+            }
+        };
+        for i in start_idx..visible_end.min(max_len) {
+            let cx_px = index_to_screen(view_start, view_size, i as f32, canvas_w, y_axis_gap);
+            if !on_screen(cx_px) {
+                continue;
+            }
+            let col = cx_px.floor() as i32;
+            for (row_idx, row) in rows.iter().enumerate() {
+                let v = match row.values.get(i).copied().flatten() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let intensity =
+                    bar_stat_intensity(grade, v, visible_max[row_idx], row.daily_max, i);
                 let base = if row.signed {
                     if v >= 0.0 { bullish } else { bearish }
                 } else {
                     row.base
                 };
-                let color = grade_color(base, intensity);
-                fill_rect(window, origin, cell_x, cell_w, y_top, row_h, color);
+                if col != pend_col[row_idx] {
+                    flush(window, row_idx, pend_col[row_idx], pend_intensity[row_idx], pend_base[row_idx]);
+                    pend_col[row_idx] = col;
+                    pend_intensity[row_idx] = intensity;
+                    pend_base[row_idx] = base;
+                } else if intensity > pend_intensity[row_idx] {
+                    pend_intensity[row_idx] = intensity;
+                    pend_base[row_idx] = base;
+                }
             }
-            if show_text {
-                paint_centred_text(
-                    window,
-                    cx,
-                    origin,
-                    cell_x,
-                    cell_w,
-                    y_top,
-                    row_h,
-                    text_color,
-                    &(row.formatter)(v),
-                );
+        }
+        for row_idx in 0..n_rows {
+            flush(window, row_idx, pend_col[row_idx], pend_intensity[row_idx], pend_base[row_idx]);
+        }
+    } else {
+        for i in start_idx..visible_end.min(max_len) {
+            let cx_px = index_to_screen(view_start, view_size, i as f32, canvas_w, y_axis_gap);
+            let cell_x = cx_px - cell_w * 0.5;
+            if !on_screen(cx_px) {
+                continue;
+            }
+
+            for (row_idx, row) in rows.iter().enumerate() {
+                let y_top = chart_top + row_h * row_idx as f32;
+                let v = match row.values.get(i).copied().flatten() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let intensity =
+                    bar_stat_intensity(grade, v, visible_max[row_idx], row.daily_max, i);
+                if intensity > 0.0 {
+                    // Signed rows (delta) flip base by data sign; the
+                    // disagreement between candle and cell tint is itself the
+                    // signal, so this stays independent of the candle color.
+                    let base = if row.signed {
+                        if v >= 0.0 { bullish } else { bearish }
+                    } else {
+                        row.base
+                    };
+                    let color = grade_color(base, intensity);
+                    fill_rect(window, origin, cell_x, cell_w, y_top, row_h, color);
+                }
+                if show_text {
+                    paint_centred_text(
+                        window,
+                        cx,
+                        origin,
+                        cell_x,
+                        cell_w,
+                        y_top,
+                        row_h,
+                        text_color,
+                        &(row.formatter)(v),
+                    );
+                }
             }
         }
     }
@@ -3309,6 +3341,35 @@ fn paint_bar_stat_pane(
                 row.header,
             );
         }
+    }
+}
+
+/// Cell heatmap intensity (0..1) for one BarStat value under the active
+/// grade. Factored out so the normal and the zoomed-out decimated paint
+/// paths stay in lockstep.
+#[inline]
+fn bar_stat_intensity(
+    grade: crate::indicators::BarStatGrade,
+    v: f64,
+    visible_max: f64,
+    daily_max: Option<&[Option<f64>]>,
+    i: usize,
+) -> f32 {
+    use crate::indicators::BarStatGrade;
+    match grade {
+        BarStatGrade::Off => 0.0,
+        BarStatGrade::Bar => 1.0,
+        BarStatGrade::VisibleRange => {
+            if visible_max > 0.0 {
+                (v.abs() / visible_max) as f32
+            } else {
+                0.0
+            }
+        }
+        BarStatGrade::Daily => match daily_max.and_then(|s| s.get(i).copied().flatten()) {
+            Some(mx) if mx > 0.0 => (v.abs() / mx) as f32,
+            _ => 0.0,
+        },
     }
 }
 

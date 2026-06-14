@@ -141,6 +141,7 @@ pub(super) fn render_number(
     let opts_init = opts.clone();
     let opts_step = opts.clone();
     let opts_change = opts.clone();
+    let get_step = get.clone();
     let set_step = set.clone();
     let set_change = set.clone();
     let state = window.use_keyed_state(key, cx, move |window, cx| {
@@ -148,7 +149,10 @@ pub(super) fn render_number(
         let input = cx.new(|cx| InputState::new(window, cx).default_value(display.to_string()));
         let step_sub = window.subscribe(&input, cx, move |input, ev: &NumberInputEvent, window, cx| {
             let NumberInputEvent::Step(action) = ev;
-            let cur: f64 = input.read(cx).value().parse().unwrap_or(0.0);
+            // Step from the committed param value, not the displayed text:
+            // formatted fields ("70%", "100 ticks") don't parse as a bare
+            // f64, so reading the display would reset us to 0.
+            let cur = get_step(cx);
             let next = match action {
                 StepAction::Increment => cur + opts_step.step,
                 StepAction::Decrement => cur - opts_step.step,
@@ -164,7 +168,10 @@ pub(super) fn render_number(
                 return;
             }
             let raw = input.read(cx).value();
-            let Ok(value) = raw.as_ref().parse::<f64>() else {
+            // Lenient parse so a manual edit that keeps the unit suffix
+            // ("80%", "120 ticks") still commits — the field re-formats it
+            // on the next render anyway.
+            let Some(value) = parse_formatted(raw.as_ref()) else {
                 return;
             };
             let clamped = value.clamp(opts_change.min, opts_change.max);
@@ -206,6 +213,39 @@ fn format_display(v: f64, opts: &NumberOpts) -> SharedString {
     } else {
         SharedString::from(format!("{}", v))
     }
+}
+
+/// Recover the numeric value from a (possibly formatted) input string.
+/// Number fields display with arbitrary unit affixes ("70%", "100 ticks",
+/// "$10"), so a bare `parse::<f64>()` rejects them; we scan for the first
+/// float-like token (optional leading `-`, digits, single decimal point).
+fn parse_formatted(s: &str) -> Option<f64> {
+    let mut start: Option<usize> = None;
+    let mut end = s.len();
+    let mut dot_seen = false;
+    for (i, ch) in s.char_indices() {
+        match start {
+            None => {
+                if ch.is_ascii_digit() || ch == '-' {
+                    start = Some(i);
+                } else if ch == '.' {
+                    start = Some(i);
+                    dot_seen = true;
+                }
+            }
+            Some(_) => {
+                if ch.is_ascii_digit() {
+                    continue;
+                } else if ch == '.' && !dot_seen {
+                    dot_seen = true;
+                } else {
+                    end = i;
+                    break;
+                }
+            }
+        }
+    }
+    s[start?..end].parse::<f64>().ok()
 }
 
 // ───────────────────────────── switch / checkbox ─────────────────────────────

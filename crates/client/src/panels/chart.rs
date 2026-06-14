@@ -2097,20 +2097,27 @@ fn render_synthetic_render_chip(
         // chip behaving like its siblings in the same vertical stack.
         .occlude()
         .hover(move |this| this.bg(hover_bg))
-        .child(div().child(label))
-        // Eye toggles `render_visible` — flipping it suppresses the main
-        // render layer (paint_main_chart honours `render_visible`) without
-        // touching subscriptions. Dispatches an action so chart-scoped
-        // key bindings could trigger the same toggle later.
-        .child(
-            Button::new("chip-render-eye")
-                .label(eye_label)
-                .xsmall()
-                .ghost()
-                .on_click(|_ev, window, cx| {
-                    window.dispatch_action(Box::new(ToggleChartRenderVisible), cx);
-                }),
-        );
+        .child(div().child(label));
+
+    // OHLC + volume/delta readout (hovered candle, else latest) lives inside
+    // the render chip, right after the mode label.
+    if let Some(readout) = ohlc_readout(state, cx) {
+        chip = chip.child(readout);
+    }
+
+    // Eye toggles `render_visible` — flipping it suppresses the main
+    // render layer (paint_main_chart honours `render_visible`) without
+    // touching subscriptions. Dispatches an action so chart-scoped
+    // key bindings could trigger the same toggle later.
+    chip = chip.child(
+        Button::new("chip-render-eye")
+            .label(eye_label)
+            .xsmall()
+            .ghost()
+            .on_click(|_ev, window, cx| {
+                window.dispatch_action(Box::new(ToggleChartRenderVisible), cx);
+            }),
+    );
 
     // Gear: enabled only for footprint kinds (Candlestick has no params).
     // Dispatches `OpenChartRenderSettings`; the workspace handler resolves
@@ -2140,13 +2147,90 @@ fn render_synthetic_render_chip(
     chip.into_any_element()
 }
 
+/// OHLC + volume/delta readout embedded inside the render chip (it used to
+/// be a hover-only pill in the top-right corner). Reads the candle under the
+/// crosshair when hovering, else the latest candle — the standard "legend
+/// defaults to the last bar" behaviour. Volume + delta follow the chart's
+/// `VolumeUnit` toggle. Returns `None` when the chart has no candles yet, so
+/// the render chip falls back to just its mode label.
+fn ohlc_readout(
+    state: &ChartState,
+    cx: &mut Context<super::ContentPanel>,
+) -> Option<gpui::AnyElement> {
+    if state.candles.is_empty() {
+        return None;
+    }
+    // Candle to read: the one under the crosshair if the cursor is over a
+    // valid bar, otherwise the most recent candle.
+    let idx = state
+        .cursor
+        .zip(state.bounds)
+        .and_then(|((cx_px, _), bounds)| {
+            let canvas_w = bounds.size.width.as_f32();
+            let t = screen_to_index(
+                state.view_start,
+                state.view_size,
+                cx_px,
+                canvas_w,
+                state.y_axis_gap_px.get(),
+            );
+            let i = t.round() as i32;
+            (i >= 0 && (i as usize) < state.candles.len()).then_some(i as usize)
+        })
+        .unwrap_or(state.candles.len() - 1);
+    let c = &state.candles[idx];
+
+    let (muted, fg, bull, bear) = {
+        let theme = cx.theme();
+        (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.chart_bullish,
+            theme.chart_bearish,
+        )
+    };
+
+    // Volume + delta in the chart's active unit (delta = signed taker
+    // buy/sell imbalance, same definition the Volume Delta indicator uses).
+    let scale = |raw: f64| match state.volume_unit {
+        crate::persistence::VolumeUnit::Coin => raw,
+        crate::persistence::VolumeUnit::Usd => raw * c.close,
+    };
+    let vol = scale(c.volume);
+    let delta = c.taker_buy_vol.map(|tbv| scale(2.0 * tbv - c.volume));
+    let delta_color = match delta {
+        Some(d) if d >= 0.0 => bull,
+        Some(_) => bear,
+        None => muted,
+    };
+
+    // No border/bg/padding of its own — it's a child group inside the render
+    // chip; the chip supplies the pill chrome.
+    Some(
+        h_flex()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .text_color(muted)
+                    .child(SharedString::from(format_user_tz(c.open_time, cx))),
+            )
+            .child(div().text_color(fg).child(format!("O {}", format_price(c.open))))
+            .child(div().text_color(bull).child(format!("H {}", format_price(c.high))))
+            .child(div().text_color(bear).child(format!("L {}", format_price(c.low))))
+            .child(div().text_color(fg).child(format!("C {}", format_price(c.close))))
+            .child(div().text_color(muted).child(format!("V {}", fmt_scalar(Some(vol)))))
+            .child(div().text_color(delta_color).child(format!("Δ {}", fmt_scalar(delta))))
+            .into_any_element(),
+    )
+}
+
 /// Render the main-pane vertical indicator list — the synthetic render
-/// chip (Candlestick / Cluster / Profile) on top, the per-overlay chips
-/// below it, and a chevron-only collapse button pinned at the bottom of
-/// the stack. Collapsing hides the render chip + overlay chips alike,
-/// leaving only the chevron visible — pointed by the design ask to keep
-/// the canvas as uncluttered as possible until the user explicitly
-/// expands.
+/// chip (Candlestick / Cluster / Profile, which also carries the OHLC +
+/// volume/delta readout) on top, the per-overlay chips below it, and a
+/// chevron-only collapse button pinned at the bottom of the stack.
+/// Collapsing hides the render chip + overlay chips alike, leaving only the
+/// chevron visible — pointed by the design ask to keep the canvas as
+/// uncluttered as possible until the user explicitly expands.
 ///
 /// Pane-placed indicators are NOT included here; they each get their own
 /// chip rendered at the top-left of their sub-pane (`render_sub_pane_chip`).
@@ -3101,9 +3185,6 @@ pub fn render(
         axis_bg: theme_background,
         axis_border: theme_border,
     };
-    // Snapshot before the move-into-closure below — overlay paint runs
-    // after main_chart paint and reuses the same label color.
-    let overlay_label: Hsla = main_chart_colors.label;
     let entity = cx.entity();
 
     // Right (price) axis interaction zone — overlays the chart's reserved
@@ -3422,83 +3503,9 @@ pub fn render(
 
             let mut chrome: Vec<gpui::AnyElement> = Vec::new();
 
-            // OHLC pill at top-right (inboard of the y-axis labels). Was at
-            // top-left, but the indicator list moved there as the
-            // chart's primary "what am I looking at?" surface; the OHLC
-            // hover readout reads cleanly from either corner.
-            if let Some(c) = candle {
-                let prev_close = if candle_idx > 0 {
-                    state.candles.get(candle_idx as usize - 1).map(|p| p.close)
-                } else {
-                    None
-                };
-                let change = prev_close.map(|prev| c.close - prev);
-                let pct = prev_close.and_then(|prev| {
-                    if prev.abs() > 1e-9 {
-                        Some((c.close - prev) / prev * 100.0)
-                    } else {
-                        None
-                    }
-                });
-                let change_color = match change {
-                    Some(d) if d >= 0.0 => theme_chart_bullish,
-                    Some(_) => theme_chart_bearish,
-                    None => theme_muted_foreground,
-                };
-                let change_text = match (change, pct) {
-                    (Some(d), Some(p)) => format!("{:+.2} ({:+.2}%)", d, p),
-                    (Some(d), None) => format!("{:+.2}", d),
-                    _ => String::new(),
-                };
-                // Anchor inboard of the y-axis gutter so the pill doesn't
-                // overlap the right-axis price labels.
-                let ohlc_right = state.y_axis_gap_px.get() + 8.0;
-                chrome.push(
-                    h_flex()
-                        .absolute()
-                        .top(px(8.0))
-                        .right(px(ohlc_right))
-                        .gap(px(8.0))
-                        .pl(px(8.0))
-                        .pr(px(8.0))
-                        .pt(px(4.0))
-                        .pb(px(4.0))
-                        .text_size(px(11.))
-                        .bg(theme_background)
-                        .border_1()
-                        .border_color(theme_border)
-                        .rounded(px(4.0))
-                        .child(
-                            div()
-                                .text_color(theme_muted_foreground)
-                                .child(SharedString::from(format_user_tz(c.open_time, cx))),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme_foreground)
-                                .child(format!("O {}", format_price(c.open))),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme_chart_bullish)
-                                .child(format!("H {}", format_price(c.high))),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme_chart_bearish)
-                                .child(format!("L {}", format_price(c.low))),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme_foreground)
-                                .child(format!("C {}", format_price(c.close))),
-                        )
-                        .when(!change_text.is_empty(), |this| {
-                            this.child(div().text_color(change_color).child(change_text))
-                        })
-                        .into_any_element(),
-                );
-            }
+            // (The OHLC readout moved to the top-left chip stack — see
+            // `render_ohlc_chip`. The crosshair now only paints the axis
+            // labels below.)
 
             // Time label hugging the bottom axis at the cursor's x.
             let chart_w = canvas_w - y_axis_gap;
@@ -4727,9 +4734,7 @@ pub fn render(
                                     &paint_overlay_items,
                                     overlay_bullish,
                                     overlay_bearish,
-                                    overlay_label,
                                     window,
-                                    cx,
                                 );
                             });
                         }

@@ -11,8 +11,7 @@
 //! drawing-rect's geometry instead.
 
 use gpui::{
-    App, BorderStyle, Bounds, Corners, Edges, Hsla, PaintQuad, Pixels, Point, SharedString,
-    TextRun, Window, point, px,
+    BorderStyle, Bounds, Corners, Edges, Hsla, PaintQuad, Pixels, Point, Window, point, px,
 };
 
 use super::output::{VolumeProfileOutput, VpBucket};
@@ -34,13 +33,21 @@ const COVERAGE_THRESHOLD: f32 = 0.95;
 /// still legible.
 const NON_VA_DIM_ALPHA: f32 = 0.30;
 
-/// True iff `bucket`'s price span overlaps the value-area band `[val, vah]`.
-/// Half-open / inclusive both ends — a bucket whose edge touches `val` or
-/// `vah` is treated as inside so the boundary buckets don't flicker between
-/// dim and bright depending on float rounding.
+/// True iff `bucket` lies *within* the value-area band `[val, vah]` — i.e.
+/// it is one of the buckets the VAH/VAL reference lines bracket.
+///
+/// This is a containment test, not an overlap test, and the distinction
+/// matters: `vah`/`val` are bucket *edges* (`vah_price` = the highest VA
+/// bucket's `price_high`, `val_price` = the lowest's `price_low`), and
+/// contiguous buckets share edges. The bucket just above VAH has
+/// `price_low == vah`, the bucket just below VAL has `price_high == val` —
+/// an overlap test counts both as inside, so the highlight band ends up one
+/// bucket taller on each side than the lines, which is the discrepancy this
+/// fixes. `eps` (a sliver of a bucket) absorbs float-add error on the shared
+/// edges so the genuine boundary buckets stay solidly inside.
 #[inline]
-fn bucket_in_va(b: &VpBucket, vah: f64, val: f64) -> bool {
-    b.price_low <= vah && b.price_high >= val
+fn bucket_in_va(b: &VpBucket, vah: f64, val: f64, eps: f64) -> bool {
+    b.price_low >= val - eps && b.price_high <= vah + eps
 }
 
 /// Pre-resolved VA dimming context. `None` → no dimming this paint pass
@@ -51,6 +58,10 @@ fn bucket_in_va(b: &VpBucket, vah: f64, val: f64) -> bool {
 struct DimCtx {
     vah: f64,
     val: f64,
+    /// Containment slack — a thousandth of a bucket, far below one bucket
+    /// (so just-outside buckets stay excluded) yet far above f64 add error
+    /// on the shared edges (so VA boundary buckets stay included).
+    eps: f64,
 }
 
 fn dim_ctx(params: &VolumeProfileParams, output: &VolumeProfileOutput) -> Option<DimCtx> {
@@ -65,7 +76,11 @@ fn dim_ctx(params: &VolumeProfileParams, output: &VolumeProfileOutput) -> Option
         return None;
     }
     match (output.vah_price, output.val_price) {
-        (Some(vah), Some(val)) => Some(DimCtx { vah, val }),
+        (Some(vah), Some(val)) => Some(DimCtx {
+            vah,
+            val,
+            eps: params.bucket_dollars().max(f64::MIN_POSITIVE) * 1e-3,
+        }),
         _ => None,
     }
 }
@@ -75,7 +90,7 @@ fn dim_ctx(params: &VolumeProfileParams, output: &VolumeProfileOutput) -> Option
 #[inline]
 fn bucket_color(base: Hsla, b: &VpBucket, dim: Option<DimCtx>) -> Hsla {
     match dim {
-        Some(d) if !bucket_in_va(b, d.vah, d.val) => Hsla {
+        Some(d) if !bucket_in_va(b, d.vah, d.val, d.eps) => Hsla {
             a: base.a * NON_VA_DIM_ALPHA,
             ..base
         },
@@ -93,7 +108,6 @@ fn bucket_color(base: Hsla, b: &VpBucket, dim: Option<DimCtx>) -> Hsla {
 #[allow(clippy::too_many_arguments)]
 pub fn paint_volume_profile(
     window: &mut Window,
-    cx: &mut App,
     origin: Point<Pixels>,
     chart_left: f32,
     chart_w: f32,
@@ -103,7 +117,6 @@ pub fn paint_volume_profile(
     y_hi: f64,
     output: &VolumeProfileOutput,
     params: &VolumeProfileParams,
-    label_color: Hsla,
 ) {
     if output.buckets.is_empty() {
         return;
@@ -153,9 +166,7 @@ pub fn paint_volume_profile(
     // when coverage is below threshold — partial profiles would otherwise
     // surface levels that snap around as more history arrives.
     if render_levels {
-        paint_reference_levels(
-            window, cx, origin, chart_left, chart_w, params, output, &price_to_y, label_color,
-        );
+        paint_reference_levels(window, origin, chart_left, chart_w, params, output, &price_to_y);
     }
 }
 
@@ -269,13 +280,24 @@ fn paint_delta_mode(
     }
 }
 
-/// Volume+Delta-outline mode — outlined volume bar (stroke only) with an
-/// inner filled delta bar. The outline carries `color_volume`; the inner
-/// fill picks bull/bear by delta sign. Inner length is ALWAYS per-row
-/// scaled (`|delta| / bucket.total`) so the inner bar can't overflow the
-/// outline frame regardless of `params.delta_scale`. This matches the
-/// design call from the grilling: "Mode 3 should make the delta easy to
-/// read inside the volume frame".
+/// Volume+Delta mode — the volume profile is drawn as a single connected
+/// outline (a staircase silhouette tracing each bucket's volume extent),
+/// with a filled bull/bear delta bar inside each row.
+///
+/// We deliberately do NOT stroke a full box per bucket: stacked rows share
+/// edges, so a per-row box draws the same horizontal divider twice at every
+/// bucket boundary, piling up into a dense ladder of lines across the whole
+/// profile. Instead we paint only the leading vertical edge of each bar plus
+/// a short horizontal *step* connector where two price-adjacent buckets
+/// differ in width. The result reads as one profile outline rather than a
+/// stack of boxes. Buckets aren't guaranteed contiguous (compute only emits
+/// rows that had volume), so connectors are gated on adjacency — a gap leaves
+/// the silhouette open, which is correct.
+///
+/// Inner delta length is ALWAYS per-row scaled (`|delta| / bucket.total`) so
+/// the fill can't overflow the volume extent regardless of
+/// `params.delta_scale`. This matches the design call from the grilling:
+/// "Mode 3 should make the delta easy to read inside the volume frame".
 fn paint_vol_delta_outline_mode(
     window: &mut Window,
     origin: Point<Pixels>,
@@ -299,6 +321,17 @@ fn paint_vol_delta_outline_mode(
     let outline_base = params.color_volume.into_hsla();
     let bull = params.color_bull.into_hsla();
     let bear = params.color_bear.into_hsla();
+    const STROKE_W: f32 = 1.0;
+    // Two buckets count as price-adjacent (and so get a step connector) when
+    // the upper one's low edge meets the lower one's high edge. Half a bucket
+    // of slack cleanly separates "touching" (diff ≈ 0) from "one row gap"
+    // (diff ≥ bucket size) without tripping on f64 add error.
+    let adj_eps = 0.5 * params.bucket_dollars().max(f64::MIN_POSITIVE);
+
+    // `prev` carries the lower-priced neighbour already painted this pass:
+    // its leading-edge x, its high edge price, and its outline color (so the
+    // connector blends with the bar it steps from).
+    let mut prev: Option<(f32, f64, Hsla)> = None;
     for b in &output.buckets {
         let y_top = price_to_y(b.price_high);
         let y_bot = price_to_y(b.price_low);
@@ -306,30 +339,47 @@ fn paint_vol_delta_outline_mode(
         let y_bot_c = y_bot.min(chart_bottom);
         let h = (y_bot_c - y_top_c).max(0.0);
         if h <= 0.0 {
+            // Off-screen row — break silhouette continuity so the next visible
+            // bucket doesn't connect across the gap.
+            prev = None;
             continue;
         }
-        // Outer (volume) bar.
         let outer_w = (band_w * (b.total / max_total) as f32).max(1.0);
-        let outer_x = match params.anchor {
+        let lead_x = match params.anchor {
             AnchorEdge::Right => anchor_x - outer_w,
-            AnchorEdge::Left => anchor_x,
+            AnchorEdge::Left => anchor_x + outer_w,
         };
         let outline = bucket_color(outline_base, b, dim);
-        stroke_rect(window, origin, outer_x, outer_w, y_top_c, h, outline, 1.0);
-        // Inner (delta) bar — anchored to the same edge as the outer; per-row
-        // scaling so `inner_w <= outer_w` always.
+
+        // Inner (delta) fill first so the outline paints on top of it.
         let inner_frac = delta_fraction(b, VpDeltaScale::PerRow, 0.0);
-        if !inner_frac.is_finite() || inner_frac <= 0.0 {
-            continue;
+        if inner_frac.is_finite() && inner_frac > 0.0 {
+            let inner_w = (outer_w * inner_frac as f32).max(0.5);
+            let inner_x = match params.anchor {
+                AnchorEdge::Right => anchor_x - inner_w,
+                AnchorEdge::Left => anchor_x,
+            };
+            let inner_base = if b.delta > 0.0 { bull } else { bear };
+            let inner_color = bucket_color(inner_base, b, dim);
+            fill_rect(window, origin, inner_x, inner_w, y_top_c, h, inner_color);
         }
-        let inner_w = (outer_w * inner_frac as f32).max(0.5);
-        let inner_x = match params.anchor {
-            AnchorEdge::Right => anchor_x - inner_w,
-            AnchorEdge::Left => anchor_x,
-        };
-        let inner_base = if b.delta > 0.0 { bull } else { bear };
-        let inner_color = bucket_color(inner_base, b, dim);
-        fill_rect(window, origin, inner_x, inner_w, y_top_c, h, inner_color);
+
+        // Leading vertical edge of this bar.
+        paint_v_line(window, origin, lead_x, y_top_c, h, outline, STROKE_W);
+
+        // Step connector to the lower-priced neighbour, only when the two are
+        // truly price-adjacent and the shared boundary is on-screen.
+        if let Some((prev_lead_x, prev_high, prev_outline)) = prev {
+            if (prev_high - b.price_low).abs() <= adj_eps {
+                let boundary_y = y_bot; // unclamped shared edge (this row's low)
+                if boundary_y >= chart_top && boundary_y <= chart_bottom {
+                    paint_h_segment(
+                        window, origin, prev_lead_x, lead_x, boundary_y, prev_outline, STROKE_W,
+                    );
+                }
+            }
+        }
+        prev = Some((lead_x, b.price_high, outline));
     }
 }
 
@@ -383,20 +433,17 @@ fn fill_rect(
     });
 }
 
-/// Paint POC / VAH / VAL reference lines + optional right-edge labels.
-/// Honors the per-flag show toggles. Coverage gating is the caller's
-/// responsibility (we don't re-check `coverage_pct` here).
-#[allow(clippy::too_many_arguments)]
+/// Paint POC / VAH / VAL reference lines. Honors the per-flag show toggles.
+/// Coverage gating is the caller's responsibility (we don't re-check
+/// `coverage_pct` here).
 fn paint_reference_levels(
     window: &mut Window,
-    cx: &mut App,
     origin: Point<Pixels>,
     chart_left: f32,
     chart_w: f32,
     params: &VolumeProfileParams,
     output: &VolumeProfileOutput,
     price_to_y: &dyn Fn(f64) -> f32,
-    label_color: Hsla,
 ) {
     let poc_color = params.color_poc.into_hsla();
     let va_color = params.color_va.into_hsla();
@@ -404,56 +451,14 @@ fn paint_reference_levels(
     if params.show_poc {
         if let Some(p) = output.poc_price {
             paint_h_line(window, origin, chart_left, chart_w, price_to_y(p), poc_color, 1.5);
-            if params.show_labels {
-                paint_level_label(
-                    window,
-                    cx,
-                    origin,
-                    chart_left,
-                    chart_w,
-                    price_to_y(p),
-                    "POC",
-                    p,
-                    poc_color,
-                    label_color,
-                );
-            }
         }
     }
     if params.show_va {
         if let Some(p) = output.vah_price {
             paint_h_line(window, origin, chart_left, chart_w, price_to_y(p), va_color, 1.0);
-            if params.show_labels {
-                paint_level_label(
-                    window,
-                    cx,
-                    origin,
-                    chart_left,
-                    chart_w,
-                    price_to_y(p),
-                    "VAH",
-                    p,
-                    va_color,
-                    label_color,
-                );
-            }
         }
         if let Some(p) = output.val_price {
             paint_h_line(window, origin, chart_left, chart_w, price_to_y(p), va_color, 1.0);
-            if params.show_labels {
-                paint_level_label(
-                    window,
-                    cx,
-                    origin,
-                    chart_left,
-                    chart_w,
-                    price_to_y(p),
-                    "VAL",
-                    p,
-                    va_color,
-                    label_color,
-                );
-            }
         }
     }
 }
@@ -474,74 +479,38 @@ fn paint_h_line(
     fill_rect(window, origin, chart_left, chart_w, y_top, thickness, color);
 }
 
-/// "POC 1234.50"-style label rendered at the right edge of the chart band,
-/// just above the line. Uses the configured `label_color` for the prefix
-/// (matches the chart's axis labels) and the level's color for the price
-/// — keeps the price visually anchored to its line even when the user
-/// retints the level.
-#[allow(clippy::too_many_arguments)]
-fn paint_level_label(
-    window: &mut Window,
-    cx: &mut App,
-    origin: Point<Pixels>,
-    chart_left: f32,
-    chart_w: f32,
-    y: f32,
-    name: &str,
-    price: f64,
-    name_color: Hsla,
-    _label_color: Hsla,
-) {
-    let text = SharedString::from(format!("{} {:.2}", name, price));
-    let run = TextRun {
-        len: text.len(),
-        font: window.text_style().font(),
-        color: name_color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let shaped = window
-        .text_system()
-        .shape_line(text, px(10.0), &[run], None);
-    // Right-aligned with a small inset from the y-axis gutter; baseline
-    // sits a few px above the line so it doesn't cover its own underline.
-    let approx_w_px = 60.0_f32; // small over-estimate; gpui will clip if needed
-    let x = chart_left + chart_w - approx_w_px - 4.0;
-    let y_label = y - 12.0;
-    let _ = shaped.paint(
-        point(px(x) + origin.x, px(y_label) + origin.y),
-        px(10.0),
-        gpui::TextAlign::Left,
-        None,
-        window,
-        cx,
-    );
-}
 
-/// Stroke-only rectangle (outline) — same quad primitive with a non-zero
-/// border and a transparent background. Used for the outer volume frame
-/// in VolDeltaOutline mode.
-#[inline]
-fn stroke_rect(
+/// Vertical line at canvas x `x`, spanning `y_top..y_top + h`. Painted as a
+/// thin filled rect (same approach as [`paint_h_line`]) and centered on the
+/// integer pixel column so it stays anti-alias-clean. Used for the leading
+/// edge of each bar in the VolDeltaOutline silhouette.
+fn paint_v_line(
     window: &mut Window,
     origin: Point<Pixels>,
     x: f32,
-    w: f32,
     y_top: f32,
     h: f32,
     color: Hsla,
-    stroke_w: f32,
+    thickness: f32,
 ) {
-    window.paint_quad(PaintQuad {
-        bounds: Bounds {
-            origin: point(px(x) + origin.x, px(y_top) + origin.y),
-            size: gpui::size(px(w), px(h)),
-        },
-        corner_radii: Corners::default(),
-        background: gpui::transparent_black().into(),
-        border_widths: Edges::all(px(stroke_w)),
-        border_color: color,
-        border_style: BorderStyle::Solid,
-    });
+    let x_left = (x - thickness * 0.5).round();
+    fill_rect(window, origin, x_left, thickness, y_top, h, color);
+}
+
+/// Horizontal segment between canvas x `x0` and `x1` at canvas y `y` — the
+/// step connector joining two adjacent bars' leading edges. Order-agnostic
+/// in x; centered on the integer pixel row.
+fn paint_h_segment(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    x0: f32,
+    x1: f32,
+    y: f32,
+    color: Hsla,
+    thickness: f32,
+) {
+    let x_lo = x0.min(x1);
+    let w = (x0 - x1).abs() + thickness; // +thickness so the corner squares off
+    let y_top = (y - thickness * 0.5).round();
+    fill_rect(window, origin, x_lo - thickness * 0.5, w, y_top, thickness, color);
 }

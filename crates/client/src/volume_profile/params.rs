@@ -29,9 +29,11 @@ pub enum VpRenderMode {
     /// One filled bar per bucket; length = `|delta|`, colored bull/bear by
     /// the sign of `ask_vol − bid_vol`.
     Delta,
-    /// Outlined volume bar (stroke only, no fill) with a filled colored
-    /// inner bar = `|delta|`, both anchored to the same edge. Inner length
-    /// is always per-row-scaled so it fits inside the outer frame.
+    /// Volume drawn as a single connected outline (staircase silhouette of
+    /// each bucket's volume extent — no per-row boxes, so no ladder of
+    /// horizontal divider lines), with a filled colored inner bar = `|delta|`
+    /// anchored to the same edge. Inner length is always per-row-scaled so it
+    /// fits inside the volume extent.
     VolDeltaOutline,
 }
 
@@ -76,8 +78,7 @@ impl Default for VpDeltaScale {
 }
 
 impl VpDeltaScale {
-    pub const ALL: &'static [VpDeltaScale] =
-        &[VpDeltaScale::PerRow, VpDeltaScale::WholeProfile];
+    pub const ALL: &'static [VpDeltaScale] = &[VpDeltaScale::PerRow, VpDeltaScale::WholeProfile];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -135,7 +136,6 @@ pub struct VolumeProfileParams {
     pub show_poc: bool,
     pub show_va: bool,
     pub show_va_highlight: bool,
-    pub show_labels: bool,
     pub va_percent: u8,
 
     pub color_volume: ColorBlob,
@@ -156,13 +156,16 @@ impl Default for VolumeProfileParams {
             show_poc: true,
             show_va: true,
             show_va_highlight: true,
-            show_labels: true,
             va_percent: 70,
-            color_volume: ColorBlob::from_hsla(hsla(0.0, 0.0, 0.55, 0.50)),
+            // #66E7F8 (cyan) → HSL. Alpha kept at 0.50 so filled bars don't
+            // obscure the candles underneath.
+            color_volume: ColorBlob::from_hsla(hsla(0.519, 0.912, 0.686, 0.70)),
             color_bull: ColorBlob::from_hsla(hsla(0.36, 0.55, 0.50, 0.85)),
             color_bear: ColorBlob::from_hsla(hsla(0.00, 0.65, 0.55, 0.85)),
-            color_poc: ColorBlob::from_hsla(hsla(0.13, 0.85, 0.55, 1.0)),
-            color_va: ColorBlob::from_hsla(hsla(0.13, 0.65, 0.55, 0.60)),
+            // POC + VAH/VAL reference lines are white; VA keeps a lower alpha
+            // so the band edges read as secondary to the POC.
+            color_poc: ColorBlob::from_hsla(hsla(0.0, 0.0, 1.0, 1.0)),
+            color_va: ColorBlob::from_hsla(hsla(0.0, 0.0, 1.0, 0.60)),
         }
     }
 }
@@ -196,7 +199,6 @@ impl VolumeProfileParams {
         self.show_poc = d.show_poc;
         self.show_va = d.show_va;
         self.show_va_highlight = d.show_va_highlight;
-        self.show_labels = d.show_labels;
         self.va_percent = d.va_percent;
         self.color_volume = d.color_volume;
         self.color_bull = d.color_bull;

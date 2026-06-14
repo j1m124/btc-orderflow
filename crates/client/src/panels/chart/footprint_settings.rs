@@ -133,10 +133,13 @@ fn missing_body(msg: &'static str, muted: Hsla) -> impl IntoElement {
 
 fn build_footprint_form(target: WeakEntity<ContentPanel>, kind: RenderKind) -> SettingsForm {
     let form_id = SharedString::from(format!("footprint-{}", kind.as_id()));
+    // Working value is already in ticks (getter divides bucket by the tick
+    // size, setter multiplies back), so step is 1 tick and the display shows
+    // the value as-is — no second tick division.
     let bucket_field = Field::number(
         "Bucket",
-        NumberOpts::float(0.1, 100_000.0, BTCUSDT_TICK_SIZE)
-            .format(|v| SharedString::from(format!("{} ticks", (v / BTCUSDT_TICK_SIZE).round() as i64))),
+        NumberOpts::int(1, 100_000)
+            .format(|v| SharedString::from(format!("{} ticks", v.round() as i64))),
         getter_f64(target.clone(), |p| p.bucket / BTCUSDT_TICK_SIZE),
         setter(target.clone(), |p: &mut FootprintParams, v: f64| {
             let ticks = v.max(1.0).round();

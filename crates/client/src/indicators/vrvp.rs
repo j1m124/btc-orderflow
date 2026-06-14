@@ -135,6 +135,14 @@ impl IndicatorKind for VrvpParams {
                 .read(cx, |p| !matches!(p.params.render_mode, VpRenderMode::Volume))
                 .unwrap_or(false)
         };
+        // Delta scaling only affects the pure Delta mode — VolDeltaOutline
+        // forces per-row scaling internally, so the knob is meaningless there.
+        let target_for_pure_delta = target.clone();
+        let is_pure_delta_mode = move |cx: &gpui::App| -> bool {
+            target_for_pure_delta
+                .read(cx, |p| matches!(p.params.render_mode, VpRenderMode::Delta))
+                .unwrap_or(false)
+        };
         let target_for_show_poc = target.clone();
         let show_poc_pred = move |cx: &gpui::App| -> bool {
             target_for_show_poc
@@ -191,7 +199,7 @@ impl IndicatorKind for VrvpParams {
                 }
             }),
         )
-        .visible_if(is_delta_mode.clone());
+        .visible_if(is_pure_delta_mode);
 
         let width_field = Field::number(
             "Width",
@@ -244,7 +252,7 @@ impl IndicatorKind for VrvpParams {
         );
         let va_pct_field = Field::number(
             "VA %",
-            NumberOpts::int(VA_PERCENT_MIN as i64, VA_PERCENT_MAX as i64).with_step(5.0)
+            NumberOpts::int(VA_PERCENT_MIN as i64, VA_PERCENT_MAX as i64).with_step(1.0)
                 .format(|v| SharedString::from(format!("{}%", v.round() as i64))),
             target.getter(70.0, |p: &VrvpParams| p.params.va_percent as f64),
             target.setter(|p: &mut VrvpParams, v: f64| {
@@ -256,11 +264,6 @@ impl IndicatorKind for VrvpParams {
             "Show VA highlight",
             target.getter(true, |p: &VrvpParams| p.params.show_va_highlight),
             target.setter(|p: &mut VrvpParams, v: bool| p.params.show_va_highlight = v),
-        );
-        let labels_field = Field::switch(
-            "Show labels",
-            target.getter(true, |p: &VrvpParams| p.params.show_labels),
-            target.setter(|p: &mut VrvpParams, v: bool| p.params.show_labels = v),
         );
         let va_color = make_color_field("VA color", target.clone(), |p| &mut p.params.color_va, |p| p.params.color_va)
             .visible_if(show_va_pred);
@@ -290,7 +293,6 @@ impl IndicatorKind for VrvpParams {
                         .item(show_va_field)
                         .item(va_pct_field)
                         .item(show_va_hl_field)
-                        .item(labels_field)
                         .item(va_color),
                 ),
         )

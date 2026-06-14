@@ -176,11 +176,23 @@ impl IndicatorKind for BarStatParams {
             }
         }
 
-        let times: Vec<i64> = candles.iter().map(|c| c.open_time).collect();
-        let daily_max_vol = rolling_daily_max_abs(&volume, &times);
-        let daily_max_delta = rolling_daily_max_abs(&delta, &times);
-        let daily_max_long_liq = rolling_daily_max_abs(&long_liq, &times);
-        let daily_max_short_liq = rolling_daily_max_abs(&short_liq, &times);
+        // The rolling 24h maxima are only consumed by the `Daily` grade.
+        // Computing them is O(n × window) — skip entirely for the other
+        // (incl. default) grades so panning/zooming doesn't pay for series
+        // paint never reads. A grade flip triggers a recompute, so `Daily`
+        // gets them when it's actually selected.
+        let (daily_max_vol, daily_max_delta, daily_max_long_liq, daily_max_short_liq) =
+            if matches!(self.grade, BarStatGrade::Daily) {
+                let times: Vec<i64> = candles.iter().map(|c| c.open_time).collect();
+                (
+                    rolling_daily_max_abs(&volume, &times),
+                    rolling_daily_max_abs(&delta, &times),
+                    rolling_daily_max_abs(&long_liq, &times),
+                    rolling_daily_max_abs(&short_liq, &times),
+                )
+            } else {
+                (vec![None; n], vec![None; n], vec![None; n], vec![None; n])
+            };
 
         IndicatorOutput::BarStat {
             grade: self.grade,
