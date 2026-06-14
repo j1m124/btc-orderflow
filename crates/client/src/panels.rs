@@ -288,6 +288,26 @@ fn volume_unit_id(u: crate::persistence::VolumeUnit) -> &'static str {
     }
 }
 
+/// Map a USD notional to a row-tint alpha that keeps small orders faint and
+/// makes large ones pop. The trades tape and liquidations tape both tint rows
+/// by size, so sharing this keeps their grading curves identical.
+///
+/// The notional is clamped to `[$100, $5M]` and log-normalized to `[0, 1]`
+/// (≈4.7 decades), then run through a gamma ease-in (`t²`) and scaled into
+/// `[floor, ceil]`. The square curve is the point: a plain linear-over-log
+/// ramp spends too much of its alpha range on the common small prints
+/// (a $5k order ends up nearly as tinted as a $500k one), so the squaring
+/// pushes the low/mid end toward `floor` and reserves the strong tints near
+/// `ceil` for the rare whale orders the user actually wants to spot. Widening
+/// the top of the range to $5M (vs the old $1M clamp) lets multi-million
+/// prints separate from the merely-large instead of all flattening to the
+/// same ceiling.
+pub fn size_tint_alpha(usd: f64, floor: f32, ceil: f32) -> f32 {
+    // $100 → 0.0, $5M → 1.0 on a log scale.
+    let t = (((usd.max(100.0).log10() - 2.0) / 4.7) as f32).clamp(0.0, 1.0);
+    floor + t * t * (ceil - floor)
+}
+
 fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
     let PanelInfo::Panel(value) = info else {
         return None;

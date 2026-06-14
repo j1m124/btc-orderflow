@@ -359,26 +359,31 @@ pub(super) fn paint_main_chart(
         }
     }
 
-    // -- 1. horizontal grid (behind candles) -- 1px-tall quads.
-    for &y_val in &y_ticks {
-        let y = price_to_screen(y_lo, y_hi, y_val, canvas_h);
-        if y < chart_top || y > chart_bottom {
-            continue;
+    // -- 1 & 2. grid lines (behind candles), toggled by Settings → Chart.
+    // `x_ticks` / `y_ticks` are still computed unconditionally above because
+    // the axis *labels* below always render — only the grid quads are gated.
+    if crate::prefs::chart_show_grid() {
+        // -- 1. horizontal grid (behind candles) -- 1px-tall quads.
+        for &y_val in &y_ticks {
+            let y = price_to_screen(y_lo, y_hi, y_val, canvas_h);
+            if y < chart_top || y > chart_bottom {
+                continue;
+            }
+            fill_rect(window, origin, 0.0, chart_w, y, 1.0, colors.grid);
         }
-        fill_rect(window, origin, 0.0, chart_w, y, 1.0, colors.grid);
-    }
 
-    // -- 2. vertical grid (at each time label) -- 1px-wide quads.
-    for &(x, _) in &x_ticks {
-        fill_rect(
-            window,
-            origin,
-            x,
-            1.0,
-            chart_top,
-            (chart_bottom - chart_top).max(0.0),
-            colors.grid,
-        );
+        // -- 2. vertical grid (at each time label) -- 1px-wide quads.
+        for &(x, _) in &x_ticks {
+            fill_rect(
+                window,
+                origin,
+                x,
+                1.0,
+                chart_top,
+                (chart_bottom - chart_top).max(0.0),
+                colors.grid,
+            );
+        }
     }
 
     // -- 3. main render layer --
@@ -2715,13 +2720,15 @@ pub(super) fn paint_sub_pane(
         }
     }
 
-    // -- horizontal grid (1px quads) --
-    for &y_val in &y_ticks {
-        let y = band_y(y_lo, y_hi, y_val, chart_top, chart_bottom);
-        if y < chart_top || y > chart_bottom {
-            continue;
+    // -- horizontal grid (1px quads) -- toggled by Settings → Chart.
+    if crate::prefs::chart_show_grid() {
+        for &y_val in &y_ticks {
+            let y = band_y(y_lo, y_hi, y_val, chart_top, chart_bottom);
+            if y < chart_top || y > chart_bottom {
+                continue;
+            }
+            fill_rect(window, origin, 0.0, chart_w, y, 1.0, grid);
         }
-        fill_rect(window, origin, 0.0, chart_w, y, 1.0, grid);
     }
 
     // -- the indicator's series --

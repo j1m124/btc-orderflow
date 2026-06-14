@@ -14,12 +14,14 @@ static DEFAULT_VIEW: AtomicU32 = AtomicU32::new(0x42700000); // 60.0_f32.to_bits
 static RIGHT_BUFFER: AtomicU32 = AtomicU32::new(0x3ECCCCCD); // 0.40_f32.to_bits()
 static Y_PADDING: AtomicU32 = AtomicU32::new(0x3D4CCCCD); // 0.05_f32.to_bits()
 static TRUNCATE_FOOTPRINT_DECIMALS: AtomicBool = AtomicBool::new(false);
+static SHOW_GRID: AtomicBool = AtomicBool::new(true);
 
 fn store_atomic_chart_prefs(p: &ChartPrefs) {
     DEFAULT_VIEW.store(p.default_view.to_bits(), Ordering::Relaxed);
     RIGHT_BUFFER.store(p.right_buffer.to_bits(), Ordering::Relaxed);
     Y_PADDING.store(p.y_padding.to_bits(), Ordering::Relaxed);
     TRUNCATE_FOOTPRINT_DECIMALS.store(p.truncate_footprint_decimals, Ordering::Relaxed);
+    SHOW_GRID.store(p.show_grid, Ordering::Relaxed);
 }
 
 pub fn chart_default_view() -> f32 {
@@ -42,6 +44,12 @@ pub fn chart_y_padding() -> f32 {
 /// blobs even though the scope is broader.
 pub fn footprint_truncate_decimals() -> bool {
     TRUNCATE_FOOTPRINT_DECIMALS.load(Ordering::Relaxed)
+}
+
+/// When true, the chart and indicator sub-panes paint grid lines. Read on the
+/// paint path, so it's a lock-free atomic mirror of `ChartPrefs::show_grid`.
+pub fn chart_show_grid() -> bool {
+    SHOW_GRID.load(Ordering::Relaxed)
 }
 
 #[derive(Clone, Default)]

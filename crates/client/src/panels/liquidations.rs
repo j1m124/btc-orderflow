@@ -9,7 +9,7 @@
 //! bullish). The flip from Binance's raw forced-order side happens server-
 //! side at ingest — see crates/server/src/binance/parse.rs.
 
-use chrono::{DateTime, Local};
+use chrono::FixedOffset;
 use gpui::{
     Action, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
     ParentElement as _, SharedString, Styled as _, Window, div, px,
@@ -174,6 +174,11 @@ pub fn render(
     let border = theme.border;
     let fg = theme.foreground;
 
+    // Tape timestamps honor the Settings → Timezone preference. Every visible
+    // row is within seconds of now, so one resolved offset is exact for the
+    // whole tape (DST can't flip across the window).
+    let tz_offset = crate::prefs::offset_for(cx, chrono::Utc::now().timestamp_millis());
+
     let size_header_label = match size_mode {
         LiquidationsSizeMode::Coin => "Size",
         LiquidationsSizeMode::Usd => "Size ($)",
@@ -253,18 +258,16 @@ pub fn render(
                 LiquidationSide::Long => bearish,
                 LiquidationSide::Short => bullish,
             };
-            // Liquidations are punchy events — start the row tint at a
-            // higher floor than the trade tape (0.10 vs 0.04) and scale up
-            // by USD notional the same way. Long/short colors stay distinct
-            // even at the floor so the side is glanceable.
-            let usd = l.quote_qty.max(100.0);
-            let lg = (usd.log10() - 2.0).clamp(0.0, 4.0) as f32;
-            let row_alpha = 0.10 + (lg / 4.0) * 0.55;
+            // Liquidations are punchy events — higher floor and ceiling than
+            // the trade tape (0.08→0.82 vs 0.03→0.70) so even small liqs read
+            // and big ones really pop. Same squared size curve. Long/short
+            // colors stay distinct even at the floor so the side is glanceable.
+            let row_alpha = super::size_tint_alpha(l.quote_qty, 0.08, 0.82);
             let row_bg = gpui::Hsla {
                 a: row_alpha,
                 ..tint_color
             };
-            let time_str = format_time(l.ts_ms);
+            let time_str = format_time(l.ts_ms, tz_offset);
             let side_label = match l.side {
                 LiquidationSide::Long => "LONG",
                 LiquidationSide::Short => "SHORT",
@@ -378,10 +381,13 @@ fn side_filter_dropdown(
         })
 }
 
-fn format_time(ts_ms: i64) -> String {
-    DateTime::<Local>::from(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ts_ms as u64))
-        .format("%H:%M:%S")
-        .to_string()
+fn format_time(ts_ms: i64, offset: FixedOffset) -> String {
+    use chrono::TimeZone as _;
+    offset
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_default()
 }
 
 fn format_usd(usd: f64) -> String {

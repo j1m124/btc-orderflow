@@ -267,6 +267,7 @@ fn render_general(
         .child(candles_row(cx))
         .child(right_buffer_row(cx))
         .child(y_padding_row(cx))
+        .child(show_grid_row(cx))
         .child(truncate_footprint_decimals_row(cx))
         .child(div().px_4().child(Separator::horizontal()))
         .child(reset_all_row(cx))
@@ -493,8 +494,14 @@ fn timezone_row(
 /// One row inside the timezone-picker popover. Plain stateful div instead of
 /// `Button` so the label sits left-aligned (Button hardcodes
 /// `justify_center` at button.rs:475). Hover background is applied directly
-/// via `.hover(...)`. Clicking dispatches `SetTimezone` and emits
-/// `DismissEvent` to close the popover.
+/// via `.hover(...)`. Clicking applies the timezone and emits `DismissEvent`
+/// to close the popover.
+///
+/// The settings view opens as a `window.open_dialog` overlay, so it lives in
+/// its own element tree — a dispatched `SetTimezone` action wouldn't propagate
+/// up to the workspace's `on_action` handlers. We therefore apply the choice
+/// directly (and `window.refresh()` so the chart x-axis + bottom-bar clock
+/// repaint immediately, mirroring `reset_all_settings`).
 fn tz_picker_row(
     cx: &mut Context<gpui_component::popover::PopoverState>,
     id: impl Into<gpui::ElementId>,
@@ -515,7 +522,8 @@ fn tz_picker_row(
         .hover(move |s| s.bg(hover_bg))
         .child(label.into())
         .on_click(cx.listener(move |_, _, window, cx| {
-            window.dispatch_action(Box::new(SetTimezone(iana.clone())), cx);
+            apply_timezone(cx, iana.clone());
+            window.refresh();
             cx.emit(DismissEvent);
         }))
 }
@@ -644,6 +652,24 @@ fn truncate_footprint_decimals_row(cx: &mut Context<SettingsView>) -> impl IntoE
             .on_click(|checked, _window, cx| {
                 let next = *checked;
                 adjust_chart(cx, |p| p.truncate_footprint_decimals = next);
+            }),
+    )
+}
+
+fn show_grid_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
+    let enabled = cx.global::<ChartPrefsGlobal>().0.show_grid;
+    setting_row(
+        "Grid lines",
+        "Show the price/time grid behind candles and the horizontal grid in indicator panes.",
+        Switch::new("show-grid-toggle")
+            .checked(enabled)
+            .label(if enabled { "On" } else { "Off" })
+            .on_click(|checked, window, cx| {
+                let next = *checked;
+                adjust_chart(cx, |p| p.show_grid = next);
+                // Repaint immediately so the grid appears/disappears even in a
+                // quiet market where the chart isn't otherwise re-rendering.
+                window.refresh();
             }),
     )
 }
@@ -976,15 +1002,13 @@ fn render_keymap(cx: &mut Context<SettingsView>) -> impl IntoElement {
 }
 
 // ---------------------------------------------------------------------------
-// Actions — dispatched by the Timezone dropdown. Workspace handles them.
+// Timezone application
 // ---------------------------------------------------------------------------
 
-#[derive(gpui::Action, Clone, PartialEq, Eq, serde::Deserialize)]
-#[action(namespace = client, no_json)]
-pub struct SetTimezone(pub Option<SharedString>);
-
 /// Apply a timezone choice. `None` ≡ Auto; `Some("UTC"|...)` parses via
-/// `chrono_tz`. Called from the workspace's action handler.
+/// `chrono_tz`. Called directly from the timezone-picker rows — the settings
+/// dialog is an overlay window so an action dispatch wouldn't reach a
+/// workspace handler.
 pub fn apply_timezone(cx: &mut gpui::App, iana: Option<SharedString>) {
     let parsed: Option<Tz> = iana.as_deref().and_then(|s| s.parse().ok());
     prefs::set_tz(cx, parsed);

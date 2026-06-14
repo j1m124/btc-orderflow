@@ -318,6 +318,17 @@ pub struct ChartPrefs {
     /// and indicator readouts ignore this flag.
     #[serde(default)]
     pub truncate_footprint_decimals: bool,
+    /// When true, the chart paints horizontal (price) and vertical (time)
+    /// grid lines behind the candles, plus the horizontal grid in indicator
+    /// sub-panes. Default on. Uses a `true`-preserving serde default so
+    /// blobs persisted before this field existed keep the grid rather than
+    /// silently losing it.
+    #[serde(default = "default_true")]
+    pub show_grid: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ChartPrefs {
@@ -327,6 +338,7 @@ impl Default for ChartPrefs {
             right_buffer: 0.40,
             y_padding: 0.05,
             truncate_footprint_decimals: false,
+            show_grid: true,
         }
     }
 }

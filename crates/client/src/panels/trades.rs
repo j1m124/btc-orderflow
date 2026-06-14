@@ -9,7 +9,7 @@
 //! roll off the underlying service ring. Threshold is a free-form numeric
 //! input in the header; empty / `0` → no filter.
 
-use chrono::{DateTime, Local};
+use chrono::FixedOffset;
 use gpui::{
     Action, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, Styled as _, Window, div, px,
@@ -114,6 +114,11 @@ pub fn render(
     let border = theme.border;
     let fg = theme.foreground;
 
+    // Tape timestamps honor the Settings → Timezone preference. Every visible
+    // print is within seconds of now, so one resolved offset is exact for the
+    // whole tape (DST can't flip across the window).
+    let tz_offset = crate::prefs::offset_for(cx, chrono::Utc::now().timestamp_millis());
+
     let size_header_label = match size_mode {
         TradesSizeMode::Coin => "Size",
         TradesSizeMode::Usd => "Size ($)",
@@ -182,13 +187,14 @@ pub fn render(
         let is_buy = !t.is_buyer_maker;
         let tint_color = if is_buy { bullish } else { bearish };
         let usd = t.price * t.qty;
-        let lg = (usd.max(100.0).log10() - 2.0).clamp(0.0, 4.0) as f32;
-        let row_alpha = 0.04 + (lg / 4.0) * 0.51;
+        // Faint floor for the common small prints; squared size curve keeps
+        // the bulk of the tape quiet and lets the rare large prints stand out.
+        let row_alpha = super::size_tint_alpha(usd, 0.03, 0.70);
         let row_bg = gpui::Hsla {
             a: row_alpha,
             ..tint_color
         };
-        let time_str = format_time(t.ts_ms);
+        let time_str = format_time(t.ts_ms, tz_offset);
         let price_str = format!("{:.1}", t.price);
         let size_str = match size_mode {
             TradesSizeMode::Coin => format_qty(t.qty),
@@ -266,10 +272,13 @@ fn size_mode_dropdown(current: TradesSizeMode, focus: FocusHandle) -> impl IntoE
         })
 }
 
-fn format_time(ts_ms: i64) -> String {
-    DateTime::<Local>::from(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ts_ms as u64))
-        .format("%H:%M:%S%.3f")
-        .to_string()
+fn format_time(ts_ms: i64, offset: FixedOffset) -> String {
+    use chrono::TimeZone as _;
+    offset
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .map(|dt| dt.format("%H:%M:%S%.3f").to_string())
+        .unwrap_or_default()
 }
 
 /// Adaptive USD notation: large notionals use compact `M`/`k` suffixes so a
