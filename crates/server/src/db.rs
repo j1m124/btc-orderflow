@@ -474,30 +474,41 @@ pub async fn fetch_footprint_snapshot(
     bars: i64,
 ) -> Result<(Vec<FootprintCell>, Option<i64>)> {
     let interval = footprint_bucket_interval(tf);
+
+    // Bound the scan to the window covering the most recent `bars` buckets:
+    // [aligned_now - (bars-1)*width, +inf). A direct `ts >=` range lets
+    // TimescaleDB do chunk exclusion + use the PK index (symbol, ts, agg_id),
+    // instead of scanning every trade for the symbol and computing
+    // time_bucket() on each row (the old self-join CTE did exactly that, with
+    // no time bound — O(48h of trades) per snapshot). `time_bucket` is
+    // epoch-aligned for all our widths, so flooring `now` by the width hits the
+    // same boundaries the bucket aggregation produces.
+    let width_ms = tf.duration_ms().max(1);
+    let now_ms = Utc::now().timestamp_millis();
+    let lower_ms = (now_ms - now_ms.rem_euclid(width_ms)) - (bars - 1).max(0) * width_ms;
+    let lower = Utc
+        .timestamp_millis_opt(lower_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
     let sql = format!(
-        "WITH recent_bars AS ( \
-            SELECT DISTINCT time_bucket(INTERVAL '{interval}', ts) AS bar \
-            FROM trades WHERE symbol = $1 \
-            ORDER BY bar DESC LIMIT $2 \
-        ) \
-        SELECT \
-            rb.bar AS open_time, \
-            floor(t.price / $3) * $3 AS price_bucket_low, \
-            coalesce(sum(t.qty) FILTER (WHERE t.is_buyer_maker), 0.0) AS bid_vol, \
-            coalesce(sum(t.qty) FILTER (WHERE NOT t.is_buyer_maker), 0.0) AS ask_vol, \
-            (SELECT max(agg_id) FROM trades WHERE symbol = $1) AS snapshot_max_agg_id \
-        FROM trades t \
-        JOIN recent_bars rb \
-          ON time_bucket(INTERVAL '{interval}', t.ts) = rb.bar \
-        WHERE t.symbol = $1 \
-        GROUP BY rb.bar, price_bucket_low \
-        ORDER BY rb.bar ASC, price_bucket_low ASC",
+        "SELECT \
+            time_bucket(INTERVAL '{interval}', ts) AS open_time, \
+            floor(price / $2) * $2 AS price_bucket_low, \
+            coalesce(sum(qty) FILTER (WHERE is_buyer_maker), 0.0) AS bid_vol, \
+            coalesce(sum(qty) FILTER (WHERE NOT is_buyer_maker), 0.0) AS ask_vol, \
+            (SELECT max(agg_id) FROM trades WHERE symbol = $1 AND ts >= $3) \
+                AS snapshot_max_agg_id \
+        FROM trades \
+        WHERE symbol = $1 AND ts >= $3 \
+        GROUP BY open_time, price_bucket_low \
+        ORDER BY open_time ASC, price_bucket_low ASC",
     );
 
     let rows = sqlx::query(&sql)
         .bind(symbol)
-        .bind(bars)
         .bind(price_bucket)
+        .bind(lower)
         .fetch_all(pool)
         .await?;
 
@@ -530,36 +541,43 @@ pub async fn fetch_footprint_history_page(
     bars: i64,
 ) -> Result<Vec<FootprintCell>> {
     let interval = footprint_bucket_interval(tf);
+
+    // `before_open_time_ms` is a bucket boundary (an open_time the client
+    // already holds), so the `bars` buckets immediately before it occupy
+    // exactly [before - bars*width, before). Bounding `ts` to that window
+    // (both ends direct comparisons on the partitioning column) lets Timescale
+    // prune chunks and ride the PK index, instead of the old self-join CTE that
+    // scanned every trade for the symbol and bucketed each row. For BTC perp's
+    // continuous tape this returns the same `bars` populated buckets the old
+    // DISTINCT-LIMIT did; they only diverge across an ingest gap, where a
+    // fixed-time-window page is the more natural "scroll back" unit anyway.
+    let width_ms = tf.duration_ms().max(1);
+    let lower_ms = before_open_time_ms - bars.max(0) * width_ms;
     let before = Utc
         .timestamp_millis_opt(before_open_time_ms)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+    let lower = Utc
+        .timestamp_millis_opt(lower_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
 
     let sql = format!(
-        "WITH recent_bars AS ( \
-            SELECT DISTINCT time_bucket(INTERVAL '{interval}', ts) AS bar \
-            FROM trades \
-            WHERE symbol = $1 \
-              AND time_bucket(INTERVAL '{interval}', ts) < $2 \
-            ORDER BY bar DESC LIMIT $3 \
-        ) \
-        SELECT \
-            rb.bar AS open_time, \
-            floor(t.price / $4) * $4 AS price_bucket_low, \
-            coalesce(sum(t.qty) FILTER (WHERE t.is_buyer_maker), 0.0) AS bid_vol, \
-            coalesce(sum(t.qty) FILTER (WHERE NOT t.is_buyer_maker), 0.0) AS ask_vol \
-        FROM trades t \
-        JOIN recent_bars rb \
-          ON time_bucket(INTERVAL '{interval}', t.ts) = rb.bar \
-        WHERE t.symbol = $1 \
-        GROUP BY rb.bar, price_bucket_low \
-        ORDER BY rb.bar ASC, price_bucket_low ASC",
+        "SELECT \
+            time_bucket(INTERVAL '{interval}', ts) AS open_time, \
+            floor(price / $4) * $4 AS price_bucket_low, \
+            coalesce(sum(qty) FILTER (WHERE is_buyer_maker), 0.0) AS bid_vol, \
+            coalesce(sum(qty) FILTER (WHERE NOT is_buyer_maker), 0.0) AS ask_vol \
+        FROM trades \
+        WHERE symbol = $1 AND ts >= $2 AND ts < $3 \
+        GROUP BY open_time, price_bucket_low \
+        ORDER BY open_time ASC, price_bucket_low ASC",
     );
 
     let rows = sqlx::query(&sql)
         .bind(symbol)
+        .bind(lower)
         .bind(before)
-        .bind(bars)
         .bind(price_bucket)
         .fetch_all(pool)
         .await?;
