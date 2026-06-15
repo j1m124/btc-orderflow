@@ -47,8 +47,8 @@ pub enum IndicatorOutput {
 
     /// Per-bar statistic rows stacked vertically inside one cell per bar.
     /// Up to five rows: total volume, signed delta, long-liq total,
-    /// short-liq total, and an OI-delta placeholder (rendered as an empty
-    /// row pending future wiring). Volume cell paints with a fixed blue
+    /// short-liq total, and per-bar OI delta (signed, bull/bear tinted like
+    /// the delta row). Volume cell paints with a fixed blue
     /// base tint; delta cell paints bull/bear based on the sign of the
     /// delta itself; liq rows paint bearish (long-liq) / bullish
     /// (short-liq) full intensity. `daily_max_*` are per-bar rolling 24h
@@ -69,10 +69,14 @@ pub enum IndicatorOutput {
         delta: Series,
         long_liq: Series,
         short_liq: Series,
+        /// Per-bar open-interest change (close − open within the bar), in the
+        /// chart's active unit. `None` for bars with no OI sample.
+        oi_delta: Series,
         daily_max_vol: Series,
         daily_max_delta: Series,
         daily_max_long_liq: Series,
         daily_max_short_liq: Series,
+        daily_max_oi_delta: Series,
     },
 
     /// Visible-range volume profile: aggregated bid/ask per price bucket
@@ -111,6 +115,21 @@ pub enum IndicatorOutput {
         /// the ctx threaded through it.
         unit: crate::persistence::VolumeUnit,
     },
+
+    /// Per-bar open-interest OHLC aligned to candle index. Series are in
+    /// contracts; `price[i]` is the bar's candle close so paint can derive
+    /// USD (`OI × price`) when the chart's unit is USD. `None` slots are bars
+    /// with no OI sample. Paint reads `params.render` (Line vs Candles) and
+    /// the `unit` to pick axis units, draw direction-colored, and y-fit.
+    OpenInterest {
+        open: Series,
+        high: Series,
+        low: Series,
+        close: Series,
+        price: Series,
+        params: crate::indicators::OpenInterestParams,
+        unit: crate::persistence::VolumeUnit,
+    },
 }
 
 impl IndicatorOutput {
@@ -127,6 +146,7 @@ impl IndicatorOutput {
             // (e.g., the VP paint arm) don't go through `len()`.
             IndicatorOutput::VolumeProfile { .. } => 0,
             IndicatorOutput::LiquidationBars { long_qty, .. } => long_qty.len(),
+            IndicatorOutput::OpenInterest { close, .. } => close.len(),
         }
     }
 

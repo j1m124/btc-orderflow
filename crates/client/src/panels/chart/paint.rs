@@ -2444,9 +2444,11 @@ pub(super) fn paint_overlay_indicators(
             }
             IndicatorOutput::Macd { .. }
             | IndicatorOutput::BarStat { .. }
-            | IndicatorOutput::LiquidationBars { .. } => {
-                // MACD, BarStat, and LiquidationBars are pane-only; ignore
-                // here. Pane render routes them to `paint_sub_pane`.
+            | IndicatorOutput::LiquidationBars { .. }
+            | IndicatorOutput::OpenInterest { .. } => {
+                // MACD, BarStat, LiquidationBars, and OpenInterest are
+                // pane-only; ignore here. Pane render routes them to
+                // `paint_sub_pane`.
             }
             IndicatorOutput::VolumeProfile { output, params } => {
                 // VP renders inside the same price band as the candles
@@ -2642,10 +2644,12 @@ pub(super) fn paint_sub_pane(
         delta,
         long_liq,
         short_liq,
+        oi_delta,
         daily_max_vol,
         daily_max_delta,
         daily_max_long_liq,
         daily_max_short_liq,
+        daily_max_oi_delta,
     } = &item.output
     {
         let slot_w = (chart_w / view_size.max(1.0)).max(0.5);
@@ -2672,10 +2676,12 @@ pub(super) fn paint_sub_pane(
             delta,
             long_liq,
             short_liq,
+            oi_delta,
             daily_max_vol,
             daily_max_delta,
             daily_max_long_liq,
             daily_max_short_liq,
+            daily_max_oi_delta,
             bullish,
             bearish,
             cell_text_color,
@@ -2938,6 +2944,101 @@ pub(super) fn paint_sub_pane(
                 );
             }
         }
+        IndicatorOutput::OpenInterest {
+            open,
+            high,
+            low,
+            close,
+            price,
+            params,
+            unit,
+        } => {
+            use crate::indicators::OiRenderMode;
+            // Contracts → active unit (USD = OI × candle close, precomputed
+            // per bar in `price`).
+            let conv = |raw: f64, i: usize| match unit {
+                crate::persistence::VolumeUnit::Coin => raw,
+                crate::persistence::VolumeUnit::Usd => {
+                    raw * price.get(i).copied().flatten().unwrap_or(0.0)
+                }
+            };
+            let up_color = params.up_color.unwrap_or(Hsla { a: 1.0, ..bullish });
+            let down_color = params.down_color.unwrap_or(Hsla { a: 1.0, ..bearish });
+            match params.render {
+                OiRenderMode::Line => {
+                    // Direction-colored close line: each segment is green when
+                    // OI rose vs the previous point, red when it fell. Two
+                    // accumulated paths → 2 paint calls regardless of bar count.
+                    let mut up_pb = PathBuilder::stroke(px(1.5));
+                    let mut down_pb = PathBuilder::stroke(px(1.5));
+                    let mut prev: Option<(f32, f32, f64)> = None;
+                    let lo = start_idx;
+                    let hi = visible_end.min(close.len());
+                    for i in lo..hi {
+                        let Some(c) = close[i] else {
+                            prev = None;
+                            continue;
+                        };
+                        let v = conv(c, i);
+                        let x = index_to_screen(
+                            view_start, view_size, i as f32, canvas_w, y_axis_gap,
+                        );
+                        let y = band_y(y_lo, y_hi, v, chart_top, chart_bottom);
+                        let p = point(px(x) + origin.x, px(y) + origin.y);
+                        if let Some((px0, py0, v0)) = prev {
+                            let pb = if v >= v0 { &mut up_pb } else { &mut down_pb };
+                            pb.move_to(point(px(px0) + origin.x, px(py0) + origin.y));
+                            pb.line_to(p);
+                        }
+                        prev = Some((x, y, v));
+                    }
+                    if let Ok(path) = up_pb.build() {
+                        window.paint_path(path, up_color);
+                    }
+                    if let Ok(path) = down_pb.build() {
+                        window.paint_path(path, down_color);
+                    }
+                }
+                OiRenderMode::Candles => {
+                    for i in start_idx..visible_end.min(close.len()) {
+                        let (Some(o), Some(h), Some(l), Some(c)) =
+                            (open[i], high[i], low[i], close[i])
+                        else {
+                            continue;
+                        };
+                        let cx_px = index_to_screen(
+                            view_start, view_size, i as f32, canvas_w, y_axis_gap,
+                        );
+                        if cx_px < -bar_w || cx_px > chart_w + bar_w {
+                            continue;
+                        }
+                        let (ov, hv, lv, cv) =
+                            (conv(o, i), conv(h, i), conv(l, i), conv(c, i));
+                        let color = if cv >= ov { up_color } else { down_color };
+                        let high_y = band_y(y_lo, y_hi, hv, chart_top, chart_bottom);
+                        let low_y = band_y(y_lo, y_hi, lv, chart_top, chart_bottom);
+                        let open_y = band_y(y_lo, y_hi, ov, chart_top, chart_bottom);
+                        let close_y = band_y(y_lo, y_hi, cv, chart_top, chart_bottom);
+                        // Wick.
+                        let wick_top = high_y.min(low_y);
+                        let wick_h = (high_y - low_y).abs().max(1.0);
+                        fill_rect(window, origin, cx_px - 0.5, 1.0, wick_top, wick_h, color);
+                        // Body.
+                        let body_top = open_y.min(close_y);
+                        let body_h = (open_y - close_y).abs().max(1.0);
+                        fill_rect(
+                            window,
+                            origin,
+                            cx_px - bar_w * 0.5,
+                            bar_w,
+                            body_top,
+                            body_h,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
         IndicatorOutput::Bands { .. }
         | IndicatorOutput::Lines(_)
         | IndicatorOutput::BarStat { .. }
@@ -3074,8 +3175,8 @@ struct BarStatShow {
 }
 
 /// One row of the BarStat pane. `signed` = use bull/bear tint by data
-/// sign (delta only); otherwise the row uses its fixed `base` color.
-/// `daily_max` is `None` for the placeholder OI-delta row (no data).
+/// sign (delta + OI Δ); otherwise the row uses its fixed `base` color.
+/// `daily_max` carries the per-bar rolling-24h maxima for the Daily grade.
 /// `header` is a short row tag painted in the right-edge gutter so the
 /// user can identify which row is which without remembering the order.
 struct BarStatRow<'a> {
@@ -3109,10 +3210,12 @@ fn paint_bar_stat_pane(
     delta: &[Option<f64>],
     long_liq: &[Option<f64>],
     short_liq: &[Option<f64>],
+    oi_delta: &[Option<f64>],
     daily_max_vol: &[Option<f64>],
     daily_max_delta: &[Option<f64>],
     daily_max_long_liq: &[Option<f64>],
     daily_max_short_liq: &[Option<f64>],
+    daily_max_oi_delta: &[Option<f64>],
     bullish: Hsla,
     bearish: Hsla,
     text_color: Hsla,
@@ -3130,9 +3233,7 @@ fn paint_bar_stat_pane(
     let volume_base = gpui::hsla(0.61, 0.80, 0.55, 1.0);
 
     // Assemble the row list in fixed display order, skipping any row
-    // whose show-flag is off. Placeholder OI-delta row is built from an
-    // empty values slice so the row slot is allocated but no cell paints.
-    const EMPTY_F64: &[Option<f64>] = &[];
+    // whose show-flag is off.
     let mut rows: Vec<BarStatRow<'_>> = Vec::with_capacity(5);
     if show.volume {
         rows.push(BarStatRow {
@@ -3176,11 +3277,11 @@ fn paint_bar_stat_pane(
     }
     if show.oi_delta {
         rows.push(BarStatRow {
-            values: EMPTY_F64,
-            daily_max: None,
-            base: volume_base,
-            signed: false,
-            formatter: format_compact,
+            values: oi_delta,
+            daily_max: Some(daily_max_oi_delta),
+            base: bullish, // overridden per cell when `signed`
+            signed: true,
+            formatter: format_signed_compact,
             header: "OI Δ",
         });
     }

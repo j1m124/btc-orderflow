@@ -189,6 +189,17 @@ pub enum Channel {
     /// `time_bucket`. Snapshot returns the most-recent-N bars; pagination
     /// via `HistoryPage`.
     LiquidationBars { tf: Timeframe },
+    /// Per-bar open-interest OHLC: the open/high/low/close of the symbol's
+    /// total open interest (in contracts / base asset) within each bar at
+    /// the subscription's tf, computed server-side from raw OI samples via
+    /// `time_bucket` (`first`/`max`/`min`/`last`). Snapshot returns the
+    /// most-recent-N bars; pagination via `HistoryPage`.
+    ///
+    /// USD notional is NOT shipped — Binance's live `/fapi/v1/openInterest`
+    /// endpoint returns contracts only. The client multiplies by the candle
+    /// close to render the USD axis (approximate vs Binance's mark-price
+    /// figure, but consistent with how the chart's Coin/USD toggle works).
+    OpenInterest { tf: Timeframe },
 }
 
 // --- Trade payload ----------------------------------------------------------
@@ -275,6 +286,31 @@ pub struct LiquidationBar {
     pub long_quote_qty: f64,
     pub short_qty: f64,
     pub short_quote_qty: f64,
+}
+
+// --- Open interest payload --------------------------------------------------
+
+/// One per-bar open-interest cell: the OHLC of the symbol's total open
+/// interest within the bar at `open_time` for the subscription's tf. Values
+/// are in **contracts** (base asset, e.g. BTC) — `open` is the first OI
+/// sample in the bucket, `close` the last, `high`/`low` the extremes.
+///
+/// Computed server-side from raw OI samples via `time_bucket`. Only populated
+/// buckets ship a row — unlike [`LiquidationBar`], OI is never zero, so a
+/// missing bucket means "no sample in that window", not "OI = 0"; the server
+/// emits no zero-fill rows and the client connects the points it receives.
+///
+/// USD notional is not shipped (the live Binance OI endpoint has no USD
+/// figure). The client derives USD = `close * candle.close` per bar for the
+/// chart's Coin/USD unit toggle — approximate vs Binance's mark-price
+/// `sumOpenInterestValue`, but consistent across the terminal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenInterestBar {
+    pub open_time: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
 }
 
 // --- Book payload -----------------------------------------------------------
@@ -464,6 +500,29 @@ pub enum ServerFrame {
     LiquidationBarHistoryPage {
         id: SubId,
         bars: Vec<LiquidationBar>,
+    },
+
+    // --- OpenInterest channel (per-bar OHLC) ---
+    /// Initial open-interest bars: OHLC cells for the most recent N bars at
+    /// the subscription's tf. One row per populated bucket (no zero-fill —
+    /// OI is never zero, so a missing bucket means "no sample").
+    OpenInterestSnapshot {
+        id: SubId,
+        bars: Vec<OpenInterestBar>,
+        server_v: u64,
+    },
+    /// Incremental per-bar OI updates as new samples land in the active bar.
+    /// Bars share `open_time` keys with the snapshot; clients overwrite.
+    OpenInterestUpdate {
+        id: SubId,
+        bars: Vec<OpenInterestBar>,
+        v: u64,
+    },
+    /// Reply to a `HistoryPage` request on an open-interest subscription.
+    /// Chronological (oldest first), strictly older than the cursor.
+    OpenInterestHistoryPage {
+        id: SubId,
+        bars: Vec<OpenInterestBar>,
     },
 
     // --- Cross-channel control frames ---
@@ -693,6 +752,50 @@ mod tests {
         assert_eq!(back.ts_ms, l.ts_ms);
         assert_eq!(back.side, LiquidationSide::Short);
         assert!((back.price - l.price).abs() < 1e-9);
+    }
+
+    #[test]
+    fn channel_open_interest_with_tf() {
+        let s = serde_json::to_string(&Channel::OpenInterest {
+            tf: Timeframe::M5,
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"open_interest\""));
+        assert!(s.contains("\"tf\":\"5m\""));
+    }
+
+    #[test]
+    fn open_interest_snapshot_frame_shape() {
+        let f = ServerFrame::OpenInterestSnapshot {
+            id: SubId(13),
+            bars: vec![OpenInterestBar {
+                open_time: 1_700_000_000_000,
+                open: 84_000.0,
+                high: 84_300.0,
+                low: 83_950.0,
+                close: 84_210.0,
+            }],
+            server_v: 0,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"type\":\"open_interest_snapshot\""));
+        assert!(s.contains("\"close\":84210.0"));
+    }
+
+    #[test]
+    fn open_interest_bar_roundtrip() {
+        let b = OpenInterestBar {
+            open_time: 1_700_000_001_234,
+            open: 84_000.5,
+            high: 84_300.25,
+            low: 83_950.75,
+            close: 84_210.0,
+        };
+        let s = serde_json::to_string(&b).unwrap();
+        let back: OpenInterestBar = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.open_time, b.open_time);
+        assert!((back.high - b.high).abs() < 1e-9);
+        assert!((back.low - b.low).abs() < 1e-9);
     }
 
     #[test]

@@ -23,6 +23,10 @@ pub const KLINES_PAGE_LIMIT: u32 = 1500;
 /// Max trades per `/fapi/v1/aggTrades` REST page (Binance hard limit).
 pub const AGGTRADES_PAGE_LIMIT: u32 = 1000;
 
+/// Max rows per `/futures/data/openInterestHist` REST page (Binance hard
+/// limit). Only the last 30 days are available regardless of `startTime`.
+pub const OPEN_INTEREST_HIST_PAGE_LIMIT: u32 = 500;
+
 /// Bundle of typed broadcast senders threaded into the ingest path. The
 /// connection loop fans inbound events (kline, aggTrade, depth) into the
 /// right channel so each consumer task — DB writers, sub-second aggregator,
@@ -33,4 +37,5 @@ pub struct BroadcastTxs {
     pub trade: tokio::sync::broadcast::Sender<parse::TradeTick>,
     pub depth: tokio::sync::broadcast::Sender<parse::DepthDiff>,
     pub liquidation: tokio::sync::broadcast::Sender<parse::LiquidationTick>,
+    pub open_interest: tokio::sync::broadcast::Sender<parse::OpenInterestTick>,
 }

@@ -25,6 +25,7 @@ use super::field::{DropdownOption, Field};
 pub struct AfterChange {
     pub refresh_footprint: bool,
     pub refresh_liq_bars: bool,
+    pub refresh_oi_bars: bool,
 }
 
 impl AfterChange {
@@ -32,6 +33,7 @@ impl AfterChange {
         Self {
             refresh_footprint: false,
             refresh_liq_bars: false,
+            refresh_oi_bars: false,
         }
     }
 
@@ -39,6 +41,7 @@ impl AfterChange {
         Self {
             refresh_footprint: true,
             refresh_liq_bars: false,
+            refresh_oi_bars: false,
         }
     }
 
@@ -46,6 +49,25 @@ impl AfterChange {
         Self {
             refresh_footprint: false,
             refresh_liq_bars: true,
+            refresh_oi_bars: false,
+        }
+    }
+
+    pub const fn oi_bars() -> Self {
+        Self {
+            refresh_footprint: false,
+            refresh_liq_bars: false,
+            refresh_oi_bars: true,
+        }
+    }
+
+    /// Bar Stats toggles both liquidation rows and the OI-Δ row, each of
+    /// which gates a different shared subscription — refresh both.
+    pub const fn liq_and_oi_bars() -> Self {
+        Self {
+            refresh_footprint: false,
+            refresh_liq_bars: true,
+            refresh_oi_bars: true,
         }
     }
 }
@@ -138,6 +160,9 @@ where
             }
             if after.refresh_liq_bars {
                 p.refresh_chart_liq_bars_sub(cx);
+            }
+            if after.refresh_oi_bars {
+                p.refresh_chart_oi_bars_sub(cx);
             }
             cx.notify();
             crate::panels::request_layout_save(cx);

@@ -28,7 +28,7 @@ use tokio::sync::broadcast;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
-use crate::binance::parse::{DepthDiff, LiquidationTick, Tick, TradeTick};
+use crate::binance::parse::{DepthDiff, LiquidationTick, OpenInterestTick, Tick, TradeTick};
 use crate::ingest::BookState;
 
 /// Shared state passed to each per-connection axum handler. The kline
@@ -42,6 +42,7 @@ pub struct GatewayState {
     pub trade_tx: broadcast::Sender<TradeTick>,
     pub depth_tx: broadcast::Sender<DepthDiff>,
     pub liquidation_tx: broadcast::Sender<LiquidationTick>,
+    pub open_interest_tx: broadcast::Sender<OpenInterestTick>,
     pub book_state: BookState,
     /// Allowed `Origin` header values for WS upgrades. `None` skips the
     /// check (the local-dev default — set `ALLOWED_ORIGINS` in prod to

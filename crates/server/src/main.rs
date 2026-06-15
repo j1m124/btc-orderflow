@@ -60,6 +60,10 @@ async fn main() -> Result<()> {
         broadcast::channel::<binance::parse::LiquidationTick>(
             ingest::LIQUIDATION_BROADCAST_CAPACITY,
         );
+    let (open_interest_tx, _open_interest_bootstrap_rx) =
+        broadcast::channel::<binance::parse::OpenInterestTick>(
+            ingest::OPEN_INTEREST_BROADCAST_CAPACITY,
+        );
 
     // Shared live book state. Maintainer writes; gateway readers borrow
     // briefly to populate initial BookSnapshot frames.
@@ -95,6 +99,15 @@ async fn main() -> Result<()> {
             }
         })
     };
+    let open_interest_writer = {
+        let rx = open_interest_tx.subscribe();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ingest::run_open_interest_writer(pool, rx).await {
+                warn!(error = ?e, "open interest writer task exited with error");
+            }
+        })
+    };
 
     // Sub-second aggregator: subscribes to trades, emits synthesized S1/S5
     // bars on the kline broadcast so the gateway treats live sub-second
@@ -126,6 +139,7 @@ async fn main() -> Result<()> {
             trade: trade_tx.clone(),
             depth: depth_tx.clone(),
             liquidation: liquidation_tx.clone(),
+            open_interest: open_interest_tx.clone(),
         };
         let book_state = book_state.clone();
         tokio::spawn(async move {
@@ -149,6 +163,7 @@ async fn main() -> Result<()> {
     drop(_trade_bootstrap_rx);
     drop(_depth_bootstrap_rx);
     drop(_liquidation_bootstrap_rx);
+    drop(_open_interest_bootstrap_rx);
 
     let ingest_handle = {
         let pool = pool.clone();
@@ -158,6 +173,7 @@ async fn main() -> Result<()> {
             trade: trade_tx.clone(),
             depth: depth_tx.clone(),
             liquidation: liquidation_tx.clone(),
+            open_interest: open_interest_tx.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = ingest::run_binance_ingest(
@@ -171,6 +187,30 @@ async fn main() -> Result<()> {
             {
                 warn!(error = ?e, "binance ingest task exited with error");
             }
+        })
+    };
+
+    // Open-interest poller: REST-only (no WS stream for OI). Seeds 5m history
+    // then polls /fapi/v1/openInterest every 5s onto the OI broadcast.
+    let open_interest_handle = {
+        let pool = pool.clone();
+        let rest = binance::rest::RestClient::default();
+        let txs = BroadcastTxs {
+            kline: kline_tx.clone(),
+            trade: trade_tx.clone(),
+            depth: depth_tx.clone(),
+            liquidation: liquidation_tx.clone(),
+            open_interest: open_interest_tx.clone(),
+        };
+        tokio::spawn(async move {
+            ingest::run_open_interest_poller(
+                pool,
+                rest,
+                txs,
+                SYMBOL.to_string(),
+                ChronoDuration::days(COLD_START_DAYS),
+            )
+            .await;
         })
     };
 
@@ -200,6 +240,7 @@ async fn main() -> Result<()> {
         trade_tx: trade_tx.clone(),
         depth_tx: depth_tx.clone(),
         liquidation_tx: liquidation_tx.clone(),
+        open_interest_tx: open_interest_tx.clone(),
         book_state: book_state.clone(),
         allowed_origins,
     };
@@ -216,9 +257,11 @@ async fn main() -> Result<()> {
 
     info!("shutdown requested");
     gateway_handle.abort();
+    open_interest_handle.abort();
     ingest_handle.abort();
     book_maintainer.abort();
     subsec_aggregator.abort();
+    open_interest_writer.abort();
     liquidation_writer.abort();
     trade_writer.abort();
     kline_writer.abort();

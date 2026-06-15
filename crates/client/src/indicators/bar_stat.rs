@@ -145,6 +145,7 @@ impl IndicatorKind for BarStatParams {
         let mut delta: Series = Vec::with_capacity(n);
         let mut long_liq: Series = vec![None; n];
         let mut short_liq: Series = vec![None; n];
+        let mut oi_delta: Series = vec![None; n];
 
         for c in candles {
             volume.push(Some(scale_vol(c.volume, c, unit)));
@@ -176,23 +177,52 @@ impl IndicatorKind for BarStatParams {
             }
         }
 
+        // OI Δ: per-bar change in open interest (close − open within the bar),
+        // scaled to the active unit. Same two-pointer join against candle
+        // open_times as the liquidation rows above.
+        if let Some(bars) = ctx.open_interest {
+            let mut j = 0usize;
+            for (i, c) in candles.iter().enumerate() {
+                while j < bars.len() && bars[j].open_time < c.open_time {
+                    j += 1;
+                }
+                if j < bars.len() && bars[j].open_time == c.open_time {
+                    let b = &bars[j];
+                    oi_delta[i] = Some(scale_vol(b.close - b.open, c, unit));
+                    j += 1;
+                }
+            }
+        }
+
         // The rolling 24h maxima are only consumed by the `Daily` grade.
         // Computing them is O(n × window) — skip entirely for the other
         // (incl. default) grades so panning/zooming doesn't pay for series
         // paint never reads. A grade flip triggers a recompute, so `Daily`
         // gets them when it's actually selected.
-        let (daily_max_vol, daily_max_delta, daily_max_long_liq, daily_max_short_liq) =
-            if matches!(self.grade, BarStatGrade::Daily) {
-                let times: Vec<i64> = candles.iter().map(|c| c.open_time).collect();
-                (
-                    rolling_daily_max_abs(&volume, &times),
-                    rolling_daily_max_abs(&delta, &times),
-                    rolling_daily_max_abs(&long_liq, &times),
-                    rolling_daily_max_abs(&short_liq, &times),
-                )
-            } else {
-                (vec![None; n], vec![None; n], vec![None; n], vec![None; n])
-            };
+        let (
+            daily_max_vol,
+            daily_max_delta,
+            daily_max_long_liq,
+            daily_max_short_liq,
+            daily_max_oi_delta,
+        ) = if matches!(self.grade, BarStatGrade::Daily) {
+            let times: Vec<i64> = candles.iter().map(|c| c.open_time).collect();
+            (
+                rolling_daily_max_abs(&volume, &times),
+                rolling_daily_max_abs(&delta, &times),
+                rolling_daily_max_abs(&long_liq, &times),
+                rolling_daily_max_abs(&short_liq, &times),
+                rolling_daily_max_abs(&oi_delta, &times),
+            )
+        } else {
+            (
+                vec![None; n],
+                vec![None; n],
+                vec![None; n],
+                vec![None; n],
+                vec![None; n],
+            )
+        };
 
         IndicatorOutput::BarStat {
             grade: self.grade,
@@ -205,10 +235,12 @@ impl IndicatorKind for BarStatParams {
             delta,
             long_liq,
             short_liq,
+            oi_delta,
             daily_max_vol,
             daily_max_delta,
             daily_max_long_liq,
             daily_max_short_liq,
+            daily_max_oi_delta,
         }
     }
 
@@ -255,10 +287,10 @@ impl IndicatorKind for BarStatParams {
         id: InstanceId,
     ) -> Option<SettingsForm> {
         // Toggling long_liq / short_liq drives the shared LiquidationBars
-        // sub — refresh on every mutation (idempotent for grade/other-row
-        // toggles).
+        // sub and OI Δ drives the shared OpenInterest sub — refresh both on
+        // every mutation (idempotent for grade / other-row toggles).
         let target: IndicatorTarget<BarStatParams> =
-            IndicatorTarget::new(panel, id).with_after_change(AfterChange::liq_bars());
+            IndicatorTarget::new(panel, id).with_after_change(AfterChange::liq_and_oi_bars());
 
         let grade_field = Field::dropdown(
             "Color grading",
@@ -301,7 +333,7 @@ impl IndicatorKind for BarStatParams {
                 target.getter(false, |p: &BarStatParams| p.show_oi_delta),
                 target.setter(|p: &mut BarStatParams, v: bool| p.show_oi_delta = v),
             )
-            .description("Placeholder pending wiring."),
+            .description("Per-bar change in open interest (close − open)."),
         ];
 
         let rows_field = Field::multi_checkbox("Show rows", items)

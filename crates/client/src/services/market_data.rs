@@ -344,6 +344,17 @@ pub struct LiquidationBar {
     pub short_quote_qty: f64,
 }
 
+/// One per-bar open-interest OHLC cell. Values are in contracts (base asset);
+/// the chart derives USD as `close * candle.close` for the Coin/USD toggle.
+#[derive(Clone, Debug)]
+pub struct OpenInterestBar {
+    pub open_time: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
 /// One book price level.
 #[derive(Clone, Debug)]
 pub struct BookLevel {
@@ -491,6 +502,36 @@ pub enum BookEvent {
     Resnap { symbol: SharedString },
 }
 
+#[derive(Clone, Debug)]
+pub enum OpenInterestEvent {
+    /// Initial per-bar OHLC cells for the recent N bars.
+    Snapshot {
+        symbol: SharedString,
+        tf: Timeframe,
+        bars: Vec<OpenInterestBar>,
+    },
+    /// Live per-bar update (compose by `open_time`).
+    Update {
+        symbol: SharedString,
+        tf: Timeframe,
+        bars: Vec<OpenInterestBar>,
+    },
+    /// Older bars prepended.
+    Prepended {
+        symbol: SharedString,
+        tf: Timeframe,
+        added: usize,
+    },
+    HistoryCapped {
+        symbol: SharedString,
+        tf: Timeframe,
+    },
+    Resnap {
+        symbol: SharedString,
+        tf: Timeframe,
+    },
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SubKey {
     pub(crate) symbol: String,
@@ -584,6 +625,21 @@ impl LiquidationBarsSubKey {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct OpenInterestSubKey {
+    pub(crate) symbol: String,
+    pub(crate) tf: Timeframe,
+}
+
+impl OpenInterestSubKey {
+    fn new(symbol: &str, tf: Timeframe) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            tf,
+        }
+    }
+}
+
 /// Discriminator on `by_id` so an incoming server frame can route to the
 /// right per-channel handler from just its `SubId`.
 #[derive(Clone)]
@@ -594,6 +650,7 @@ enum AnySubKey {
     Book(BookSubKey),
     Liquidations(LiquidationsSubKey),
     LiquidationBars(LiquidationBarsSubKey),
+    OpenInterest(OpenInterestSubKey),
 }
 
 /// Used by the release pump to know which kind of refcount to decrement
@@ -606,6 +663,7 @@ enum ReleaseKey {
     Book(BookSubKey),
     Liquidations(LiquidationsSubKey),
     LiquidationBars(LiquidationBarsSubKey),
+    OpenInterest(OpenInterestSubKey),
 }
 
 pub struct MarketDataService {
@@ -658,6 +716,13 @@ pub struct MarketDataService {
     liquidation_bars_refcounts: HashMap<LiquidationBarsSubKey, usize>,
     liquidation_bars_history_in_flight: HashSet<LiquidationBarsSubKey>,
 
+    // --- OpenInterest (per-bar OHLC) channel state ---
+    /// Bars keyed by `open_time` so live updates compose by overwriting.
+    open_interest: HashMap<OpenInterestSubKey, HashMap<i64, OpenInterestBar>>,
+    open_interest_sub_ids: HashMap<OpenInterestSubKey, proto::SubId>,
+    open_interest_refcounts: HashMap<OpenInterestSubKey, usize>,
+    open_interest_history_in_flight: HashSet<OpenInterestSubKey>,
+
     // --- Shared routing / connection state ---
 
     /// Maps wire `SubId` → channel-tagged key. One counter is shared across
@@ -699,6 +764,7 @@ impl EventEmitter<FootprintEvent> for MarketDataService {}
 impl EventEmitter<BookEvent> for MarketDataService {}
 impl EventEmitter<LiquidationEvent> for MarketDataService {}
 impl EventEmitter<LiquidationBarEvent> for MarketDataService {}
+impl EventEmitter<OpenInterestEvent> for MarketDataService {}
 
 impl MarketDataService {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -718,6 +784,7 @@ impl MarketDataService {
                         ReleaseKey::Book(k) => s.release_one_book(k, cx),
                         ReleaseKey::Liquidations(k) => s.release_one_liquidations(k, cx),
                         ReleaseKey::LiquidationBars(k) => s.release_one_liquidation_bars(k, cx),
+                        ReleaseKey::OpenInterest(k) => s.release_one_open_interest(k, cx),
                     })
                     .is_err()
                 {
@@ -759,6 +826,10 @@ impl MarketDataService {
             liquidation_bars_sub_ids: HashMap::new(),
             liquidation_bars_refcounts: HashMap::new(),
             liquidation_bars_history_in_flight: HashSet::new(),
+            open_interest: HashMap::new(),
+            open_interest_sub_ids: HashMap::new(),
+            open_interest_refcounts: HashMap::new(),
+            open_interest_history_in_flight: HashSet::new(),
             by_id: HashMap::new(),
             next_sub_id: 0,
             to_ws,
@@ -990,6 +1061,50 @@ impl MarketDataService {
         }
     }
 
+    pub fn ensure_open_interest(
+        &mut self,
+        symbol: &str,
+        tf: Timeframe,
+        _cx: &mut Context<Self>,
+    ) -> SubscriptionHandle {
+        let key = OpenInterestSubKey::new(symbol, tf);
+        let count = self.open_interest_refcounts.entry(key.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            let sub_id = self.alloc_sub_id();
+            self.open_interest_sub_ids.insert(key.clone(), sub_id);
+            self.by_id
+                .insert(sub_id, AnySubKey::OpenInterest(key.clone()));
+            self.open_interest.insert(key.clone(), HashMap::new());
+            let frame = proto::ClientFrame::Subscribe {
+                id: sub_id,
+                symbol: symbol.to_string(),
+                channel: proto::Channel::OpenInterest { tf: proto_tf(tf) },
+            };
+            let _ = self.to_ws.unbounded_send(frame);
+        }
+        SubscriptionHandle {
+            key: ReleaseKey::OpenInterest(key),
+            release_tx: self.release_tx.clone(),
+        }
+    }
+
+    pub fn open_interest_bars(
+        &self,
+        symbol: &str,
+        tf: Timeframe,
+    ) -> Vec<OpenInterestBar> {
+        let key = OpenInterestSubKey::new(symbol, tf);
+        match self.open_interest.get(&key) {
+            Some(map) => {
+                let mut bars: Vec<OpenInterestBar> = map.values().cloned().collect();
+                bars.sort_by_key(|b| b.open_time);
+                bars
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub fn trades_snapshot(&self, symbol: &str) -> Option<&[Trade]> {
         self.trades.get(&TradeSubKey::new(symbol)).map(|v| v.as_slice())
     }
@@ -1210,6 +1325,33 @@ impl MarketDataService {
         let _ = self.to_ws.unbounded_send(frame);
     }
 
+    /// Request older open-interest bars. Cursor = oldest held `open_time`.
+    pub fn load_older_open_interest(
+        &mut self,
+        symbol: &str,
+        tf: Timeframe,
+        _cx: &mut Context<Self>,
+    ) {
+        let key = OpenInterestSubKey::new(symbol, tf);
+        let Some(sub_id) = self.open_interest_sub_ids.get(&key).copied() else {
+            return;
+        };
+        if !self.open_interest_history_in_flight.insert(key.clone()) {
+            return;
+        }
+        let before_ms = self
+            .open_interest
+            .get(&key)
+            .and_then(|bars| bars.keys().min().copied())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let frame = proto::ClientFrame::HistoryPage {
+            id: sub_id,
+            before_ms,
+            count: HISTORY_PAGE_SIZE,
+        };
+        let _ = self.to_ws.unbounded_send(frame);
+    }
+
     // --- Internal: driven by the connection task ---------------------------
 
     /// Route an incoming server frame into per-subscription state.
@@ -1277,6 +1419,15 @@ impl MarketDataService {
             }
             proto::ServerFrame::LiquidationBarHistoryPage { id, bars } => {
                 self.on_liquidation_bar_history_page(id, bars, cx);
+            }
+            proto::ServerFrame::OpenInterestSnapshot { id, bars, server_v: _ } => {
+                self.on_open_interest_snapshot(id, bars, cx);
+            }
+            proto::ServerFrame::OpenInterestUpdate { id, bars, v: _ } => {
+                self.on_open_interest_update(id, bars, cx);
+            }
+            proto::ServerFrame::OpenInterestHistoryPage { id, bars } => {
+                self.on_open_interest_history_page(id, bars, cx);
             }
             proto::ServerFrame::Resnap { id } => {
                 self.on_resnap(id, cx);
@@ -1460,6 +1611,20 @@ impl MarketDataService {
                     id,
                     symbol: key.symbol.clone(),
                     channel: proto::Channel::LiquidationBars { tf: proto_tf(tf) },
+                });
+            }
+            AnySubKey::OpenInterest(key) => {
+                let tf = key.tf;
+                self.open_interest.insert(key.clone(), HashMap::new());
+                self.open_interest_history_in_flight.remove(&key);
+                cx.emit(OpenInterestEvent::Resnap {
+                    symbol: key.symbol.clone().into(),
+                    tf,
+                });
+                let _ = self.to_ws.unbounded_send(proto::ClientFrame::Subscribe {
+                    id,
+                    symbol: key.symbol.clone(),
+                    channel: proto::Channel::OpenInterest { tf: proto_tf(tf) },
                 });
             }
         }
@@ -1888,6 +2053,92 @@ impl MarketDataService {
         });
     }
 
+    fn on_open_interest_snapshot(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::OpenInterestBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::OpenInterest(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        let domain: Vec<OpenInterestBar> =
+            bars.into_iter().map(open_interest_bar_from_proto).collect();
+        let mut map: HashMap<i64, OpenInterestBar> = HashMap::new();
+        for b in &domain {
+            map.insert(b.open_time, b.clone());
+        }
+        self.open_interest.insert(key.clone(), map);
+        self.open_interest_history_in_flight.remove(&key);
+        cx.emit(OpenInterestEvent::Snapshot {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            bars: domain,
+        });
+    }
+
+    fn on_open_interest_update(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::OpenInterestBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::OpenInterest(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        let domain: Vec<OpenInterestBar> =
+            bars.into_iter().map(open_interest_bar_from_proto).collect();
+        let map = self.open_interest.entry(key.clone()).or_default();
+        for b in &domain {
+            map.insert(b.open_time, b.clone());
+        }
+        cx.emit(OpenInterestEvent::Update {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            bars: domain,
+        });
+    }
+
+    fn on_open_interest_history_page(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::OpenInterestBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::OpenInterest(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        self.open_interest_history_in_flight.remove(&key);
+        if bars.is_empty() {
+            cx.emit(OpenInterestEvent::HistoryCapped {
+                symbol: key.symbol.clone().into(),
+                tf: key.tf,
+            });
+            return;
+        }
+        let domain: Vec<OpenInterestBar> =
+            bars.into_iter().map(open_interest_bar_from_proto).collect();
+        let map = self.open_interest.entry(key.clone()).or_default();
+        let mut added = 0;
+        for b in &domain {
+            // Only insert open_times we don't already hold, so a history page
+            // for an already-visible bar can't clobber the live OHLC with a
+            // stale (snapshot-time) value.
+            if !map.contains_key(&b.open_time) {
+                map.insert(b.open_time, b.clone());
+                added += 1;
+            }
+        }
+        if added == 0 {
+            return;
+        }
+        cx.emit(OpenInterestEvent::Prepended {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            added,
+        });
+    }
+
     /// Fold a fresh RTT sample into the EMA, seeding with the first sample on
     /// a connection. Called from `pump` on every `Pong`. The bottom bar
     /// repaints every frame (it self-drives via `request_animation_frame`), so
@@ -1999,6 +2250,20 @@ impl MarketDataService {
                 id: sub_id,
                 symbol: key.symbol.clone(),
                 channel: proto::Channel::LiquidationBars {
+                    tf: proto_tf(key.tf),
+                },
+            });
+        }
+        let open_interest_subs: Vec<(OpenInterestSubKey, proto::SubId)> = self
+            .open_interest_sub_ids
+            .iter()
+            .map(|(k, id)| (k.clone(), *id))
+            .collect();
+        for (key, sub_id) in open_interest_subs {
+            let _ = self.to_ws.unbounded_send(proto::ClientFrame::Subscribe {
+                id: sub_id,
+                symbol: key.symbol.clone(),
+                channel: proto::Channel::OpenInterest {
                     tf: proto_tf(key.tf),
                 },
             });
@@ -2140,6 +2405,31 @@ impl MarketDataService {
             }
             self.liquidation_bars.remove(&key);
             self.liquidation_bars_history_in_flight.remove(&key);
+        }
+    }
+
+    fn release_one_open_interest(
+        &mut self,
+        key: OpenInterestSubKey,
+        _cx: &mut Context<Self>,
+    ) {
+        let zero = match self.open_interest_refcounts.get_mut(&key) {
+            Some(c) => {
+                *c = c.saturating_sub(1);
+                *c == 0
+            }
+            None => return,
+        };
+        if zero {
+            self.open_interest_refcounts.remove(&key);
+            if let Some(sub_id) = self.open_interest_sub_ids.remove(&key) {
+                self.by_id.remove(&sub_id);
+                let _ = self
+                    .to_ws
+                    .unbounded_send(proto::ClientFrame::Unsubscribe { id: sub_id });
+            }
+            self.open_interest.remove(&key);
+            self.open_interest_history_in_flight.remove(&key);
         }
     }
 }
@@ -2466,6 +2756,16 @@ fn liquidation_bar_from_proto(b: proto::LiquidationBar) -> LiquidationBar {
         long_quote_qty: b.long_quote_qty,
         short_qty: b.short_qty,
         short_quote_qty: b.short_quote_qty,
+    }
+}
+
+fn open_interest_bar_from_proto(b: proto::OpenInterestBar) -> OpenInterestBar {
+    OpenInterestBar {
+        open_time: b.open_time,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
     }
 }
 

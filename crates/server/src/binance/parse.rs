@@ -154,6 +154,28 @@ pub struct LiquidationTick {
     pub liq: LiquidationRow,
 }
 
+// --- Open interest sample ---------------------------------------------------
+
+/// One open-interest sample: the symbol's total open interest (in contracts /
+/// base asset) at instant `ts`. Sourced from REST polling — `/fapi/v1/open
+/// Interest` (live) and `/futures/data/openInterestHist` (cold-start backfill).
+/// Binance publishes no WS stream for OI, so unlike the other rows this never
+/// comes off the combined-stream parser.
+#[derive(Clone, Debug)]
+pub struct OpenInterestRow {
+    pub ts: DateTime<Utc>,
+    pub oi: f64,
+}
+
+/// An open-interest sample traveling on the internal broadcast. Mirrors
+/// [`LiquidationTick`] in shape — the DB writer + per-client forwarder
+/// subscribe to this.
+#[derive(Clone, Debug)]
+pub struct OpenInterestTick {
+    pub symbol: String,
+    pub oi: OpenInterestRow,
+}
+
 // --- Depth diff event -------------------------------------------------------
 
 /// One depth-diff event off `<symbol>@depth@100ms`. Carries the Binance

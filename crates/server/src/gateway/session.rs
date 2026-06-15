@@ -42,7 +42,9 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::GatewayState;
-use crate::binance::parse::{DepthDiff, KlineRow, LiquidationTick, Tick, TradeTick};
+use crate::binance::parse::{
+    DepthDiff, KlineRow, LiquidationTick, OpenInterestTick, Tick, TradeTick,
+};
 use crate::ingest::BookState;
 use crate::db;
 
@@ -66,6 +68,10 @@ const LIQ_TAPE_SNAPSHOT_COUNT: i64 = 200;
 /// footprint snapshot depth — both are per-tf bar aggregations driving
 /// indicator paint, so consistent visual fill on first sub.
 const LIQ_BARS_SNAPSHOT_BARS: i64 = FOOTPRINT_SNAPSHOT_BARS;
+
+/// Number of recent bars in an open-interest snapshot. Same depth as the
+/// other per-tf bar aggregations driving indicator paint.
+const OI_SNAPSHOT_BARS: i64 = FOOTPRINT_SNAPSHOT_BARS;
 
 /// Server-side batching window for live trade / book / footprint / liquidation
 /// frames.
@@ -103,6 +109,7 @@ enum SubChannel {
     Book,
     Liquidations,
     LiquidationBars { tf: Timeframe },
+    OpenInterest { tf: Timeframe },
 }
 
 impl Drop for SubMeta {
@@ -310,6 +317,23 @@ async fn handle_text(
                     );
                     (SubChannel::LiquidationBars { tf }, h)
                 }
+                Channel::OpenInterest { tf } => {
+                    let rx = state.open_interest_tx.subscribe();
+                    let h = spawn_forwarder(
+                        id,
+                        write_tx.clone(),
+                        "open_interest forwarder",
+                        run_open_interest_subscription(
+                            id,
+                            symbol.clone(),
+                            tf,
+                            rx,
+                            state.pool.clone(),
+                            write_tx.clone(),
+                        ),
+                    );
+                    (SubChannel::OpenInterest { tf }, h)
+                }
             };
 
             subs.insert(
@@ -453,6 +477,13 @@ async fn history_page(
                 &ServerFrame::LiquidationBarHistoryPage { id, bars },
             )
             .await;
+        }
+        SubChannel::OpenInterest { tf } => {
+            let capped = count.min(HISTORY_PAGE_CAP as i64);
+            let bars =
+                db::fetch_open_interest_history_page(&pool, &symbol, tf, before_ms, capped)
+                    .await?;
+            send_frame(write_tx, &ServerFrame::OpenInterestHistoryPage { id, bars }).await;
         }
     }
     Ok(())
@@ -1221,6 +1252,143 @@ async fn run_liquidation_bars_subscription(
                 }
                 server_v += 1;
                 let frame = ServerFrame::LiquidationBarUpdate {
+                    id,
+                    bars,
+                    v: server_v,
+                };
+                if write_tx.send(message_from_frame(&frame)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+// --- Open interest forwarder -----------------------------------------------
+
+/// Open-interest forwarder. Snapshot is per-bar OHLC from `time_bucket` over
+/// the `open_interest` sample table; live updates fold each broadcast sample
+/// into the current bar's running OHLC and emit an `OpenInterestUpdate` every
+/// `LIVE_BATCH_INTERVAL` for any touched bar.
+///
+/// Dedup differs from the liquidation-bars forwarder: OI updates are OHLC, not
+/// sums, so re-folding a snapshot-covered sample is idempotent (max/min/last
+/// don't double-count). We therefore skip only samples in a strictly OLDER
+/// bar than the snapshot tail (those bars are closed and final in the
+/// snapshot) and keep folding the tail bar — so the in-progress bar's
+/// high/low/close stay live every poll instead of freezing until rollover.
+async fn run_open_interest_subscription(
+    id: SubId,
+    symbol: String,
+    tf: Timeframe,
+    mut rx: broadcast::Receiver<OpenInterestTick>,
+    pool: PgPool,
+    write_tx: mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    let snapshot = db::fetch_open_interest_snapshot(&pool, &symbol, tf, OI_SNAPSHOT_BARS).await?;
+    let snapshot_tail_open_time = snapshot.iter().map(|b| b.open_time).max();
+    let bar_ms = tf.duration_ms();
+
+    // Per-bar OHLC state. Seed the snapshot tail bar so the first live sample
+    // folds onto its existing open/high/low rather than resetting toward the
+    // new value.
+    let mut bar_ohlc: HashMap<i64, protocol::OpenInterestBar> = HashMap::new();
+    if let Some(tail) = snapshot_tail_open_time {
+        if let Some(tail_bar) = snapshot.iter().find(|b| b.open_time == tail) {
+            bar_ohlc.insert(tail, tail_bar.clone());
+        }
+    }
+
+    debug!(
+        ?id,
+        tf = tf.as_str(),
+        bars = snapshot.len(),
+        "sending open interest snapshot"
+    );
+    let mut server_v: u64 = 0;
+    send_frame(
+        &write_tx,
+        &ServerFrame::OpenInterestSnapshot {
+            id,
+            bars: snapshot,
+            server_v,
+        },
+    )
+    .await;
+
+    let mut touched: HashSet<i64> = HashSet::new();
+    let mut current_bar_open: Option<i64> = snapshot_tail_open_time;
+    let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
+    batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    batch_timer.tick().await;
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        if tick.symbol != symbol {
+                            continue;
+                        }
+                        let ts_ms = tick.oi.ts.timestamp_millis();
+                        let bar_open = (ts_ms / bar_ms) * bar_ms;
+                        // Skip strictly-older bars (closed + final in snapshot).
+                        if let Some(tail) = snapshot_tail_open_time {
+                            if bar_open < tail {
+                                continue;
+                            }
+                        }
+                        if let Some(prev) = current_bar_open {
+                            if bar_open > prev {
+                                // Bar rolled over — drop totals older than the
+                                // prior bar to bound memory, keeping prev for
+                                // its final in-flight emit.
+                                bar_ohlc.retain(|k, _| *k >= prev);
+                            }
+                        }
+                        current_bar_open = Some(bar_open);
+
+                        let oi = tick.oi.oi;
+                        bar_ohlc
+                            .entry(bar_open)
+                            .and_modify(|b| {
+                                b.high = b.high.max(oi);
+                                b.low = b.low.min(oi);
+                                b.close = oi;
+                            })
+                            .or_insert(protocol::OpenInterestBar {
+                                open_time: bar_open,
+                                open: oi,
+                                high: oi,
+                                low: oi,
+                                close: oi,
+                            });
+                        touched.insert(bar_open);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(?id, skipped = n, "open interest sub lagged; sending resnap");
+                        send_frame(&write_tx, &ServerFrame::Resnap { id }).await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!(?id, "open interest broadcast closed; sub exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            _ = batch_timer.tick() => {
+                if touched.is_empty() {
+                    continue;
+                }
+                let bars: Vec<protocol::OpenInterestBar> = touched
+                    .drain()
+                    .filter_map(|k| bar_ohlc.get(&k).cloned())
+                    .collect();
+                if bars.is_empty() {
+                    continue;
+                }
+                server_v += 1;
+                let frame = ServerFrame::OpenInterestUpdate {
                     id,
                     bars,
                     v: server_v,

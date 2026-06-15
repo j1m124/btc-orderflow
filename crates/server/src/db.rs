@@ -435,6 +435,179 @@ fn liquidation_bucket_interval(tf: Timeframe) -> &'static str {
     }
 }
 
+// --- open interest (computed on read from raw samples) ----------------------
+
+/// Latest stored OI sample `ts` for `symbol`, or `None` if no rows. Used as
+/// the resume cursor for the openInterestHist cold-start/gap-heal backfill.
+pub async fn max_open_interest_ts(
+    pool: &PgPool,
+    symbol: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    let row = sqlx::query("SELECT MAX(ts) AS t FROM open_interest WHERE symbol = $1")
+        .bind(symbol)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("t")?)
+}
+
+/// `time_bucket` interval literal for open-interest OHLC aggregation. OI bars
+/// cover every TF the chart supports; sub-5m TFs just bucket the same raw
+/// sample table more finely (and read sparse on backfilled history — see the
+/// migration).
+fn open_interest_bucket_interval(tf: Timeframe) -> &'static str {
+    match tf {
+        Timeframe::S1 => "1 second",
+        Timeframe::S5 => "5 seconds",
+        Timeframe::M1 => "1 minute",
+        Timeframe::M5 => "5 minutes",
+        Timeframe::M15 => "15 minutes",
+        Timeframe::M30 => "30 minutes",
+        Timeframe::H1 => "1 hour",
+        Timeframe::H2 => "2 hours",
+        Timeframe::H4 => "4 hours",
+        Timeframe::H6 => "6 hours",
+        Timeframe::D1 => "1 day",
+    }
+}
+
+/// Bulk-UPSERT a window of open-interest samples. PK is `(symbol, ts)`;
+/// `ON CONFLICT DO NOTHING` absorbs the rare live/backfill tie and any
+/// reconnect redelivery. 3 params/row → ~21k-row cap before the 65535
+/// Postgres-parameter ceiling; live flushes (one sample per 5s poll) and the
+/// 500-row backfill page sit far under it.
+pub async fn upsert_open_interest(
+    pool: &PgPool,
+    symbol: &str,
+    rows: &[crate::binance::parse::OpenInterestRow],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut qb: QueryBuilder<sqlx::Postgres> =
+        QueryBuilder::new("INSERT INTO open_interest (symbol, ts, oi) ");
+
+    qb.push_values(rows.iter(), |mut b, row| {
+        b.push_bind(symbol).push_bind(row.ts).push_bind(row.oi);
+    });
+
+    qb.push(" ON CONFLICT (symbol, ts) DO NOTHING");
+    qb.build().execute(pool).await?;
+    Ok(())
+}
+
+/// Per-bar open-interest OHLC for the most recent `bars` bars at `tf`,
+/// chronological (oldest first). Only populated buckets emit a row — OI is
+/// never zero, so a missing bucket means "no sample in that window", and the
+/// client connects the points it receives (no zero-fill, unlike liq bars).
+///
+/// Bounds the scan to `[aligned_now - (bars-1)*width, +inf)` so TimescaleDB
+/// prunes chunks and rides the PK index (`(symbol, ts)`) instead of scanning
+/// every sample — same shape as the footprint snapshot. `first`/`last` are
+/// Timescale ordered aggregates over `ts` (the same pattern the sub-second
+/// candle synthesis uses over `agg_id`).
+pub async fn fetch_open_interest_snapshot(
+    pool: &PgPool,
+    symbol: &str,
+    tf: Timeframe,
+    bars: i64,
+) -> Result<Vec<protocol::OpenInterestBar>> {
+    let interval = open_interest_bucket_interval(tf);
+
+    let width_ms = tf.duration_ms().max(1);
+    let now_ms = Utc::now().timestamp_millis();
+    let lower_ms = (now_ms - now_ms.rem_euclid(width_ms)) - (bars - 1).max(0) * width_ms;
+    let lower = Utc
+        .timestamp_millis_opt(lower_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
+    let sql = format!(
+        "SELECT \
+            time_bucket(INTERVAL '{interval}', ts) AS open_time, \
+            first(oi, ts) AS open, \
+            max(oi) AS high, \
+            min(oi) AS low, \
+            last(oi, ts) AS close \
+         FROM open_interest \
+         WHERE symbol = $1 AND ts >= $2 \
+         GROUP BY open_time \
+         ORDER BY open_time ASC",
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(lower)
+        .fetch_all(pool)
+        .await?;
+
+    build_open_interest_bars(rows)
+}
+
+/// Per-bar open-interest OHLC for up to `bars` bars strictly older than
+/// `before_open_time_ms` (a bucket boundary the client already holds),
+/// chronological. Bounded window `[before - bars*width, before)` lets
+/// Timescale prune chunks — same shape as the footprint history page.
+pub async fn fetch_open_interest_history_page(
+    pool: &PgPool,
+    symbol: &str,
+    tf: Timeframe,
+    before_open_time_ms: i64,
+    bars: i64,
+) -> Result<Vec<protocol::OpenInterestBar>> {
+    let interval = open_interest_bucket_interval(tf);
+
+    let width_ms = tf.duration_ms().max(1);
+    let lower_ms = before_open_time_ms - bars.max(0) * width_ms;
+    let before = Utc
+        .timestamp_millis_opt(before_open_time_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+    let lower = Utc
+        .timestamp_millis_opt(lower_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
+    let sql = format!(
+        "SELECT \
+            time_bucket(INTERVAL '{interval}', ts) AS open_time, \
+            first(oi, ts) AS open, \
+            max(oi) AS high, \
+            min(oi) AS low, \
+            last(oi, ts) AS close \
+         FROM open_interest \
+         WHERE symbol = $1 AND ts >= $2 AND ts < $3 \
+         GROUP BY open_time \
+         ORDER BY open_time ASC",
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(lower)
+        .bind(before)
+        .fetch_all(pool)
+        .await?;
+
+    build_open_interest_bars(rows)
+}
+
+fn build_open_interest_bars(
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> Result<Vec<protocol::OpenInterestBar>> {
+    rows.into_iter()
+        .map(|r| -> Result<protocol::OpenInterestBar> {
+            let bar: DateTime<Utc> = r.try_get("open_time")?;
+            Ok(protocol::OpenInterestBar {
+                open_time: bar.timestamp_millis(),
+                open: r.try_get("open")?,
+                high: r.try_get("high")?,
+                low: r.try_get("low")?,
+                close: r.try_get("close")?,
+            })
+        })
+        .collect()
+}
+
 // --- footprint (computed on read from `trades`) ----------------------------
 
 /// Pick the time_bucket interval literal for any TF (sub-second OR native).

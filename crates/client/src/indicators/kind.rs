@@ -18,7 +18,7 @@ use super::instance::InstanceId;
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
-use crate::services::market_data::{Candle, FootprintCellLookup, LiquidationBar};
+use crate::services::market_data::{Candle, FootprintCellLookup, LiquidationBar, OpenInterestBar};
 use crate::settings_form::SettingsForm;
 
 /// Cross-cutting per-compute context, threaded from `ChartState` into each
@@ -49,6 +49,10 @@ pub struct ComputeCtx<'a> {
     /// current `(symbol, tf)`. `None` when no `liq_bars` indicator is live
     /// on the chart — ChartState skips rebuilding the cache then.
     pub liquidation_bars: Option<&'a [LiquidationBar]>,
+    /// Pre-sorted (oldest-first) open-interest OHLC bars for the chart's
+    /// current `(symbol, tf)`. `None` when no `open_interest` indicator (and
+    /// no bar_stat OI-Δ row) is live — ChartState skips the cache then.
+    pub open_interest: Option<&'a [OpenInterestBar]>,
 }
 
 impl<'a> Default for ComputeCtx<'a> {
@@ -58,6 +62,7 @@ impl<'a> Default for ComputeCtx<'a> {
             footprint: None,
             view_time_range: None,
             liquidation_bars: None,
+            open_interest: None,
         }
     }
 }

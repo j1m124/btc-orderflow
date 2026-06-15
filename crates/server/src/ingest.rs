@@ -24,9 +24,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::binance::{
-    AGGTRADES_PAGE_LIMIT, BroadcastTxs, KLINES_PAGE_LIMIT,
+    AGGTRADES_PAGE_LIMIT, BroadcastTxs, KLINES_PAGE_LIMIT, OPEN_INTEREST_HIST_PAGE_LIMIT,
     book::Book,
-    parse::{KlineRow, Tick, TradeRow, TradeTick},
+    parse::{KlineRow, OpenInterestRow, OpenInterestTick, Tick, TradeRow, TradeTick},
     rest::RestClient,
     ws,
 };
@@ -79,6 +79,11 @@ pub const DEPTH_BROADCAST_CAPACITY: usize = 4096;
 /// trade/kline channels because the source rate is two orders of magnitude
 /// lower.
 pub const LIQUIDATION_BROADCAST_CAPACITY: usize = 256;
+
+/// Capacity of the open-interest broadcast channel. The poller emits ≤1
+/// sample per [`OPEN_INTEREST_POLL_INTERVAL`] (5s), so 64 slots is ~5 minutes
+/// of buffering — tiny, like liquidations, because the source rate is glacial.
+pub const OPEN_INTEREST_BROADCAST_CAPACITY: usize = 64;
 
 /// Min/max wait between Binance WS reconnect attempts.
 const RECONNECT_MIN: StdDuration = StdDuration::from_secs(1);
@@ -432,6 +437,187 @@ async fn flush_liquidation_buffer(
         let count = rows.len();
         if let Err(e) = db::upsert_liquidations(pool, &symbol, &rows).await {
             warn!(symbol, count, error = ?e, "liquidation upsert failed");
+        }
+    }
+}
+
+// --- Open interest poller + backfill + writer -------------------------------
+
+/// Cadence of the live open-interest poll. Binance recomputes OI slower than
+/// this, so polls that land on an unchanged value dedupe for free on the
+/// `(symbol, ts)` PK (we tag each sample with Binance's own `time`). Weight 1
+/// per call → 12/min, negligible against the 2400/min IP budget.
+const OPEN_INTEREST_POLL_INTERVAL: StdDuration = StdDuration::from_secs(5);
+
+/// Flush cadence for the OI writer's row buffer. Samples arrive at ~0.2/sec,
+/// so 1s batching keeps writes to one tiny upsert per second.
+const OPEN_INTEREST_WRITER_FLUSH: StdDuration = StdDuration::from_secs(1);
+
+/// Binance period bucket used for OI cold-start backfill. 5m is the finest
+/// `openInterestHist` grain; sub-5m chart TFs therefore read sparse history
+/// and only fill finely from live polling forward.
+const OPEN_INTEREST_BACKFILL_PERIOD: &str = "5m";
+
+/// How far `openInterestHist` data reaches. Binance serves at most the last
+/// 30 days regardless of `startTime`; we clamp the backfill cursor to this so
+/// a fresh table doesn't waste pages requesting unavailable history.
+const OPEN_INTEREST_HIST_MAX_AGE: ChronoDuration = ChronoDuration::days(30);
+
+/// Pause between paginated `openInterestHist` calls. The `futures/data`
+/// namespace has its own modest rate budget; 200ms keeps a multi-page 7-day
+/// cold start polite without noticeably delaying boot.
+const OPEN_INTEREST_BACKFILL_PAGE_DELAY: StdDuration = StdDuration::from_millis(200);
+
+/// Poll `/fapi/v1/openInterest` forever, broadcasting each sample. Seeds
+/// history once via [`backfill_open_interest`] before the live loop. The
+/// writer persists from the broadcast; gateway forwarders read it for live
+/// `OpenInterestUpdate` frames. There is no WS stream + reconnect cycle here
+/// (OI has no stream), so unlike the kline/depth loops this is a plain timer.
+pub async fn run_open_interest_poller(
+    pool: PgPool,
+    rest: RestClient,
+    txs: BroadcastTxs,
+    symbol: String,
+    cold_start: ChronoDuration,
+) {
+    info!(symbol = %symbol, "open interest poller task started");
+
+    // Cold-start / gap-heal. Non-fatal: the live loop fills forward anyway.
+    if let Err(e) = backfill_open_interest(&pool, &rest, &symbol, cold_start).await {
+        warn!(error = ?e, "open interest backfill failed; continuing with live polling only");
+    }
+
+    let mut poll_timer = tokio::time::interval(OPEN_INTEREST_POLL_INTERVAL);
+    poll_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        poll_timer.tick().await;
+        match rest.open_interest(&symbol).await {
+            Ok(row) => {
+                // `send` errors only with zero receivers; the writer holds a
+                // permanent one after boot, so this is never empty in steady
+                // state.
+                let _ = txs.open_interest.send(OpenInterestTick {
+                    symbol: symbol.clone(),
+                    oi: row,
+                });
+            }
+            Err(e) => {
+                warn!(error = ?e, "open interest poll failed; retrying next tick");
+            }
+        }
+    }
+}
+
+/// Catch the `open_interest` table up to "now" via `openInterestHist`.
+/// Resume-aware against `MAX(ts)` (like the kline backfill): start at the last
+/// sample, or `cold_start` ago for a fresh table, clamped to Binance's 30-day
+/// availability. Pages forward at 5m resolution. Returns rows upserted.
+pub async fn backfill_open_interest(
+    pool: &PgPool,
+    rest: &RestClient,
+    symbol: &str,
+    cold_start: ChronoDuration,
+) -> Result<usize> {
+    let now = Utc::now();
+    let last = db::max_open_interest_ts(pool, symbol)
+        .await
+        .context("query MAX(open_interest.ts)")?;
+
+    let earliest_ms = (now - OPEN_INTEREST_HIST_MAX_AGE).timestamp_millis();
+    let mut cursor_ms = match last {
+        Some(t) => (t.timestamp_millis() + 1).max(earliest_ms),
+        None => (now - cold_start).timestamp_millis().max(earliest_ms),
+    };
+    let now_ms = now.timestamp_millis();
+    let mut total = 0usize;
+
+    loop {
+        if cursor_ms >= now_ms {
+            break;
+        }
+
+        let rows = rest
+            .open_interest_hist(
+                symbol,
+                OPEN_INTEREST_BACKFILL_PERIOD,
+                cursor_ms,
+                OPEN_INTEREST_HIST_PAGE_LIMIT,
+            )
+            .await
+            .with_context(|| format!("openInterestHist page for {symbol} from {cursor_ms}"))?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let page_size = rows.len();
+        let last_ts_ms = rows.last().map(|r| r.ts.timestamp_millis()).unwrap_or(cursor_ms);
+
+        db::upsert_open_interest(pool, symbol, &rows)
+            .await
+            .with_context(|| format!("upsert open interest for {symbol}"))?;
+
+        total += page_size;
+        cursor_ms = last_ts_ms + 1;
+
+        if (page_size as u32) < OPEN_INTEREST_HIST_PAGE_LIMIT {
+            break;
+        }
+        tokio::time::sleep(OPEN_INTEREST_BACKFILL_PAGE_DELAY).await;
+    }
+
+    if total > 0 {
+        info!(symbol, rows = total, "open interest backfill complete");
+    }
+    Ok(total)
+}
+
+/// Drain the open-interest broadcast, buffer per-symbol, bulk-UPSERT every
+/// [`OPEN_INTEREST_WRITER_FLUSH`]. Mirrors [`run_liquidation_writer`].
+pub async fn run_open_interest_writer(
+    pool: PgPool,
+    mut rx: broadcast::Receiver<OpenInterestTick>,
+) -> Result<()> {
+    info!("open interest writer task started");
+    let mut buffer: HashMap<String, Vec<OpenInterestRow>> = HashMap::new();
+    let mut flush_timer = tokio::time::interval(OPEN_INTEREST_WRITER_FLUSH);
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        buffer.entry(tick.symbol).or_default().push(tick.oi);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "open interest writer lagged behind broadcast");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("open interest broadcast closed; flushing and exiting");
+                        flush_open_interest_buffer(&pool, &mut buffer).await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ = flush_timer.tick() => {
+                flush_open_interest_buffer(&pool, &mut buffer).await;
+            }
+        }
+    }
+}
+
+async fn flush_open_interest_buffer(
+    pool: &PgPool,
+    buffer: &mut HashMap<String, Vec<OpenInterestRow>>,
+) {
+    for (symbol, rows) in buffer.drain() {
+        if rows.is_empty() {
+            continue;
+        }
+        let count = rows.len();
+        if let Err(e) = db::upsert_open_interest(pool, &symbol, &rows).await {
+            warn!(symbol, count, error = ?e, "open interest upsert failed");
         }
     }
 }

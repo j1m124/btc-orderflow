@@ -7,13 +7,14 @@
 //! tiny (Q10: ~16 max across all 9 tfs for a 7-day cold start).
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
 
 use super::{
-    AGGTRADES_PAGE_LIMIT, KLINES_PAGE_LIMIT, REST_BASE,
-    parse::{KlineRow, TradeRow},
+    AGGTRADES_PAGE_LIMIT, KLINES_PAGE_LIMIT, OPEN_INTEREST_HIST_PAGE_LIMIT, REST_BASE,
+    parse::{KlineRow, OpenInterestRow, TradeRow},
 };
 
 /// Bootstrap response from `GET /fapi/v1/depth`.
@@ -179,6 +180,105 @@ impl RestClient {
             asks,
         })
     }
+
+    /// Current open interest for `symbol` from `GET /fapi/v1/openInterest`
+    /// (weight 1, unauthenticated). Returns the value in contracts (base
+    /// asset) tagged with Binance's own `time` — using the exchange timestamp
+    /// rather than wall-clock means consecutive polls that land on the same
+    /// unchanged OI snapshot collide on the `(symbol, ts)` PK and dedupe for
+    /// free (Binance recomputes OI slower than our poll cadence).
+    pub async fn open_interest(&self, symbol: &str) -> Result<OpenInterestRow> {
+        let url = format!("{}/fapi/v1/openInterest", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("symbol", symbol)])
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("binance returned non-2xx for openInterest {symbol}"))?;
+
+        let json: Value = resp.json().await.context("decode openInterest JSON")?;
+        let oi = json
+            .get("openInterest")
+            .and_then(|v| v.as_str())
+            .context("openInterest.openInterest missing")?
+            .parse::<f64>()
+            .context("openInterest.openInterest decode")?;
+        let ts_ms = json
+            .get("time")
+            .and_then(|v| v.as_i64())
+            .context("openInterest.time missing")?;
+        Ok(OpenInterestRow {
+            ts: ms_to_utc(ts_ms),
+            oi,
+        })
+    }
+
+    /// Historical open-interest statistics from `GET /futures/data/open
+    /// InterestHist`. Only `sumOpenInterest` (contracts) + `timestamp` are
+    /// decoded; `sumOpenInterestValue` (USD) is dropped — the client derives
+    /// USD from the candle close. `period` is one of Binance's fixed buckets
+    /// ("5m","15m",…,"1d"); only the last 30 days are available and `limit`
+    /// caps at [`OPEN_INTEREST_HIST_PAGE_LIMIT`]. Returns rows ascending.
+    pub async fn open_interest_hist(
+        &self,
+        symbol: &str,
+        period: &str,
+        start_time_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<OpenInterestRow>> {
+        let limit = limit.min(OPEN_INTEREST_HIST_PAGE_LIMIT);
+        let url = format!("{}/futures/data/openInterestHist", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("symbol", symbol),
+                ("period", period),
+                ("startTime", &start_time_ms.to_string()),
+                ("limit", &limit.to_string()),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("binance returned non-2xx for openInterestHist {symbol}"))?;
+
+        let arr: Value = resp.json().await.context("decode openInterestHist JSON")?;
+        let items = arr
+            .as_array()
+            .context("openInterestHist response is not a JSON array")?;
+
+        let mut rows = Vec::with_capacity(items.len());
+        for (idx, v) in items.iter().enumerate() {
+            let obj = v
+                .as_object()
+                .with_context(|| format!("openInterestHist #{idx} is not an object"))?;
+            let oi = obj
+                .get("sumOpenInterest")
+                .and_then(|x| x.as_str())
+                .with_context(|| format!("openInterestHist #{idx}.sumOpenInterest missing"))?
+                .parse::<f64>()
+                .with_context(|| format!("openInterestHist #{idx}.sumOpenInterest decode"))?;
+            let ts_ms = obj
+                .get("timestamp")
+                .and_then(|x| x.as_i64())
+                .with_context(|| format!("openInterestHist #{idx}.timestamp missing"))?;
+            rows.push(OpenInterestRow {
+                ts: ms_to_utc(ts_ms),
+                oi,
+            });
+        }
+        Ok(rows)
+    }
+}
+
+fn ms_to_utc(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
 }
 
 fn parse_depth_levels(json: &Value, field: &str) -> Result<Vec<(f64, f64)>> {
