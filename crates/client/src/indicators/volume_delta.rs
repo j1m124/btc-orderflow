@@ -27,7 +27,9 @@ use super::output::{IndicatorOutput, ValueReadout};
 use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
-use crate::settings_form::{DropdownOption, Field, IndicatorTarget, SettingsForm, SettingsGroup};
+use crate::settings_form::{
+    DropdownOption, Field, IndicatorTarget, SettingsForm, SettingsGroup, inst_color_field,
+};
 
 /// Scale a delta value (`2*tbv - volume`) into the global volume unit.
 /// USD multiplies by `c.close` so the histogram, y-range, and readout
@@ -226,31 +228,44 @@ impl IndicatorKind for VolumeDeltaParams {
         panel: WeakEntity<ContentPanel>,
         id: InstanceId,
     ) -> Option<SettingsForm> {
-        let target: IndicatorTarget<VolumeDeltaParams> = IndicatorTarget::new(panel, id);
+        let target: IndicatorTarget<VolumeDeltaParams> = IndicatorTarget::new(panel.clone(), id);
         let form_id = SharedString::from(format!("volume-delta-{}", id));
+
+        let mode_field = Field::dropdown(
+            "Mode",
+            vec![
+                DropdownOption::new("Histogram", "Histogram"),
+                DropdownOption::new("Cvd", "CVD"),
+            ],
+            target.getter(SharedString::from("Histogram"), |p: &VolumeDeltaParams| {
+                match p.mode {
+                    VolumeDeltaMode::Histogram => SharedString::from("Histogram"),
+                    VolumeDeltaMode::Cvd => SharedString::from("Cvd"),
+                }
+            }),
+            target.setter(|p: &mut VolumeDeltaParams, v: SharedString| {
+                p.mode = match v.as_ref() {
+                    "Cvd" => VolumeDeltaMode::Cvd,
+                    _ => VolumeDeltaMode::Histogram,
+                };
+            }),
+        )
+        .description("Histogram: per-bar signed delta. CVD: running cumulative line.");
+
+        // CVD draws a single line off color slot 0; the histogram is
+        // sign-colored off the theme and ignores this slot, so only surface
+        // the picker in CVD mode.
+        let is_cvd = target.clone();
+        let line_color = inst_color_field("Line color", panel, id, 0)
+            .description("Color of the CVD line.")
+            .visible_if(move |cx| {
+                is_cvd
+                    .read(cx, |p: &VolumeDeltaParams| matches!(p.mode, VolumeDeltaMode::Cvd))
+                    .unwrap_or(false)
+            });
+
         Some(SettingsForm::new(form_id).group(
-            SettingsGroup::new("General").item(
-                Field::dropdown(
-                    "Mode",
-                    vec![
-                        DropdownOption::new("Histogram", "Histogram"),
-                        DropdownOption::new("Cvd", "CVD"),
-                    ],
-                    target.getter(SharedString::from("Histogram"), |p: &VolumeDeltaParams| {
-                        match p.mode {
-                            VolumeDeltaMode::Histogram => SharedString::from("Histogram"),
-                            VolumeDeltaMode::Cvd => SharedString::from("Cvd"),
-                        }
-                    }),
-                    target.setter(|p: &mut VolumeDeltaParams, v: SharedString| {
-                        p.mode = match v.as_ref() {
-                            "Cvd" => VolumeDeltaMode::Cvd,
-                            _ => VolumeDeltaMode::Histogram,
-                        };
-                    }),
-                )
-                .description("Histogram: per-bar signed delta. CVD: running cumulative line."),
-            ),
+            SettingsGroup::new("General").item(mode_field).item(line_color),
         ))
     }
 }

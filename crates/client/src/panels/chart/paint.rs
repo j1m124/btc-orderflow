@@ -2966,12 +2966,12 @@ pub(super) fn paint_sub_pane(
             let down_color = params.down_color.unwrap_or(Hsla { a: 1.0, ..bearish });
             match params.render {
                 OiRenderMode::Line => {
-                    // Direction-colored close line: each segment is green when
-                    // OI rose vs the previous point, red when it fell. Two
-                    // accumulated paths → 2 paint calls regardless of bar count.
-                    let mut up_pb = PathBuilder::stroke(px(1.5));
-                    let mut down_pb = PathBuilder::stroke(px(1.5));
-                    let mut prev: Option<(f32, f32, f64)> = None;
+                    // Single-color close line off color slot 0 (same picker
+                    // model as the CVD line). One accumulated path → one paint
+                    // call regardless of bar count.
+                    let line_color = item.color_at(0);
+                    let mut pb = PathBuilder::stroke(px(1.5));
+                    let mut prev: Option<Point<Pixels>> = None;
                     let lo = start_idx;
                     let hi = visible_end.min(close.len());
                     for i in lo..hi {
@@ -2985,18 +2985,14 @@ pub(super) fn paint_sub_pane(
                         );
                         let y = band_y(y_lo, y_hi, v, chart_top, chart_bottom);
                         let p = point(px(x) + origin.x, px(y) + origin.y);
-                        if let Some((px0, py0, v0)) = prev {
-                            let pb = if v >= v0 { &mut up_pb } else { &mut down_pb };
-                            pb.move_to(point(px(px0) + origin.x, px(py0) + origin.y));
+                        if let Some(p0) = prev {
+                            pb.move_to(p0);
                             pb.line_to(p);
                         }
-                        prev = Some((x, y, v));
+                        prev = Some(p);
                     }
-                    if let Ok(path) = up_pb.build() {
-                        window.paint_path(path, up_color);
-                    }
-                    if let Ok(path) = down_pb.build() {
-                        window.paint_path(path, down_color);
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(path, line_color);
                     }
                 }
                 OiRenderMode::Candles => {
@@ -3175,7 +3171,7 @@ struct BarStatShow {
 }
 
 /// One row of the BarStat pane. `signed` = use bull/bear tint by data
-/// sign (delta + OI Δ); otherwise the row uses its fixed `base` color.
+/// sign (delta only); otherwise the row uses its fixed `base` color.
 /// `daily_max` carries the per-bar rolling-24h maxima for the Daily grade.
 /// `header` is a short row tag painted in the right-edge gutter so the
 /// user can identify which row is which without remembering the order.
@@ -3225,9 +3221,9 @@ fn paint_bar_stat_pane(
 ) {
     use crate::indicators::BarStatGrade;
 
-    // Fixed blue base for the volume row — keeps it visually distinct
-    // from the bull/bear-tinted delta cell so the eye can read each row
-    // as a separate metric. Liq rows reuse the bull/bear theme colors
+    // Fixed blue base for the volume + OI-Δ rows — keeps them visually
+    // distinct from the bull/bear-tinted delta cell so the eye can read each
+    // row as a separate metric. Liq rows reuse the bull/bear theme colors
     // directly (long-liq = bearish, short-liq = bullish), so they share
     // visual vocabulary with the dedicated liq_bars indicator.
     let volume_base = gpui::hsla(0.61, 0.80, 0.55, 1.0);
@@ -3255,6 +3251,19 @@ fn paint_bar_stat_pane(
             header: "Δ",
         });
     }
+    if show.oi_delta {
+        // Blue base like volume (not bull/bear tinted): OI Δ reads as its
+        // own metric, with the rise/fall direction carried by the signed
+        // text value rather than the cell color.
+        rows.push(BarStatRow {
+            values: oi_delta,
+            daily_max: Some(daily_max_oi_delta),
+            base: volume_base,
+            signed: false,
+            formatter: format_signed_compact,
+            header: "OI Δ",
+        });
+    }
     if show.long_liq {
         rows.push(BarStatRow {
             values: long_liq,
@@ -3273,16 +3282,6 @@ fn paint_bar_stat_pane(
             signed: false,
             formatter: format_compact,
             header: "S LIQ",
-        });
-    }
-    if show.oi_delta {
-        rows.push(BarStatRow {
-            values: oi_delta,
-            daily_max: Some(daily_max_oi_delta),
-            base: bullish, // overridden per cell when `signed`
-            signed: true,
-            formatter: format_signed_compact,
-            header: "OI Δ",
         });
     }
 
@@ -3385,8 +3384,10 @@ fn paint_bar_stat_pane(
 
             for (row_idx, row) in rows.iter().enumerate() {
                 let y_top = chart_top + row_h * row_idx as f32;
-                let v = match row.values.get(i).copied().flatten() {
-                    Some(v) => v,
+                // In-bounds cells with no data render as 0 (same as a real
+                // zero); only skip positions past the end of this row's series.
+                let v = match row.values.get(i) {
+                    Some(cell) => cell.unwrap_or(0.0),
                     None => continue,
                 };
                 let intensity =

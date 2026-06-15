@@ -1,9 +1,10 @@
 //! Bar statistic row: per-bar metrics rendered as stacked text cells, with
 //! optional heatmap-style color grading. Up to five rows are surfaced (in
-//! fixed order): volume, signed delta, long-liquidation total, short-
-//! liquidation total, OI delta (placeholder — empty row pending wiring).
-//! Which rows actually render is decided by the `show_*` flags in
-//! `BarStatParams`; paint divides pane height by the visible row count.
+//! fixed order): volume, signed delta, OI delta, long-liquidation total,
+//! short-liquidation total. Volume and OI delta paint with a fixed blue base
+//! tint; the delta row is bull/bear tinted by sign. Which rows actually
+//! render is decided by the `show_*` flags in `BarStatParams`; paint divides
+//! pane height by the visible row count.
 //!
 //! Grading modes (paint-time decision; compute always emits the full data
 //! set so a mode flip is a pure paint refresh):
@@ -86,8 +87,8 @@ pub struct BarStatParams {
     pub show_long_liq: bool,
     #[serde(default)]
     pub show_short_liq: bool,
-    /// Placeholder for an OI-delta row that isn't wired up yet. When true
-    /// the row slot is allocated in the pane but the cell paints empty.
+    /// Per-bar open-interest change (close − open) row. Rendered directly
+    /// below the delta row with a fixed blue base tint (like volume).
     #[serde(default)]
     pub show_oi_delta: bool,
 }
@@ -115,9 +116,9 @@ impl BarStatParams {
         [
             self.show_volume,
             self.show_delta,
+            self.show_oi_delta,
             self.show_long_liq,
             self.show_short_liq,
-            self.show_oi_delta,
         ]
         .into_iter()
         .filter(|b| *b)
@@ -319,6 +320,12 @@ impl IndicatorKind for BarStatParams {
                 target.setter(|p: &mut BarStatParams, v: bool| p.show_delta = v),
             ),
             MultiCheckItem::new(
+                "OI Δ",
+                target.getter(false, |p: &BarStatParams| p.show_oi_delta),
+                target.setter(|p: &mut BarStatParams, v: bool| p.show_oi_delta = v),
+            )
+            .description("Per-bar change in open interest (close − open)."),
+            MultiCheckItem::new(
                 "Long Liq",
                 target.getter(false, |p: &BarStatParams| p.show_long_liq),
                 target.setter(|p: &mut BarStatParams, v: bool| p.show_long_liq = v),
@@ -328,12 +335,6 @@ impl IndicatorKind for BarStatParams {
                 target.getter(false, |p: &BarStatParams| p.show_short_liq),
                 target.setter(|p: &mut BarStatParams, v: bool| p.show_short_liq = v),
             ),
-            MultiCheckItem::new(
-                "OI Δ",
-                target.getter(false, |p: &BarStatParams| p.show_oi_delta),
-                target.setter(|p: &mut BarStatParams, v: bool| p.show_oi_delta = v),
-            )
-            .description("Per-bar change in open interest (close − open)."),
         ];
 
         let rows_field = Field::multi_checkbox("Show rows", items)

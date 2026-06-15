@@ -1,7 +1,7 @@
 //! Open interest — sub-pane line (default) or candlesticks of the symbol's
-//! total open interest. The line is direction-colored (bullish when OI rises
-//! bar-over-bar, bearish when it falls); candle mode draws per-bar OHLC. The
-//! axis unit follows the chart's `VolumeUnit` toggle — Coin shows contracts,
+//! total open interest. The line is a single color (color slot 0, like the
+//! CVD line); candle mode draws per-bar OHLC tinted by the up/down colors.
+//! The axis unit follows the chart's `VolumeUnit` toggle — Coin shows contracts,
 //! USD shows `OI × candle close` (Binance's live OI endpoint has no USD
 //! figure, so this is an approximation, consistent with the rest of the
 //! chart's USD rendering).
@@ -13,7 +13,8 @@
 
 use std::any::Any;
 
-use gpui::{Hsla, SharedString, WeakEntity};
+use gpui::{App, Hsla, SharedString, WeakEntity};
+use gpui_component::ActiveTheme as _;
 use serde::{Deserialize, Serialize};
 
 use super::instance::InstanceId;
@@ -23,13 +24,13 @@ use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
 use crate::services::market_data::Candle;
 use crate::settings_form::{
-    DropdownOption, Field, IndicatorTarget, SettingsForm, SettingsGroup,
+    DropdownOption, Field, IndicatorTarget, SettingsForm, SettingsGroup, inst_color_field,
 };
 
 /// Sub-pane render style.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OiRenderMode {
-    /// Direction-colored line/area of the per-bar close. Default.
+    /// Single-color line of the per-bar close. Default.
     Line,
     /// Per-bar OHLC candlesticks of open interest.
     Candles,
@@ -41,8 +42,9 @@ impl Default for OiRenderMode {
     }
 }
 
-/// Per-instance params. Color overrides are deferred (no UI in v1); paint
-/// reads bull/bear straight off the theme.
+/// Per-instance params. `up_color` / `down_color` override the rise/fall
+/// colors used by both the line and candle renders; `None` falls back to the
+/// theme's bullish / bearish chart colors.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OpenInterestParams {
     #[serde(default)]
@@ -190,7 +192,7 @@ impl IndicatorKind for OpenInterestParams {
         // Render-mode edits don't change the subscription need (the sub is
         // gated on the indicator's presence, handled by the add/remove
         // refresh hooks), so the default no-op AfterChange is fine here.
-        let target: IndicatorTarget<OpenInterestParams> = IndicatorTarget::new(panel, id);
+        let target: IndicatorTarget<OpenInterestParams> = IndicatorTarget::new(panel.clone(), id);
         let form_id = SharedString::from(format!("open-interest-{}", id));
 
         let render_field = Field::dropdown(
@@ -212,11 +214,66 @@ impl IndicatorKind for OpenInterestParams {
                 };
             }),
         )
-        .description("Line draws the direction-colored OI close; Candles draws per-bar OHLC.");
+        .description("Line draws a single-color OI close; Candles draws per-bar OHLC.");
+
+        // Line mode: one color off slot 0 (same picker model as the CVD line).
+        let is_line = target.clone();
+        let line_color_field = inst_color_field("Line color", panel, id, 0)
+            .description("Color of the OI line.")
+            .visible_if(move |cx| {
+                is_line
+                    .read(cx, |p: &OpenInterestParams| matches!(p.render, OiRenderMode::Line))
+                    .unwrap_or(true)
+            });
+
+        // Candle mode: rise/fall body colors. `None` falls back to the theme
+        // bull/bear, so the swatch reflects the live default until overridden.
+        let up_target = target.clone();
+        let up_visible = target.clone();
+        let up_color_field = Field::color(
+            "Up color",
+            move |cx: &App| {
+                up_target
+                    .read(cx, |p: &OpenInterestParams| p.up_color)
+                    .flatten()
+                    .unwrap_or_else(|| cx.theme().chart_bullish)
+            },
+            target.setter(|p: &mut OpenInterestParams, c: Hsla| p.up_color = Some(c)),
+        )
+        .description("Candle body color when OI rises bar-over-bar.")
+        .visible_if(move |cx| {
+            up_visible
+                .read(cx, |p: &OpenInterestParams| matches!(p.render, OiRenderMode::Candles))
+                .unwrap_or(false)
+        });
+
+        let down_target = target.clone();
+        let down_visible = target.clone();
+        let down_color_field = Field::color(
+            "Down color",
+            move |cx: &App| {
+                down_target
+                    .read(cx, |p: &OpenInterestParams| p.down_color)
+                    .flatten()
+                    .unwrap_or_else(|| cx.theme().chart_bearish)
+            },
+            target.setter(|p: &mut OpenInterestParams, c: Hsla| p.down_color = Some(c)),
+        )
+        .description("Candle body color when OI falls bar-over-bar.")
+        .visible_if(move |cx| {
+            down_visible
+                .read(cx, |p: &OpenInterestParams| matches!(p.render, OiRenderMode::Candles))
+                .unwrap_or(false)
+        });
 
         Some(
-            SettingsForm::new(form_id)
-                .group(SettingsGroup::new("General").item(render_field)),
+            SettingsForm::new(form_id).group(
+                SettingsGroup::new("General")
+                    .item(render_field)
+                    .item(line_color_field)
+                    .item(up_color_field)
+                    .item(down_color_field),
+            ),
         )
     }
 }
