@@ -70,6 +70,20 @@ const LIQUIDATIONS_BUFFER_CAP: usize = 1000;
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
+/// Interval between application-level pings. Each ping (a) measures RTT for
+/// the bottom-bar readout and (b) feeds zombie detection. See `pump`.
+const PING_INTERVAL: Duration = Duration::from_secs(2);
+/// Force a reconnect once this many ping intervals elapse with no `Pong`. At
+/// `PING_INTERVAL` = 2s that's ~8–10s of silence before we treat the socket
+/// as a zombie (TCP open, server gone quiet) and drop it. Robust to
+/// backgrounded-tab timer throttling: a throttled timer still sends one ping
+/// per fire and any `Pong` resets the counter, so slow firing can't false-trip.
+const MAX_MISSED_PONGS: u32 = 4;
+/// EMA smoothing factor for the displayed RTT. Higher = tracks spikes faster,
+/// lower = steadier. 0.3 lightly damps jitter while still surfacing a real
+/// latency change within a few samples.
+const RTT_EMA_ALPHA: f64 = 0.3;
+
 /// A chart timeframe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Timeframe {
@@ -664,6 +678,11 @@ pub struct MarketDataService {
     conn_status: LiveStatus,
     last_message_ms: Option<i64>,
 
+    /// Smoothed (EMA) round-trip time in ms of the app-level ping/pong, or
+    /// `None` until the first `Pong` on the current connection. Reset on every
+    /// (re)connect so a fresh socket never shows latency from before an outage.
+    rtt_ema: Option<f64>,
+
     /// Owned Tasks for the connection driver + release pump. Stored on the
     /// struct so `Drop` on the entity tears them down. Spawned via
     /// `Context<Self>::spawn` (WeakEntity-based) so update closures never
@@ -746,6 +765,7 @@ impl MarketDataService {
             release_tx,
             conn_status: LiveStatus::Connecting,
             last_message_ms: None,
+            rtt_ema: None,
             _ws_task: ws_task,
             _release_task: release_task,
         }
@@ -1019,6 +1039,13 @@ impl MarketDataService {
 
     pub fn last_message_ms(&self) -> Option<i64> {
         self.last_message_ms
+    }
+
+    /// Smoothed round-trip time (ms), or `None` until the first `Pong` arrives
+    /// on the current connection. The bottom bar renders this in the
+    /// connection pill while connected.
+    pub fn rtt_ms(&self) -> Option<i64> {
+        self.rtt_ema.map(|v| v.round() as i64)
     }
 
     /// Request older bars for an existing subscription. The page is keyed
@@ -1861,6 +1888,25 @@ impl MarketDataService {
         });
     }
 
+    /// Fold a fresh RTT sample into the EMA, seeding with the first sample on
+    /// a connection. Called from `pump` on every `Pong`. The bottom bar
+    /// repaints every frame (it self-drives via `request_animation_frame`), so
+    /// no `cx.notify()` is needed for the readout to pick this up.
+    fn record_rtt(&mut self, rtt_ms: i64) {
+        let sample = rtt_ms.max(0) as f64;
+        self.rtt_ema = Some(match self.rtt_ema {
+            Some(prev) => RTT_EMA_ALPHA * sample + (1.0 - RTT_EMA_ALPHA) * prev,
+            None => sample,
+        });
+        self.last_message_ms = Some(chrono::Utc::now().timestamp_millis());
+    }
+
+    /// Clear the smoothed RTT so a fresh connection never displays latency
+    /// measured before an outage. Called on (re)connect.
+    fn reset_rtt(&mut self) {
+        self.rtt_ema = None;
+    }
+
     fn set_conn_status(&mut self, status: LiveStatus, cx: &mut Context<Self>) {
         if self.conn_status == status {
             return;
@@ -2149,6 +2195,7 @@ async fn run_connection(
                 drain_pending(&mut outbound_rx);
                 defer_update(&this, cx, |s, cx| {
                     s.set_conn_status(LiveStatus::Connected, cx);
+                    s.reset_rtt();
                     s.resubscribe_all();
                 });
 
@@ -2206,12 +2253,53 @@ async fn pump(
 ) {
     use futures::future::FutureExt;
     let (mut sink, mut input) = stream.split();
+
+    // App-level ping loop, lifecycle-bound to this connection. `outstanding`
+    // counts pings sent since the last `Pong`; any `Pong` resets it (inbound
+    // arm below). The timer is declared OUTSIDE the loop and re-armed on fire —
+    // recreating it inline each iteration would let the steady market-data
+    // frame stream perpetually re-poll a fresh timer so it never reaches
+    // `PING_INTERVAL`. Box::pin gives the `Unpin + FusedFuture` that select!
+    // needs to poll it by reference across iterations.
+    let mut outstanding: u32 = 0;
+    let mut ping_timer = Box::pin(cx.background_executor().timer(PING_INTERVAL).fuse());
+
     loop {
         futures::select! {
+            _ = ping_timer => {
+                ping_timer = Box::pin(cx.background_executor().timer(PING_INTERVAL).fuse());
+                // Too many unanswered pings ⇒ the socket is a zombie (TCP open,
+                // server gone silent). Drop it; `run_connection` reconnects with
+                // backoff, and the existing "Disconnected after N attempts" UI
+                // takes over if the server is genuinely gone.
+                if outstanding >= MAX_MISSED_PONGS {
+                    let _ = sink.close().await;
+                    return;
+                }
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                outstanding += 1;
+                match serde_json::to_string(&proto::ClientFrame::Ping { ts_ms }) {
+                    Ok(json) => {
+                        if sink.send(WsMessage::Text(json)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => log::warn!("encode ping frame: {e:?}"),
+                }
+            }
             inc = input.next().fuse() => {
                 match inc {
                     Some(WsMessage::Text(txt)) => {
                         match serde_json::from_str::<proto::ServerFrame>(&txt) {
+                            // Intercept Pong here — RTT is measured at the point
+                            // closest to arrival, and the miss counter is
+                            // pump-local. Hand the sample to the service for the
+                            // EMA + bottom-bar readout.
+                            Ok(proto::ServerFrame::Pong { ts_ms }) => {
+                                outstanding = 0;
+                                let rtt = chrono::Utc::now().timestamp_millis() - ts_ms;
+                                defer_update(this, cx, move |s, _cx| s.record_rtt(rtt));
+                            }
                             Ok(frame) => {
                                 // Defer entity.update to a fresh executor
                                 // tick. If we apply the frame synchronously

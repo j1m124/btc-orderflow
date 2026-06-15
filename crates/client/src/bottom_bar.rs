@@ -78,7 +78,10 @@ impl Render for BottomBar {
         // failed reconnect attempts in a row crosses into "Disconnected"
         // — the user should know the feed is gone.
         let md = cx.global::<MarketDataServiceHandle>().0.clone();
-        let md_status = md.read(cx).overall_status();
+        let (md_status, rtt_ms) = {
+            let svc = md.read(cx);
+            (svc.overall_status(), svc.rtt_ms())
+        };
 
         let (dot_color, status_label): (gpui::Hsla, SharedString) = match &md_status {
             LiveStatus::Reconnecting { attempts } if *attempts >= 4 => {
@@ -88,6 +91,32 @@ impl Render for BottomBar {
             LiveStatus::Reconnecting { .. } => (amber, "Reconnecting…".into()),
             LiveStatus::Connected => (bullish, "Connected".into()),
         };
+
+        // RTT is a connected-only concept: show it only while the feed is up.
+        // Before the first pong lands we show a muted "— ms" placeholder so the
+        // pill width doesn't jump when the number arrives. Thresholds tuned for
+        // a cross-region hop to the EU VPS: green < 100ms, amber ≤ 250ms, red
+        // beyond. The leading "·" stays muted to match the "· market data" tail.
+        let rtt_chip = matches!(md_status, LiveStatus::Connected).then(|| {
+            let (value, color) = match rtt_ms {
+                Some(ms) => {
+                    let color = if ms < 100 {
+                        bullish
+                    } else if ms <= 250 {
+                        amber
+                    } else {
+                        bearish
+                    };
+                    (SharedString::from(format!("{ms} ms")), color)
+                }
+                None => (SharedString::from("— ms"), muted),
+            };
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(div().text_xs().text_color(muted).child("·"))
+                .child(div().text_xs().font_semibold().text_color(color).child(value))
+        });
 
         let connection = h_flex()
             .gap_1p5()
@@ -99,6 +128,7 @@ impl Render for BottomBar {
                     .text_color(theme.foreground)
                     .child(status_label),
             )
+            .children(rtt_chip)
             .child(div().text_xs().text_color(muted).child("· market data"));
 
         // Display clock honours the user's timezone choice; Auto falls back
