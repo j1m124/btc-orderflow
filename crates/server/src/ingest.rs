@@ -109,15 +109,36 @@ const AGGTRADE_PAGE_DELAY: StdDuration = StdDuration::from_millis(600);
 /// latency to the snapshot/footprint query path.
 const TRADE_WRITER_FLUSH: StdDuration = StdDuration::from_millis(100);
 
-/// Cadence of `book_snapshots` rows persisted by the book maintainer. 1s
-/// matches the heatmap pixel granularity at typical zooms; smaller would
-/// be over-resolution, larger would lose heatmap detail.
-const BOOK_SNAPSHOT_INTERVAL: StdDuration = StdDuration::from_secs(1);
+/// Cadence of `book_snapshots` rows persisted by the book maintainer. 1m keeps
+/// the persisted history cheap (60× fewer rows than the old 1s cadence) and
+/// matches the heatmap's natural unit at 1m+ timeframes — each 1m candle gets
+/// exactly one stored sample. Trade-off: at *sub*-1m timeframes the paged
+/// (historical) heatmap is coarser than the candles (only one stored sample per
+/// minute), so columns between samples fall back to the carry-in book. The
+/// client's live 1s sampler (`BOOK_SAMPLE_INTERVAL`) keeps the recent tail at
+/// full 1s detail; only DB-backed history is coarsened.
+const BOOK_SNAPSHOT_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
-/// How many levels each side go into the persisted snapshot row. Matches
-/// the `book_snapshots` schema invariant (top 50). The live wire BookDelta
-/// stream is independent and may filter to any client-requested depth.
-const BOOK_SNAPSHOT_DEPTH: usize = 50;
+/// How many raw levels each side feed the persisted snapshot row. The REST seed
+/// (`/fapi/v1/depth?limit=1000`) only fills the top ~1000/side, but the
+/// `depth@100ms` diff stream then keeps mutating levels across the whole book,
+/// so the maintained `Book` accumulates beyond the seed over time. 10000 lets
+/// the heatmap replay that deeper resting liquidity; `top_n(10000)` simply
+/// returns however many levels the book actually holds (≤ 10000). Note this is
+/// a ceiling on *accumulated active* depth, not true full-book depth: a
+/// sequence gap re-bootstraps the book back to the ~1000-level seed (Binance's
+/// REST max), and static walls beyond the seed that never change are never
+/// reported by diffs. The live wire BookDelta stream is independent and may
+/// filter to any client-requested depth.
+const BOOK_SNAPSHOT_DEPTH: usize = 10000;
+
+/// Price-bucket width for the persisted snapshot, in dollars: **50 ticks ×
+/// $0.10** (BTCUSDT-perp tick). The raw `top_n` levels are aggregated into these
+/// $5 bins before writing, so a 10k-deep side collapses to ~(active span / $5)
+/// rows. The heatmap (the only consumer of `book_snapshots`) re-buckets to this
+/// same width at render, so bucketing here is lossless for it while keeping
+/// deep rows cheap. Must match the client's `PRICE_BUCKET` / `BOOK_BUCKET_USD`.
+const BOOK_BUCKET_USD: f64 = 5.0;
 
 /// Depth-snapshot REST limit. Always request 1000 — gives the maintainer a
 /// robust resync point even if diffs lag at boot.
@@ -444,13 +465,18 @@ async fn flush_liquidation_buffer(
 // --- Open interest poller + backfill + writer -------------------------------
 
 /// Cadence of the live open-interest poll. Binance recomputes OI slower than
-/// this, so polls that land on an unchanged value dedupe for free on the
-/// `(symbol, ts)` PK (we tag each sample with Binance's own `time`). Weight 1
-/// per call → 12/min, negligible against the 2400/min IP budget.
-const OPEN_INTEREST_POLL_INTERVAL: StdDuration = StdDuration::from_secs(5);
+/// this (every few seconds), so 1s polling catches each new value promptly
+/// while the surplus polls that land on an unchanged snapshot dedupe for free
+/// on the `(symbol, ts)` PK (we tag each sample with Binance's own `time`, not
+/// wall-clock). Weight 1 per call → 60/min, negligible against the 2400/min IP
+/// budget — and the only recurring REST call in steady state, so bumping it
+/// here doesn't crowd out the kline/depth gap-heal bursts.
+const OPEN_INTEREST_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
-/// Flush cadence for the OI writer's row buffer. Samples arrive at ~0.2/sec,
-/// so 1s batching keeps writes to one tiny upsert per second.
+/// Flush cadence for the OI writer's row buffer. Samples arrive at ~1/sec
+/// (the poll cadence), so 1s batching keeps writes to one tiny upsert per
+/// second — and `ON CONFLICT DO NOTHING` collapses any unchanged-snapshot
+/// duplicates within the batch.
 const OPEN_INTEREST_WRITER_FLUSH: StdDuration = StdDuration::from_secs(1);
 
 /// Binance period bucket used for OI cold-start backfill. 5m is the finest
@@ -818,8 +844,9 @@ fn emit_tick(
 ///   5. Apply subsequent diffs in order; on a `pu` mismatch or any other
 ///      sync error, mark the book uninitialized and restart from step 2.
 ///
-/// A separate 1s timer reads the current top-50 each side and persists it
-/// to `book_snapshots`. No persistence is possible during the (re-)bootstrap
+/// A separate `BOOK_SNAPSHOT_INTERVAL` timer reads the current
+/// top-`BOOK_SNAPSHOT_DEPTH` each side and persists it to `book_snapshots`.
+/// No persistence is possible during the (re-)bootstrap
 /// window — the book is empty/transitioning, so the snapshot is meaningless
 /// for replay until initialized.
 pub async fn run_book_maintainer(
@@ -936,7 +963,8 @@ async fn maintain_one_session(
     }
 }
 
-/// Read the current top-50 each side and write one `book_snapshots` row.
+/// Read the current top-`BOOK_SNAPSHOT_DEPTH` each side, aggregate into
+/// `BOOK_BUCKET_USD` price bins, and write one `book_snapshots` row.
 async fn persist_snapshot(pool: &PgPool, symbol: &str, book_state: &BookState) {
     let (bids, asks) = {
         let book = book_state.inner.read().await;
@@ -948,9 +976,32 @@ async fn persist_snapshot(pool: &PgPool, symbol: &str, book_state: &BookState) {
     if bids.is_empty() && asks.is_empty() {
         return;
     }
+    // `top_n` is best-first (bids desc, asks asc), so equal-bucket levels are
+    // adjacent — a single fold aggregates them while preserving the ordering.
+    let bids = bucket_sorted(&bids);
+    let asks = bucket_sorted(&asks);
     if let Err(e) = db::upsert_book_snapshot(pool, symbol, Utc::now(), &bids, &asks).await {
         warn!(symbol, error = ?e, "book snapshot upsert failed");
     }
+}
+
+/// Aggregate price-sorted `(price, size)` levels into `BOOK_BUCKET_USD` bins,
+/// summing size per bin. Input must be sorted by price (either direction); each
+/// bin is emitted with its low boundary as the price, preserving the input
+/// order (so best-first input stays best-first out).
+fn bucket_sorted(levels: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for &(price, size) in levels {
+        if size <= 0.0 {
+            continue;
+        }
+        let bucket_low = (price / BOOK_BUCKET_USD).floor() * BOOK_BUCKET_USD;
+        match out.last_mut() {
+            Some(last) if last.0 == bucket_low => last.1 += size,
+            _ => out.push((bucket_low, size)),
+        }
+    }
+    out
 }
 
 /// Drain the broadcast channel forever, UPSERTing every **closed** kline
