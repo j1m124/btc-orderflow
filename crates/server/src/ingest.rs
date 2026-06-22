@@ -119,26 +119,37 @@ const TRADE_WRITER_FLUSH: StdDuration = StdDuration::from_millis(100);
 /// full 1s detail; only DB-backed history is coarsened.
 const BOOK_SNAPSHOT_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
-/// How many raw levels each side feed the persisted snapshot row. The REST seed
-/// (`/fapi/v1/depth?limit=1000`) only fills the top ~1000/side, but the
-/// `depth@100ms` diff stream then keeps mutating levels across the whole book,
-/// so the maintained `Book` accumulates beyond the seed over time. 10000 lets
-/// the heatmap replay that deeper resting liquidity; `top_n(10000)` simply
-/// returns however many levels the book actually holds (≤ 10000). Note this is
-/// a ceiling on *accumulated active* depth, not true full-book depth: a
-/// sequence gap re-bootstraps the book back to the ~1000-level seed (Binance's
-/// REST max), and static walls beyond the seed that never change are never
-/// reported by diffs. The live wire BookDelta stream is independent and may
-/// filter to any client-requested depth.
-const BOOK_SNAPSHOT_DEPTH: usize = 10000;
+/// Persisted-snapshot half-depth in **$5 buckets per side**: 500 buckets ×
+/// `BOOK_BUCKET_USD` ($5) ⇒ a hard **±$2500** price band around mid. This is a
+/// price bound, *not* a raw-level count — `top_n(N)` counts levels, which can't
+/// bound price span: a real book carries sparse, economically-dead resting
+/// orders far from mid (a $1k bid, a $105k ask) that the `depth@100ms` diff
+/// stream leaves in the maintained `Book` forever (no diff ever zeroes them),
+/// so a raw `top_n` spans $100k+ and the heatmap's full-extent y-band can't
+/// render it. `persist_snapshot` therefore scans the whole book and keeps only
+/// levels within ±(`BOOK_SNAPSHOT_DEPTH` × `BOOK_BUCKET_USD`) before bucketing.
+/// The heatmap (the only consumer) renders within this band, and the client's
+/// live sampler is bound to the same span. The live wire BookDelta stream is
+/// independent and may filter to any client-requested depth.
+const BOOK_SNAPSHOT_DEPTH: usize = 500;
 
 /// Price-bucket width for the persisted snapshot, in dollars: **50 ticks ×
-/// $0.10** (BTCUSDT-perp tick). The raw `top_n` levels are aggregated into these
-/// $5 bins before writing, so a 10k-deep side collapses to ~(active span / $5)
-/// rows. The heatmap (the only consumer of `book_snapshots`) re-buckets to this
-/// same width at render, so bucketing here is lossless for it while keeping
-/// deep rows cheap. Must match the client's `PRICE_BUCKET` / `BOOK_BUCKET_USD`.
+/// $0.10** (BTCUSDT-perp tick). The in-band levels are aggregated into these $5
+/// bins before writing, so each side collapses to ≤ `BOOK_SNAPSHOT_DEPTH` rows
+/// (the band is `BOOK_SNAPSHOT_DEPTH` buckets wide). The heatmap (the only
+/// consumer of `book_snapshots`) re-buckets to this same width at render, so
+/// bucketing here is lossless for it while keeping rows cheap. Must match the
+/// client's `PRICE_BUCKET` / `BOOK_BUCKET_USD`.
 const BOOK_BUCKET_USD: f64 = 5.0;
+
+/// Half-width of the served book price band, in dollars: `BOOK_SNAPSHOT_DEPTH`
+/// ($5 buckets) × `BOOK_BUCKET_USD` ⇒ **±$2500** around mid. Bounds the price
+/// *span* of every book read — the persisted snapshot (`persist_snapshot`) and
+/// the live forwarder (`gateway::session`) — so no consumer ever sees the
+/// phantom far-from-mid tail. The forwarder applies it as an *intersection* with
+/// each subscription's depth, so shallow subs (the orderbook ladder) are
+/// unaffected; the heatmap's deep sub is what the band actually bounds.
+pub(crate) const BOOK_BAND_USD: f64 = BOOK_SNAPSHOT_DEPTH as f64 * BOOK_BUCKET_USD;
 
 /// Depth-snapshot REST limit. Always request 1000 — gives the maintainer a
 /// robust resync point even if diffs lag at boot.
@@ -844,8 +855,8 @@ fn emit_tick(
 ///   5. Apply subsequent diffs in order; on a `pu` mismatch or any other
 ///      sync error, mark the book uninitialized and restart from step 2.
 ///
-/// A separate `BOOK_SNAPSHOT_INTERVAL` timer reads the current
-/// top-`BOOK_SNAPSHOT_DEPTH` each side and persists it to `book_snapshots`.
+/// A separate `BOOK_SNAPSHOT_INTERVAL` timer snapshots the book within the
+/// ±`BOOK_BAND_USD` price band and persists it to `book_snapshots`.
 /// No persistence is possible during the (re-)bootstrap
 /// window — the book is empty/transitioning, so the snapshot is meaningless
 /// for replay until initialized.
@@ -963,21 +974,24 @@ async fn maintain_one_session(
     }
 }
 
-/// Read the current top-`BOOK_SNAPSHOT_DEPTH` each side, aggregate into
-/// `BOOK_BUCKET_USD` price bins, and write one `book_snapshots` row.
+/// Read the whole book within the ±`BOOK_BAND_USD` price band around mid,
+/// aggregate into `BOOK_BUCKET_USD` price bins, and write one `book_snapshots`
+/// row (≤ `BOOK_SNAPSHOT_DEPTH` buckets/side).
 async fn persist_snapshot(pool: &PgPool, symbol: &str, book_state: &BookState) {
     let (bids, asks) = {
         let book = book_state.inner.read().await;
         if !book.is_initialized() {
             return;
         }
-        book.top_n(BOOK_SNAPSHOT_DEPTH)
+        // Pure price-band read (`n = usize::MAX`): the band, not a level count,
+        // bounds the persisted span. Drops the phantom far-from-mid tail.
+        book.top_n_within_band(usize::MAX, BOOK_BAND_USD)
     };
     if bids.is_empty() && asks.is_empty() {
         return;
     }
-    // `top_n` is best-first (bids desc, asks asc), so equal-bucket levels are
-    // adjacent — a single fold aggregates them while preserving the ordering.
+    // Best-first (bids desc, asks asc), so equal-bucket levels are adjacent — a
+    // single fold aggregates them while preserving the ordering.
     let bids = bucket_sorted(&bids);
     let asks = bucket_sorted(&asks);
     if let Err(e) = db::upsert_book_snapshot(pool, symbol, Utc::now(), &bids, &asks).await {

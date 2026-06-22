@@ -45,7 +45,7 @@ use super::GatewayState;
 use crate::binance::parse::{
     DepthDiff, KlineRow, LiquidationTick, OpenInterestTick, Tick, TradeTick,
 };
-use crate::ingest::BookState;
+use crate::ingest::{BOOK_BAND_USD, BookState};
 use crate::db;
 
 const SUPPORTED_SYMBOL: &str = "BTCUSDT";
@@ -666,12 +666,16 @@ async fn run_trades_subscription(
 // --- Book forwarder --------------------------------------------------------
 
 /// Book-channel forwarder. Snapshot reads top-N from the shared in-memory
-/// book; live diffs from Binance are relayed (filtered to the subscription's
-/// depth) as `BookDelta` frames, batched at 100ms.
+/// book (intersected with the ±`BOOK_BAND_USD` price band — see
+/// `Book::top_n_within_band`); live diffs from Binance are relayed (filtered to
+/// the same window) as `BookDelta` frames, batched at 100ms.
 ///
-/// Diff levels outside top-N are filtered out before emission. The set of
-/// "top-N prices" is recomputed from the shared book each batch — the live
-/// book moves around enough that pre-computing once would drift.
+/// Diff levels outside the window are filtered out before emission. The window
+/// is recomputed from the shared book each batch — the live book moves around
+/// enough that pre-computing once would drift. The band bounds the *span* so a
+/// deep sub (the heatmap) never streams the phantom far-from-mid tail; for a
+/// shallow sub (the orderbook ladder) the depth count is the tighter bound, so
+/// the band is a no-op there.
 async fn run_book_subscription(
     id: SubId,
     symbol: String,
@@ -690,7 +694,7 @@ async fn run_book_subscription(
         {
             let book = book_state.inner.read().await;
             if book.is_initialized() {
-                break book.top_n(depth);
+                break book.top_n_within_band(depth, BOOK_BAND_USD);
             }
         }
         if wait_attempts >= 20 {
@@ -759,10 +763,10 @@ async fn run_book_subscription(
                 if bid_buffer.is_empty() && ask_buffer.is_empty() {
                     continue;
                 }
-                // Filter to current top-N prices each side.
+                // Filter to the current window (top-N ∩ ±band) each side.
                 let (top_bid_price, top_ask_price) = {
                     let book = book_state.inner.read().await;
-                    let (bids, asks) = book.top_n(depth);
+                    let (bids, asks) = book.top_n_within_band(depth, BOOK_BAND_USD);
                     let bottom_bid = bids.last().map(|(p, _)| *p);
                     let top_ask = asks.last().map(|(p, _)| *p);
                     (bottom_bid, top_ask)
@@ -800,7 +804,7 @@ async fn run_book_subscription(
                     if !book.is_initialized() {
                         None
                     } else {
-                        Some(book.top_n(depth))
+                        Some(book.top_n_within_band(depth, BOOK_BAND_USD))
                     }
                 };
                 let Some((bids, asks)) = snapshot else {

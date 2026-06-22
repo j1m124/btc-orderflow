@@ -167,6 +167,37 @@ impl Book {
             .collect();
         (bids, asks)
     }
+
+    /// Top-N levels each side, best-first, additionally restricted to a `±band`
+    /// dollar window around mid (`(best_bid + best_ask) / 2`). The level count
+    /// alone can't bound the price *span*: the maintained book accumulates
+    /// sparse, economically-dead resting orders far from mid (a $1k bid, a $105k
+    /// ask) that no diff ever removes, so a deep `top_n` spans $100k+. Callers
+    /// that want a bounded span (the persisted snapshot, the heatmap forwarder)
+    /// pass the band; the filter is an *intersection* with `n`, so a shallow `n`
+    /// (the orderbook ladder) stays the tighter bound and is unaffected. Pass
+    /// `n = usize::MAX` for a pure price-band read.
+    pub fn top_n_within_band(
+        &self,
+        n: usize,
+        band: f64,
+    ) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+        let (bids, asks) = self.top_n(n);
+        // `first()` is best bid / best ask (the `top_n` ordering); derive mid
+        // from whichever side(s) exist.
+        let mid = match (bids.first(), asks.first()) {
+            (Some(&(b, _)), Some(&(a, _))) => (b + a) / 2.0,
+            (Some(&(b, _)), None) => b,
+            (None, Some(&(a, _))) => a,
+            (None, None) => return (bids, asks),
+        };
+        let lo = mid - band;
+        let hi = mid + band;
+        // best-first ⇒ take while inside the band (bids descend, asks ascend).
+        let bids: Vec<(f64, f64)> = bids.into_iter().take_while(|&(p, _)| p >= lo).collect();
+        let asks: Vec<(f64, f64)> = asks.into_iter().take_while(|&(p, _)| p <= hi).collect();
+        (bids, asks)
+    }
 }
 
 fn apply_level(side: &mut BTreeMap<Price, f64>, price: f64, size: f64) {
@@ -241,5 +272,35 @@ mod tests {
         assert_eq!(bids[2].0, 99.0);
         assert_eq!(asks[0].0, 103.0); // lowest ask first
         assert_eq!(asks[2].0, 107.0);
+    }
+
+    #[test]
+    fn top_n_within_band_drops_phantom_tail() {
+        // Best bid 100 / best ask 102 ⇒ mid 101. Each side has a dense near-mid
+        // cluster plus one phantom far-from-mid order well outside a ±5 band.
+        let book = Book::from_snapshot(
+            vec![(100.0, 1.0), (98.0, 2.0), (50.0, 9.0)], // 50 is the phantom bid
+            vec![(102.0, 1.0), (104.0, 2.0), (300.0, 9.0)], // 300 is the phantom ask
+            0,
+        );
+        // Pure price-band read (n = MAX): keeps the in-band cluster, drops the
+        // phantom ±-far orders (mid 101 ± 5 ⇒ [96, 106]).
+        let (bids, asks) = book.top_n_within_band(usize::MAX, 5.0);
+        assert_eq!(bids, vec![(100.0, 1.0), (98.0, 2.0)]);
+        assert_eq!(asks, vec![(102.0, 1.0), (104.0, 2.0)]);
+    }
+
+    #[test]
+    fn top_n_within_band_count_is_tighter_for_shallow_n() {
+        // A wide band (1000) never clips, so a shallow n stays the binding bound
+        // — the orderbook-ladder case: the band is a no-op there.
+        let book = Book::from_snapshot(
+            vec![(100.0, 1.0), (99.0, 2.0), (98.0, 3.0)],
+            vec![(101.0, 1.0), (102.0, 2.0), (103.0, 3.0)],
+            0,
+        );
+        let (bids, asks) = book.top_n_within_band(2, 1000.0);
+        assert_eq!(bids, vec![(100.0, 1.0), (99.0, 2.0)]);
+        assert_eq!(asks, vec![(101.0, 1.0), (102.0, 2.0)]);
     }
 }
