@@ -1,15 +1,15 @@
 //! WebSocket gateway — accepts client connections at `WS /ws`, multiplexes
 //! per-subscription snapshot+stream traffic over each socket.
 //!
-//! `GET /healthz` returns 200 once the server is past boot (this lives on
-//! the same axum router for ops convenience).
+//! `GET /healthz` returns 200 + the server's build SHA once the server is
+//! past boot (this lives on the same axum router for ops convenience).
 //!
-//! In prod the same router also serves the static SPA: any unmatched route
-//! is served from `STATIC_DIR` (set by Dokploy), with `index.html` as the
-//! SPA fallback. COOP/COEP response headers are applied to every response
-//! (required for SharedArrayBuffer, which gpui_platform needs). Cache
-//! headers split by path so Vite-hashed assets are cached forever while
-//! `index.html` stays no-cache.
+//! Since the server/client deploy split (see CLAUDE.md "Split deployment"),
+//! prod does NOT serve the static SPA here — a separate Caddy container owns
+//! the SPA + COOP/COEP + cache headers. The `STATIC_DIR` path below is kept
+//! only for local use (`make server` against a built `dist/`); in prod
+//! `STATIC_DIR` is unset, so only `/healthz` + `/ws` are routed and the
+//! `response_headers` middleware is inert (no documents pass through it).
 
 mod session;
 
@@ -83,8 +83,17 @@ pub async fn serve(addr: SocketAddr, state: GatewayState) -> Result<()> {
     Ok(())
 }
 
+/// Liveness probe + build identity. Returns the server's commit SHA (baked by
+/// `build.rs` from the GHA `server.yml` workflow; empty on local builds) so
+/// `curl /healthz` confirms which server build is live after an independent
+/// redeploy — the bottom-bar version string reports the *client* build, not
+/// this one. The Docker HEALTHCHECK only needs the 200.
 async fn healthz() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "build": env!("BUILD_SHA"),
+        "ref": env!("BUILD_REF"),
+    }))
 }
 
 async fn ws_handler(

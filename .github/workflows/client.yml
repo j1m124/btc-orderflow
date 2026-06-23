@@ -1,0 +1,93 @@
+name: deploy-client
+
+# Push to main touching client/protocol/frontend inputs → build Dockerfile.client
+# → push to GHCR (`btc-orderflow-client:latest` + `:sha-<short>`) → ping the
+# client's Dokploy redeploy webhook.
+#
+# Split from the old combined `deploy.yml` so a server-only change never
+# rebuilds the WASM blob (the long pole). `crates/protocol/**` + `Cargo.lock`
+# are in BOTH this and server.yml on purpose — a wire-protocol change must
+# redeploy both halves (deploy server first; see CLAUDE.md "Split deployment").
+#
+# Required GHA secrets:
+#   DOKPLOY_CLIENT_WEBHOOK_URL  (optional) — POSTed to on success to trigger a
+#                               redeploy. Unset → no-op (rely on Dokploy polling).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/client/**'
+      - 'crates/protocol/**'
+      - 'www/**'
+      - 'vendor/**'
+      - 'fonts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'Dockerfile.client'
+      - '.github/workflows/client.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}-client
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      # scope=client keeps this image's wasm cook layer in its own GHA cache
+      # namespace so it doesn't evict the server image's native cook layer (see
+      # the matching note in server.yml).
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.client
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=client
+          cache-to: type=gha,mode=max,scope=client
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_REF=${{ github.ref_name }}
+
+      - name: Trigger Dokploy redeploy
+        env:
+          DOKPLOY_CLIENT_WEBHOOK_URL: ${{ secrets.DOKPLOY_CLIENT_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DOKPLOY_CLIENT_WEBHOOK_URL" ]; then
+            echo "POST to Dokploy client webhook"
+            curl -fsS -X POST "$DOKPLOY_CLIENT_WEBHOOK_URL"
+          else
+            echo "DOKPLOY_CLIENT_WEBHOOK_URL not set; skipping (Dokploy polling will pick up the new image)"
+          fi

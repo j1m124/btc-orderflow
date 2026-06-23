@@ -1,0 +1,36 @@
+# Caddy config for the static client container (Dockerfile.client stage 5).
+#
+# Reproduces exactly what the former combined server's `response_headers`
+# middleware did:
+#   - COOP/COEP so the browser exposes SharedArrayBuffer (gpui_platform needs
+#     it). These MUST stay in lockstep with whatever the server set, or
+#     cross-origin isolation breaks and the canvas won't boot.
+#   - Cache-Control: Vite-hashed assets + the WASM blob are immutable-forever;
+#     everything else (notably index.html) is no-cache so a client redeploy is
+#     picked up on the next load.
+#   - SPA fallback: unknown routes serve index.html.
+#
+# Listens on :8080; Dokploy's Traefik routes Host(orderflow.j1mdev.net) &&
+# PathPrefix(/) here. `/ws` + `/healthz` are routed to the server container by
+# a more-specific Traefik rule and never reach Caddy.
+
+:8080 {
+	root * /srv
+	encode gzip zstd
+
+	# Cross-origin isolation — applied to every response.
+	header Cross-Origin-Opener-Policy "same-origin"
+	header Cross-Origin-Embedder-Policy "require-corp"
+
+	# Hashed assets + the WASM blob: cache forever.
+	@immutable path /assets/* *.wasm
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# Everything else (index.html, etc.): always revalidate.
+	@mutable not path /assets/* *.wasm
+	header @mutable Cache-Control "no-cache"
+
+	# SPA fallback: serve index.html for any path without a matching file.
+	try_files {path} /index.html
+	file_server
+}

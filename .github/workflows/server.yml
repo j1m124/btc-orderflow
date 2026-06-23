@@ -1,0 +1,92 @@
+name: deploy-server
+
+# Push to main touching server/protocol/build inputs → build Dockerfile.server →
+# push to GHCR (`btc-orderflow-server:latest` + `:sha-<short>`) → ping the
+# server's Dokploy redeploy webhook.
+#
+# Split from the old combined `deploy.yml` so a client-only change never
+# rebuilds or redeploys the server. `crates/protocol/**` + `Cargo.lock` are in
+# BOTH this and client.yml on purpose — a wire-protocol change must redeploy
+# both halves (deploy server first; see CLAUDE.md "Split deployment").
+#
+# Required GHA secrets:
+#   DOKPLOY_SERVER_WEBHOOK_URL  (optional) — POSTed to on success to trigger a
+#                               redeploy. Unset → no-op (rely on Dokploy polling).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/server/**'
+      - 'crates/protocol/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'Dockerfile.server'
+      - '.github/workflows/server.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}-server
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+
+      # scope=server keeps this image's cargo-chef cook layer in its own GHA
+      # cache namespace so it doesn't evict the client image's wasm cook layer
+      # (the two together roughly double the ~10GB GHA cache pressure — if it
+      # starts thrashing, switch cache-to to type=registry,ref=...:buildcache).
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.server
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_REF=${{ github.ref_name }}
+
+      - name: Trigger Dokploy redeploy
+        env:
+          DOKPLOY_SERVER_WEBHOOK_URL: ${{ secrets.DOKPLOY_SERVER_WEBHOOK_URL }}
+        run: |
+          if [ -n "$DOKPLOY_SERVER_WEBHOOK_URL" ]; then
+            echo "POST to Dokploy server webhook"
+            curl -fsS -X POST "$DOKPLOY_SERVER_WEBHOOK_URL"
+          else
+            echo "DOKPLOY_SERVER_WEBHOOK_URL not set; skipping (Dokploy polling will pick up the new image)"
+          fi

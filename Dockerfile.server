@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1.7
+#
+# SERVER image — the native axum/tokio binary only. Serves `WS /ws` +
+# `GET /healthz`; it does NOT serve the static SPA (that's the separate
+# client image / Caddy container — see Dockerfile.client).
+#
+# Split out of the former combined Dockerfile so a client-only change never
+# rebuilds or redeploys the server (no WS drop, no Binance cold-start). See
+# CLAUDE.md "Split deployment".
+#
+#   Stage 1 (chef)             pinned rust + cargo-chef base; installs the
+#                              rust-toolchain.toml nightly once.
+#   Stage 2 (planner)          `cargo chef prepare` — distills the workspace
+#                              to recipe.json (manifests + lockfile only).
+#   Stage 3 (rust-builder)     `cargo chef cook --package server` builds the
+#                              NATIVE dependency layer (keyed on recipe.json),
+#                              then `cargo build -p server` compiles the crate.
+#   Stage 4 (runtime)          debian-slim with the server binary.
+#
+# Layer-caching rationale is unchanged from the old combined file: the cook
+# layer is keyed on recipe.json (+ vendor/) and only rebuilds on manifest /
+# lockfile edits; BUILD_SHA/BUILD_REF are declared AFTER the cook so their
+# per-commit churn doesn't bust it. The GHA workflow exports these layers via
+# `cache-to: type=gha,scope=server` (a distinct scope from the client image so
+# the two cook layers don't evict each other).
+
+# ============================================================================
+# Stage 1: chef base (pinned rust:bookworm + cargo-chef preinstalled)
+# ============================================================================
+FROM lukemathwalker/cargo-chef:0.1.77-rust-bookworm@sha256:fa7281503a177bd5af6261f4041ca6b36d9f0de8d3090886c33cbd8e65b88ca9 AS chef
+
+# Use the system `git` for cargo's git-dep fetches (libgit2 prints no progress
+# on the multi-GB zed checkout, which looks hung). The CLI path is faster.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+WORKDIR /build
+
+COPY rust-toolchain.toml ./
+RUN rustc --version
+
+# ============================================================================
+# Stage 2: planner — produce the dependency recipe
+# ============================================================================
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ============================================================================
+# Stage 3: native server build
+# ============================================================================
+FROM chef AS rust-builder
+
+COPY --from=planner /build/recipe.json recipe.json
+
+# The workspace root Cargo.toml [patch]es gpui-component to vendor/; cargo
+# resolves patches workspace-wide even when cooking a single package, so the
+# path must exist or cook errors — even though the server crate never links it.
+COPY vendor/ vendor/
+
+RUN cargo chef cook --release --recipe-path recipe.json --package server
+
+COPY . .
+
+# Version tags surfaced through crates/server/build.rs into /healthz. Empty on
+# local builds. Declared HERE (not earlier) because they change every commit.
+ARG BUILD_SHA=""
+ARG BUILD_REF=""
+
+RUN cargo build -p server --release \
+ && mkdir -p /artifacts \
+ && cp /build/target/release/server /artifacts/server
+
+# ============================================================================
+# Stage 4: Runtime
+# ============================================================================
+FROM debian:bookworm-slim AS runtime
+
+# ca-certificates: rustls trust store for outbound TLS (Binance REST + WS).
+# tini:            PID-1 zombie reaper + SIGTERM forwarder.
+# curl:            used by the Docker HEALTHCHECK below.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tini \
+        curl \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=rust-builder /artifacts/server /app/server
+
+# No STATIC_DIR — the server no longer serves the SPA (Caddy does), so unknown
+# routes just 404. Dokploy sets DATABASE_URL + ALLOWED_ORIGINS.
+ENV LISTEN_ADDR=0.0.0.0:8787 \
+    RUST_LOG=server=info,sqlx=warn
+
+EXPOSE 8787
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8787/healthz || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/server"]

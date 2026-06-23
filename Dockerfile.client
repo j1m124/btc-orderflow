@@ -1,0 +1,130 @@
+# syntax=docker/dockerfile:1.7
+#
+# CLIENT image — the WASM blob + Vite frontend, served by a tiny Caddy static
+# container. This image OWNS the COOP/COEP + Cache-Control headers and the SPA
+# fallback (the server no longer serves static — see Dockerfile.server).
+#
+# Split out of the former combined Dockerfile so a server-only change never
+# rebuilds the WASM (the long pole). See CLAUDE.md "Split deployment".
+#
+#   Stage 1 (chef)             pinned rust + cargo-chef base; installs the
+#                              rust-toolchain.toml nightly once.
+#   Stage 2 (planner)          `cargo chef prepare` → recipe.json.
+#   Stage 3 (rust-builder)     `cargo chef cook --package client --target
+#                              wasm32` builds the WASM dependency layer, then
+#                              `cargo build -p client` + wasm-bindgen.
+#   Stage 4 (frontend-builder) Vite + Bun against the wasm-bindgen output → dist/.
+#   Stage 5 (runtime)          Caddy serving dist/ with the SPA + header config.
+#
+# Layer-caching rationale matches the old combined file: the cook layer is
+# keyed on recipe.json (+ vendor/) and holds every dep (gpui, the fork,
+# registry crates) compiled for wasm; it re-keys only on manifest/lockfile/
+# vendor edits. BUILD_SHA/BUILD_REF are declared AFTER the cook. The GHA
+# workflow exports these layers via `cache-to: type=gha,scope=client` (a
+# distinct scope from the server image so the cook layers don't evict each
+# other).
+
+# ============================================================================
+# Stage 1: chef base (pinned rust:bookworm + cargo-chef preinstalled)
+# ============================================================================
+FROM lukemathwalker/cargo-chef:0.1.77-rust-bookworm@sha256:fa7281503a177bd5af6261f4041ca6b36d9f0de8d3090886c33cbd8e65b88ca9 AS chef
+
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+WORKDIR /build
+
+COPY rust-toolchain.toml ./
+RUN rustc --version
+
+# ============================================================================
+# Stage 2: planner — produce the dependency recipe
+# ============================================================================
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ============================================================================
+# Stage 3: WASM build
+# ============================================================================
+FROM chef AS rust-builder
+
+COPY --from=planner /build/recipe.json recipe.json
+
+# The vendored gpui-component fork is path-patched in the workspace Cargo.toml,
+# but chef's recipe only captures workspace-member manifests — without the real
+# vendor/ tree, cook can't resolve the [patch] and fails. Copying it in ALSO
+# means the fork compiles during cook, so this layer holds every dependency for
+# the wasm target; it re-keys only when recipe.json or vendor/ change.
+COPY vendor/ vendor/
+
+RUN cargo chef cook --release --recipe-path recipe.json --package client \
+        --target wasm32-unknown-unknown
+
+# Prebuilt wasm-bindgen instead of `cargo install` (~3s vs ~90s compile).
+# MUST match the wasm-bindgen crate version in Cargo.lock — drift = the JS
+# shim references symbols the WASM blob doesn't export. The Makefile pins the
+# same value; bump together.
+#
+# The binary runs on the BUILD runtime, so it must match TARGETARCH (under
+# `buildx --platform`, RUN steps execute in the target's emulated env). CI/prod
+# build amd64 → x86_64; a native build on an Apple-Silicon dev box is arm64 →
+# aarch64. Both use the -musl artifact.
+ARG WASM_BINDGEN_VERSION=0.2.120
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) WB_ARCH=x86_64 ;; \
+        arm64) WB_ARCH=aarch64 ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/wasm-bindgen-${WASM_BINDGEN_VERSION}-${WB_ARCH}-unknown-linux-musl.tar.gz" \
+    | tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/wasm-bindgen' \
+ && wasm-bindgen --version
+
+COPY . .
+
+# Version tags surfaced through crates/client/build.rs into the bottom-bar
+# version string. Empty on local builds. Declared HERE (not earlier) because
+# they change every commit — see the layer-caching rationale above.
+ARG BUILD_SHA=""
+ARG BUILD_REF=""
+
+RUN cargo build -p client --lib --target wasm32-unknown-unknown --release \
+ && wasm-bindgen \
+        /build/target/wasm32-unknown-unknown/release/client.wasm \
+        --out-dir /build/www/src/wasm \
+        --target web \
+        --no-typescript
+
+# ============================================================================
+# Stage 4: Frontend build (Vite + Bun)
+# ============================================================================
+# `bun --bun vite build` matches www/package.json — the `--bun` flag forces
+# Bun's runtime instead of shelling out to Node. www/bun.lock is gitignored,
+# so no --frozen-lockfile.
+FROM oven/bun:1 AS frontend-builder
+
+WORKDIR /build/www
+
+COPY --from=rust-builder /build/www ./
+
+RUN bun install \
+ && bun --bun vite build
+
+# ============================================================================
+# Stage 5: Runtime (Caddy static host)
+# ============================================================================
+# Caddy owns the SPA fallback + the COOP/COEP + Cache-Control headers the
+# former combined server set in `response_headers`. Listens on :8080; Dokploy's
+# Traefik routes `PathPrefix(/)` here. wget (busybox) backs the healthcheck.
+FROM caddy:2-alpine AS runtime
+
+COPY www/Caddyfile /etc/caddy/Caddyfile
+COPY --from=frontend-builder /build/www/dist /srv
+
+# Fail the build (not the container at runtime) on a malformed Caddyfile.
+RUN caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1
