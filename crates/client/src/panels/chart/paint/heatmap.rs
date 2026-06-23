@@ -42,7 +42,7 @@ use crate::services::market_data::{BookSnapshotEntry, Candle};
 
 /// Book depth the heatmap subscribes + samples at. A generous level-count cap —
 /// the *span* is bounded server-side: the forwarder intersects this depth with a
-/// ±$2500 price band (`BOOK_BAND_USD`), dropping the phantom far-from-mid tail
+/// ±$5000 price band (`BOOK_BAND_USD`), dropping the phantom far-from-mid tail
 /// before it ever reaches the wire, so both the live stream and the persisted
 /// history arrive pre-bounded and the client renders the full extent as-is. The
 /// live 1 s sampler buckets each (already band-bounded) sample to `$5` before
@@ -102,12 +102,15 @@ const MIN_CELL_H_FOR_TEXT: f32 = 20.0;
 
 /// When a (uniform-height) cell is at least this tall on screen, paint the
 /// visible cells as solid quads with hard edges instead of blitting the
-/// bilinear-stretched texture — gives crisp cell boundaries. Set high enough
-/// that the quad path only kicks in when cells are clearly visible (so there are
-/// few of them); the **lazy-y** blit is now crisp (1 texel/bucket over the
-/// visible band), so below this the blit is a seamless, cheap fallback — there's
-/// no mid-zoom band where we must emit thousands of quads to stay sharp.
-const MIN_CELL_H_FOR_CRISP: f32 = 6.0;
+/// bilinear-stretched texture — gives crisp cell boundaries. This is *only* a
+/// "is the hard edge perceptible?" floor: below ~3 px a $5 row's edge is within a
+/// pixel of the bilinear blit's, so the blit is an indistinguishable, cheaper
+/// fallback. The per-frame quad *work* is bounded separately by
+/// [`MAX_CRISP_QUADS`] (the count cap is the real storm guard), so this floor can
+/// sit low without risking the mid-zoom quad storm — keeping the crisp path alive
+/// as the y axis zooms out, instead of popping to a soft blit at the first nudge
+/// below the old 6 px floor (which on a tall canvas already blitted ~1.5 px-soft).
+const MIN_CELL_H_FOR_CRISP: f32 = 3.0;
 
 /// Upper bound on the crisp-quad path's per-frame work, counted as
 /// `visible buckets × samples`. Above this the (crisp lazy-y) blit is used
