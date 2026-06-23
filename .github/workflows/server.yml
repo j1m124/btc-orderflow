@@ -5,9 +5,14 @@ name: deploy-server
 # server's Dokploy redeploy webhook.
 #
 # Split from the old combined `deploy.yml` so a client-only change never
-# rebuilds or redeploys the server. `crates/protocol/**` + `Cargo.lock` are in
-# BOTH this and client.yml on purpose — a wire-protocol change must redeploy
-# both halves (deploy server first; see CLAUDE.md "Split deployment").
+# rebuilds or redeploys the server. The genuinely-shared inputs —
+# `crates/protocol/**`, `vendor/**`, root `Cargo.toml`, `rust-toolchain.toml` —
+# are in BOTH this and client.yml so a wire-protocol / shared-dep change
+# redeploys both halves (deploy server first; see CLAUDE.md "Split deployment").
+# `Cargo.lock` is deliberately NOT a trigger: it churns on per-crate version
+# bumps (e.g. the client semver), which must not redeploy the server. A
+# lockfile-only `cargo update` therefore won't auto-build — touch a manifest
+# or use workflow_dispatch.
 #
 # Required GHA secrets:
 #   DOKPLOY_SERVER_WEBHOOK_URL  (optional) — POSTed to on success to trigger a
@@ -21,7 +26,6 @@ on:
       - 'crates/protocol/**'
       - 'vendor/**'
       - 'Cargo.toml'
-      - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'Dockerfile.server'
       - '.github/workflows/server.yml'

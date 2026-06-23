@@ -10,9 +10,12 @@ name: deploy-client
 # for an immutable rollback point — re-runs and version-unchanged pushes skip it.
 #
 # Split from the old combined `deploy.yml` so a server-only change never
-# rebuilds the WASM blob (the long pole). `crates/protocol/**` + `Cargo.lock`
-# are in BOTH this and server.yml on purpose — a wire-protocol change must
-# redeploy both halves (deploy server first; see CLAUDE.md "Split deployment").
+# rebuilds the WASM blob (the long pole). The genuinely-shared inputs —
+# `crates/protocol/**`, `vendor/**`, root `Cargo.toml`, `rust-toolchain.toml` —
+# are in BOTH this and server.yml so a wire-protocol / shared-dep change
+# redeploys both halves (deploy server first; see CLAUDE.md "Split deployment").
+# `Cargo.lock` is deliberately NOT a trigger: it churns on per-crate version
+# bumps (the client semver), which must not cross-trigger the other half.
 #
 # Required GHA secrets:
 #   DOKPLOY_CLIENT_WEBHOOK_URL  (optional) — POSTed to on success to trigger a
@@ -28,7 +31,6 @@ on:
       - 'vendor/**'
       - 'fonts/**'
       - 'Cargo.toml'
-      - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'Dockerfile.client'
       - '.github/workflows/client.yml'
