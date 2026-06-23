@@ -106,9 +106,13 @@ impl OrderbookSizeMode {
 }
 
 /// Top-N levels per side the server forwards on the WS Book channel.
-/// 200 is enough to populate roughly a $20-wide ladder at BTC's tight book
-/// without flooding the wire when book churn is heavy.
-pub const WS_DEPTH: u16 = 200;
+/// 1000 matches the maintainer's REST seed depth (`/fapi/v1/depth?limit=1000`),
+/// so the ladder can show the full book the server holds. Render stays cheap
+/// because the ladder is virtualized (`v_virtual_list`) — only the ~viewport
+/// rows are laid out; the per-tick preprocessing below is O(n) over ≤1000
+/// 16-byte levels per side. Heavier cost is on the wire: snapshots/deltas and
+/// the 5s resync carry a wider band (see `gateway::session::run_book_subscription`).
+pub const WS_DEPTH: u16 = 10000;
 
 /// Fixed height of each price-level row (content + 1px bottom border).
 const ROW_H: Pixels = px(15.);

@@ -84,6 +84,33 @@ const MAX_MISSED_PONGS: u32 = 4;
 /// latency change within a few samples.
 const RTT_EMA_ALPHA: f64 = 0.3;
 
+/// Cadence at which the live `book` is sampled into the per-`(symbol, depth)`
+/// book time-series that backs the orderbook heatmap. Held at **1s** for full
+/// recent-tail detail — deliberately finer than the server's now-1m
+/// `BOOK_SNAPSHOT_INTERVAL` (DB history is coarsened to 1m to keep rows cheap;
+/// the in-memory live tail isn't). The heatmap groups both into candle-wide
+/// columns at render, so the seam is only a resolution change, not a gap. Only
+/// keys with active sampling (heatmap on) are sampled; an idle OB panel isn't.
+const BOOK_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Price-bucket width (dollars) the live sampler aggregates each book sample
+/// into before storing — **50 ticks × $0.10**, matching the server's
+/// `BOOK_BUCKET_USD` and the heatmap's render-time `PRICE_BUCKET`. Bucketing the
+/// sample keeps `book_history` cheap at deep `HEATMAP_DEPTH` (a 10k-level side
+/// collapses to a few hundred bins) and keeps the live tail's representation
+/// identical to the now-bucketed paged history. The heatmap re-buckets to this
+/// same width at render, so it's lossless for the only consumer.
+const BOOK_BUCKET_USD: f64 = 5.0;
+
+/// Safety backstop on the in-memory book time-series length per key. The
+/// heatmap drives `evict_book_history_before` to keep only the visible window
+/// plus a margin, so this only guards a pathological zoom-out. 21600 ≈ 6h at the
+/// 1s cadence; zooming the heatmap past that just shows the most recent 6h.
+/// Each sample is `$5`-bucketed (see `bucket_book_levels`), so an entry holds a
+/// few hundred bins regardless of `HEATMAP_DEPTH` — memory is bounded by the
+/// active price span, not raw book depth.
+const BOOK_HISTORY_HARD_CAP: usize = 21_600;
+
 /// A chart timeframe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Timeframe {
@@ -363,6 +390,11 @@ pub struct BookLevel {
 }
 
 /// One historical book snapshot row used by the heatmap replay path.
+///
+/// Invariant (relied on by the heatmap's early-break aggregation): both sides
+/// are **best-first** — `bids` descending price, `asks` ascending price. The
+/// live sampler clones the maintained book (kept sorted by `apply_levels`); the
+/// history path sorts on receipt in `book_snapshot_entry_from_proto`.
 #[derive(Clone, Debug)]
 pub struct BookSnapshotEntry {
     pub ts_ms: i64,
@@ -697,11 +729,18 @@ pub struct MarketDataService {
     // --- Book channel state ---
     /// Per-subscription book state: bids/asks sorted best-first.
     book: HashMap<BookSubKey, (Vec<BookLevel>, Vec<BookLevel>)>,
-    /// Historical book snapshots (oldest-first) for heatmap replay.
+    /// Per-`(symbol, depth)` book time-series (oldest-first) backing the
+    /// heatmap: paged history is prepended on the left, the 1s live sampler
+    /// appends on the right. Distinct from `book`, which holds only the latest
+    /// snapshot for the live ladder.
     book_history: HashMap<BookSubKey, Vec<BookSnapshotEntry>>,
     book_sub_ids: HashMap<BookSubKey, proto::SubId>,
     book_refcounts: HashMap<BookSubKey, usize>,
     book_history_in_flight: HashSet<BookSubKey>,
+    /// Refcount of consumers (heatmaps) that want the live `book` sampled into
+    /// `book_history` each `BOOK_SAMPLE_INTERVAL`. Empty ⇒ the sampler is a
+    /// no-op, so an orderbook-only session pays nothing.
+    book_sampling: HashMap<BookSubKey, usize>,
 
     // --- Liquidations (tape) channel state ---
     liquidations: HashMap<LiquidationsSubKey, Vec<Liquidation>>,
@@ -756,6 +795,7 @@ pub struct MarketDataService {
     /// gpui internals.
     _ws_task: Task<()>,
     _release_task: Task<()>,
+    _sampler_task: Task<()>,
 }
 
 impl EventEmitter<KlineEvent> for MarketDataService {}
@@ -799,6 +839,18 @@ impl MarketDataService {
             run_connection(this, outbound_rx, cx).await;
         });
 
+        // Book sampler: every `BOOK_SAMPLE_INTERVAL`, snapshot the live book of
+        // each sampled `(symbol, depth)` into its time-series. Lifecycle-bound
+        // to the entity; `update` returns `Err` once it drops, ending the loop.
+        let sampler_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BOOK_SAMPLE_INTERVAL).await;
+                if this.update(cx, |s, _| s.sample_books()).is_err() {
+                    return;
+                }
+            }
+        });
+
         Self {
             candles: HashMap::new(),
             statuses: HashMap::new(),
@@ -818,6 +870,7 @@ impl MarketDataService {
             book_sub_ids: HashMap::new(),
             book_refcounts: HashMap::new(),
             book_history_in_flight: HashSet::new(),
+            book_sampling: HashMap::new(),
             liquidations: HashMap::new(),
             liquidations_sub_ids: HashMap::new(),
             liquidations_refcounts: HashMap::new(),
@@ -839,6 +892,7 @@ impl MarketDataService {
             rtt_ema: None,
             _ws_task: ws_task,
             _release_task: release_task,
+            _sampler_task: sampler_task,
         }
     }
 
@@ -980,6 +1034,67 @@ impl MarketDataService {
         }
     }
 
+    /// Refcounted opt-in to live sampling of `(symbol, depth)` into its book
+    /// time-series. The heatmap pairs this with `ensure_book`. The caller must
+    /// `disable_book_sampling` (or it'll keep sampling) — typically when the
+    /// heatmap toggles off or the chart drops.
+    pub fn enable_book_sampling(&mut self, symbol: &str, depth: u16) {
+        let key = BookSubKey::new(symbol, depth);
+        *self.book_sampling.entry(key).or_insert(0) += 1;
+    }
+
+    /// Drop one sampling consumer. On the last release, stops sampling and
+    /// clears the accumulated time-series (heatmap-only state — nothing else
+    /// reads `book_history`), freeing the live-tail memory.
+    pub fn disable_book_sampling(&mut self, symbol: &str, depth: u16) {
+        let key = BookSubKey::new(symbol, depth);
+        if let Some(c) = self.book_sampling.get_mut(&key) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.book_sampling.remove(&key);
+                if let Some(h) = self.book_history.get_mut(&key) {
+                    h.clear();
+                }
+            }
+        }
+    }
+
+    /// Snapshot the live `book` of every sampled key into its time-series.
+    /// Called on the `BOOK_SAMPLE_INTERVAL` timer; a no-op when nothing wants
+    /// sampling. Dedupes on `ts_ms` (a throttled background-tab timer can fire
+    /// twice in one wall-clock second) and front-evicts past the hard cap.
+    fn sample_books(&mut self) {
+        if self.book_sampling.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let keys: Vec<BookSubKey> = self.book_sampling.keys().cloned().collect();
+        for key in keys {
+            let Some((bids, asks)) = self.book.get(&key) else {
+                continue;
+            };
+            if bids.is_empty() && asks.is_empty() {
+                continue;
+            }
+            // `book` is kept best-first by `apply_levels`, so equal-bucket levels
+            // are adjacent — fold them into `$5` bins, preserving the ordering.
+            let entry = BookSnapshotEntry {
+                ts_ms: now,
+                bids: bucket_book_levels(bids),
+                asks: bucket_book_levels(asks),
+            };
+            let hist = self.book_history.entry(key.clone()).or_default();
+            if hist.last().is_some_and(|last| last.ts_ms >= now) {
+                continue;
+            }
+            hist.push(entry);
+            if hist.len() > BOOK_HISTORY_HARD_CAP {
+                let drop_n = hist.len() - BOOK_HISTORY_HARD_CAP;
+                hist.drain(0..drop_n);
+            }
+        }
+    }
+
     /// Refcounted subscribe for the liquidations tape channel.
     pub fn ensure_liquidations(
         &mut self,
@@ -1117,6 +1232,41 @@ impl MarketDataService {
         self.book
             .get(&BookSubKey::new(symbol, depth))
             .map(|(b, a)| (b.as_slice(), a.as_slice()))
+    }
+
+    /// The full book time-series (oldest-first) for `(symbol, depth)`, or an
+    /// empty slice if none is loaded. The heatmap paint windows it by binary
+    /// search on `ts_ms`; returning the whole slice keeps the read borrow-free
+    /// and lets the caller own the x-axis windowing.
+    pub fn book_series(&self, symbol: &str, depth: u16) -> &[BookSnapshotEntry] {
+        self.book_history
+            .get(&BookSubKey::new(symbol, depth))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Oldest `ts_ms` currently held in the time-series, if any. Drives the
+    /// lazy-left paging decision (fetch older when the view's left edge nears
+    /// this).
+    pub fn book_series_oldest_ms(&self, symbol: &str, depth: u16) -> Option<i64> {
+        self.book_history
+            .get(&BookSubKey::new(symbol, depth))
+            .and_then(|v| v.first())
+            .map(|s| s.ts_ms)
+    }
+
+    /// Drop time-series entries older than `floor_ms`, bounding live-tail
+    /// memory to the heatmap's visible window + margin. The heatmap calls this
+    /// each refresh with `(visible_lo - one span)`; if the user scrolls back,
+    /// `floor_ms` drops and the paging path re-fetches what was evicted. The
+    /// series is oldest-first, so this is a binary-search + front drain.
+    pub fn evict_book_history_before(&mut self, symbol: &str, depth: u16, floor_ms: i64) {
+        if let Some(hist) = self.book_history.get_mut(&BookSubKey::new(symbol, depth)) {
+            let cut = hist.partition_point(|s| s.ts_ms < floor_ms);
+            if cut > 0 {
+                hist.drain(0..cut);
+            }
+        }
     }
 
     pub fn footprint_cells(
@@ -2355,6 +2505,7 @@ impl MarketDataService {
             self.book.remove(&key);
             self.book_history.remove(&key);
             self.book_history_in_flight.remove(&key);
+            self.book_sampling.remove(&key);
         }
     }
 
@@ -2729,10 +2880,17 @@ fn book_level_from_proto(l: proto::BookLevel) -> BookLevel {
 }
 
 fn book_snapshot_entry_from_proto(e: proto::BookSnapshotEntry) -> BookSnapshotEntry {
+    let mut bids: Vec<BookLevel> = e.bids.into_iter().map(book_level_from_proto).collect();
+    let mut asks: Vec<BookLevel> = e.asks.into_iter().map(book_level_from_proto).collect();
+    // Enforce the best-first invariant the heatmap aggregation relies on
+    // (bids descending, asks ascending) — the server's persisted order isn't
+    // guaranteed. Cheap: runs once per prepended history page, not per frame.
+    bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+    asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
     BookSnapshotEntry {
         ts_ms: e.ts_ms,
-        bids: e.bids.into_iter().map(book_level_from_proto).collect(),
-        asks: e.asks.into_iter().map(book_level_from_proto).collect(),
+        bids,
+        asks,
     }
 }
 
@@ -2775,6 +2933,28 @@ fn open_interest_bar_from_proto(b: proto::OpenInterestBar) -> OpenInterestBar {
 ///
 /// `current` is small and bounded (top-N from the subscription), so a
 /// linear scan per level is fine — sub-microsecond at depth=50.
+/// Aggregate price-sorted book levels into `BOOK_BUCKET_USD` bins, summing size
+/// per bin. Input must be sorted by price (either direction); each bin keeps its
+/// low boundary as the price and the input order is preserved (best-first in →
+/// best-first out, which the heatmap's early-break aggregation relies on).
+fn bucket_book_levels(levels: &[BookLevel]) -> Vec<BookLevel> {
+    let mut out: Vec<BookLevel> = Vec::new();
+    for lvl in levels {
+        if lvl.size <= 0.0 {
+            continue;
+        }
+        let bucket_low = (lvl.price / BOOK_BUCKET_USD).floor() * BOOK_BUCKET_USD;
+        match out.last_mut() {
+            Some(last) if last.price == bucket_low => last.size += lvl.size,
+            _ => out.push(BookLevel {
+                price: bucket_low,
+                size: lvl.size,
+            }),
+        }
+    }
+    out
+}
+
 fn apply_levels(current: &mut Vec<BookLevel>, deltas: &[BookLevel], is_bids: bool) {
     for d in deltas {
         // Linear find: prices are exact f64 values that round-trip from the

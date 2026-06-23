@@ -313,11 +313,13 @@ pub struct ChartPrefs {
     pub default_view: f32,
     pub right_buffer: f32,
     pub y_padding: f32,
-    /// When true, footprint cell labels drop their fractional digits and
-    /// render as whole numbers. Footprint-only — main chart price labels
-    /// and indicator readouts ignore this flag.
-    #[serde(default)]
-    pub truncate_footprint_decimals: bool,
+    /// When true, per-cell numeric labels (footprint cells, Bar Stats rows,
+    /// orderbook-heatmap cells) are rounded to whole numbers (K / M / B suffix
+    /// preserved). Main chart price labels and indicator readouts ignore this
+    /// flag. `serde(alias)` keeps blobs written under the old
+    /// `truncate_footprint_decimals` key loading.
+    #[serde(default, alias = "truncate_footprint_decimals")]
+    pub round_cell_decimals: bool,
     /// When true, the chart paints horizontal (price) and vertical (time)
     /// grid lines behind the candles, plus the horizontal grid in indicator
     /// sub-panes. Default on. Uses a `true`-preserving serde default so
@@ -337,7 +339,7 @@ impl Default for ChartPrefs {
             default_view: 60.0,
             right_buffer: 0.40,
             y_padding: 0.05,
-            truncate_footprint_decimals: false,
+            round_cell_decimals: false,
             show_grid: true,
         }
     }

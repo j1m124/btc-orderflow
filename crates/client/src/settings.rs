@@ -268,7 +268,7 @@ fn render_general(
         .child(right_buffer_row(cx))
         .child(y_padding_row(cx))
         .child(show_grid_row(cx))
-        .child(truncate_footprint_decimals_row(cx))
+        .child(round_cell_decimals_row(cx))
         .child(div().px_4().child(Separator::horizontal()))
         .child(reset_all_row(cx))
 }
@@ -641,17 +641,17 @@ fn adjust_chart(cx: &mut gpui::App, mutate: impl FnOnce(&mut ChartPrefs)) {
     prefs::set_chart_prefs(cx, prefs);
 }
 
-fn truncate_footprint_decimals_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
-    let enabled = cx.global::<ChartPrefsGlobal>().0.truncate_footprint_decimals;
+fn round_cell_decimals_row(cx: &mut Context<SettingsView>) -> impl IntoElement {
+    let enabled = cx.global::<ChartPrefsGlobal>().0.round_cell_decimals;
     setting_row(
-        "Truncate cell decimals",
-        "Drop the fractional digits on footprint cells and Bar Stats rows — values render as whole numbers (K / M / B suffixes preserved).",
-        Switch::new("truncate-cell-decimals-toggle")
+        "Round cell decimals",
+        "Round footprint cells, Bar Stats rows, and orderbook-heatmap cells to whole numbers (K / M / B suffixes preserved).",
+        Switch::new("round-cell-decimals-toggle")
             .checked(enabled)
             .label(if enabled { "On" } else { "Off" })
             .on_click(|checked, _window, cx| {
                 let next = *checked;
-                adjust_chart(cx, |p| p.truncate_footprint_decimals = next);
+                adjust_chart(cx, |p| p.round_cell_decimals = next);
             }),
     )
 }

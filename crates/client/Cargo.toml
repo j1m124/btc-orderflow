@@ -20,6 +20,11 @@ log.workspace = true
 chrono = { version = "0.4", features = ["wasmbind"] }
 chrono-tz = "0.10"
 futures = "0.3"
+# Used only to construct `image::Frame`/`RgbaImage` for the orderbook heatmap's
+# `RenderImage` (gpui's texture-blit input). Version must match the `image`
+# gpui resolves (0.25.x) so the `Frame` type unifies. `default-features = false`
+# keeps codecs out — we only build buffers in-memory, never decode files.
+image = { version = "0.25", default-features = false }
 # `json` enables `Response::json::<T>()`. `stream` enables `Response::bytes_stream()`
 # for SSE in the AI chat path. On wasm, reqwest transparently routes through
 # the browser's fetch() — `rustls-tls` is a no-op there but we keep it for

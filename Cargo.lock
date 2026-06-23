@@ -943,6 +943,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "image",
  "js-sys",
  "log",
  "protocol",

@@ -27,7 +27,8 @@ pub mod watchlist;
 
 pub use chart::{
     ChangeChartRender, ChangeChartTimeframe, ChangeChartVolumeUnit, ChartRenderSettingsView,
-    GoToLatest, OpenChartRenderSettings, ResetChartScale, ToggleChartRenderVisible,
+    GoToLatest, HeatmapSettingsView, OpenChartRenderSettings, OpenHeatmapSettings, ResetChartScale,
+    ToggleChartRenderVisible,
 };
 pub use liquidations::{ChangeLiquidationsSideFilter, ChangeLiquidationsSizeMode};
 pub use orderbook::{ChangeOrderbookBucket, ChangeOrderbookSizeMode};
@@ -182,6 +183,25 @@ struct ChartPrefs {
     /// matches the new "fresh chart starts empty" behaviour.
     #[serde(default)]
     indicators: Vec<IndicatorPrefs>,
+    /// Orderbook-heatmap overlay state. All `serde(default)` so pre-feature
+    /// blobs load with the overlay off. `heatmap_manual_ref` is the colour-range
+    /// peak (book size mapped to the ramp top — name retained for back-compat),
+    /// `heatmap_color_lo` the low cut (cells below aren't drawn); `None` on
+    /// either falls back to the default.
+    #[serde(default)]
+    heatmap_enabled: bool,
+    #[serde(default)]
+    heatmap_manual_ref: Option<f64>,
+    #[serde(default)]
+    heatmap_color_lo: Option<f64>,
+    #[serde(default)]
+    heatmap_opacity: Option<f32>,
+    /// Draw per-cell book-size text (default on). `None` falls back to default.
+    #[serde(default)]
+    heatmap_show_text: Option<bool>,
+    /// Stretch the live candle's column to the right edge (default on).
+    #[serde(default)]
+    heatmap_extend_right: Option<bool>,
 }
 
 /// Serialized form of one `IndicatorInstance`. Kind reconstruction goes
@@ -271,6 +291,8 @@ struct ChartRestored {
     /// May be empty — older blobs without the field deserialize to `[]`,
     /// and that's also the intentional fresh-chart default now.
     indicators: Vec<IndicatorPrefs>,
+    heatmap_enabled: bool,
+    heatmap_settings: chart::HeatmapSettings,
 }
 
 fn parse_volume_unit(s: &str) -> Option<crate::persistence::VolumeUnit> {
@@ -330,6 +352,16 @@ fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
         .as_deref()
         .and_then(parse_volume_unit)
         .unwrap_or_default();
+    let default_heatmap = chart::HeatmapSettings::default();
+    let heatmap_settings = chart::HeatmapSettings {
+        color_lo: prefs.heatmap_color_lo.unwrap_or(default_heatmap.color_lo),
+        color_peak: prefs.heatmap_manual_ref.unwrap_or(default_heatmap.color_peak),
+        max_opacity: prefs.heatmap_opacity.unwrap_or(default_heatmap.max_opacity),
+        show_text: prefs.heatmap_show_text.unwrap_or(default_heatmap.show_text),
+        extend_right: prefs
+            .heatmap_extend_right
+            .unwrap_or(default_heatmap.extend_right),
+    };
     Some(ChartRestored {
         symbol: SharedString::from(prefs.symbol),
         tf,
@@ -338,6 +370,8 @@ fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
         profile,
         volume_unit,
         indicators: prefs.indicators,
+        heatmap_enabled: prefs.heatmap_enabled,
+        heatmap_settings,
     })
 }
 
@@ -556,6 +590,15 @@ pub struct ContentPanel {
     /// Throttle for the open-interest history-fill loop. Single slot like the
     /// liquidation-bars variant — the OI sub is keyed only on `(symbol, tf)`.
     oi_bars_history_last_request_ms: Option<i64>,
+    /// Throttle for the heatmap book-history paging loop. Single slot — the
+    /// heatmap sub is keyed only on symbol.
+    heatmap_history_last_request_ms: Option<i64>,
+    /// Throttle for heatmap time-series eviction. Eviction changes the series
+    /// length, which feeds the texture-rebuild key; running it every frame
+    /// would force a full rebuild on every forward-pan tick. Batching it (a few
+    /// seconds of slack costs negligible memory) keeps the length — and so the
+    /// rebuild gate — stable between batches.
+    heatmap_last_evict_ms: Option<i64>,
     /// `(symbol, tf, handle)` for the chart's open-interest subscription.
     /// Allocated lazily when an `open_interest` indicator (or a bar_stat with
     /// the OI-Δ row enabled) is on the chart; dropped when the last consumer
@@ -565,6 +608,13 @@ pub struct ContentPanel {
         crate::services::market_data::Timeframe,
         crate::services::market_data::SubscriptionHandle,
     )>,
+    /// `(symbol, handle)` for the orderbook-heatmap book subscription, allocated
+    /// lazily when the chart's heatmap overlay is on and dropped on toggle-off
+    /// or symbol change. Keyed on symbol only — depth is the fixed
+    /// `chart::HEATMAP_DEPTH` and the heatmap is tf-agnostic (it reads a book
+    /// time-series, not bars). Holding it also keeps the service's 1s book
+    /// sampler running for this symbol.
+    chart_heatmap_sub: Option<(SharedString, crate::services::market_data::SubscriptionHandle)>,
     watchlist_sub_handles: HashMap<SharedString, crate::services::market_data::SubscriptionHandle>,
     pub(crate) trades_symbol: Option<SharedString>,
     pub(crate) trades_min_usd: Option<Option<f64>>,
@@ -666,6 +716,9 @@ impl ContentPanel {
             if let Some((kind, cluster, profile, volume_unit)) = render_seed {
                 state.seed_render(kind, cluster, profile);
                 state.set_volume_unit(volume_unit);
+            }
+            if let Some(restored) = chart_prefs.as_ref() {
+                state.seed_heatmap(restored.heatmap_enabled, restored.heatmap_settings);
             }
             if !indicator_seed.is_empty() {
                 state.restore_indicators(indicator_seed);
@@ -906,6 +959,41 @@ impl ContentPanel {
                         HistoryCapped { .. } => {
                             cx.notify();
                         }
+                    }
+                },
+            )
+            .detach();
+            // BookEvent → repaint the heatmap overlay. The book changes
+            // constantly, so this keeps the heatmap (and its lazy history
+            // paging, which runs in `render`) live even when trade flow — and
+            // thus kline ticks — is quiet. Gated on the chart's symbol +
+            // `heatmap_enabled`, so an idle chart pays nothing.
+            cx.subscribe_in(
+                &service,
+                window,
+                |this,
+                 _service,
+                 event: &crate::services::market_data::BookEvent,
+                 _window,
+                 cx| {
+                    use crate::services::market_data::BookEvent::*;
+                    let Some(chart_symbol) = this
+                        .chart_state
+                        .as_ref()
+                        .filter(|s| s.heatmap_enabled())
+                        .map(|s| s.symbol().clone())
+                    else {
+                        return;
+                    };
+                    let ev_symbol = match event {
+                        Snapshot { symbol, .. }
+                        | Delta { symbol, .. }
+                        | HistoryPrepended { symbol, .. }
+                        | HistoryCapped { symbol }
+                        | Resnap { symbol } => symbol,
+                    };
+                    if ev_symbol.as_ref() == chart_symbol.as_ref() {
+                        cx.notify();
                     }
                 },
             )
@@ -1357,9 +1445,12 @@ impl ContentPanel {
             vp_history_last_request_ms: HashMap::new(),
             liq_bars_history_last_request_ms: None,
             oi_bars_history_last_request_ms: None,
+            heatmap_history_last_request_ms: None,
+            heatmap_last_evict_ms: None,
             chart_footprint_key: None,
             chart_liq_bars_sub: None,
             chart_oi_bars_sub: None,
+            chart_heatmap_sub: None,
             watchlist_sub_handles: watchlist_handles,
             trades_symbol,
             trades_min_usd,
@@ -1395,6 +1486,9 @@ impl ContentPanel {
             new_self.refresh_chart_footprint_sub(cx);
             new_self.refresh_chart_liq_bars_sub(cx);
             new_self.refresh_chart_oi_bars_sub(cx);
+            // Open the book sub + sampler if the restored chart had the heatmap
+            // overlay on. No-op when it was off.
+            new_self.refresh_chart_heatmap_sub(cx);
         }
         new_self
     }
@@ -1675,6 +1769,9 @@ impl ContentPanel {
             self.refresh_chart_footprint_sub(cx);
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
+            // Heatmap is symbol-keyed: re-point the book sub + sampler at the
+            // new symbol (no-op when the overlay is off).
+            self.refresh_chart_heatmap_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1765,6 +1862,22 @@ impl ContentPanel {
             request_layout_save(cx);
         }
         ran
+    }
+
+    /// Mutate the chart's heatmap settings through `f`, then repaint + persist.
+    /// The texture rebuilds on the next render (settings are part of its key).
+    pub fn apply_heatmap_settings<F>(&mut self, f: F, cx: &mut Context<Self>)
+    where
+        F: FnOnce(&mut chart::HeatmapSettings),
+    {
+        let Some(state) = self.chart_state.as_mut() else {
+            return;
+        };
+        let mut settings = state.heatmap_settings();
+        f(&mut settings);
+        state.set_heatmap_settings(settings);
+        cx.notify();
+        request_layout_save(cx);
     }
 
     /// Switch the chart's render kind. If the kind actually changed, the
@@ -2019,6 +2132,146 @@ impl ContentPanel {
                 state.recompute_indicators();
             }
             self.chart_oi_bars_sub = Some((symbol, tf, handle));
+        }
+    }
+
+    /// Reconcile the heatmap's book subscription + 1s sampler against the
+    /// chart's `heatmap_enabled` flag and symbol. Single-slot allocate / drop
+    /// keyed on symbol (depth is the fixed `chart::HEATMAP_DEPTH`). Holding the
+    /// sub also keeps the service sampling the live book into the time-series
+    /// the heatmap replays. Idempotent — same want ⇒ no churn.
+    pub(crate) fn refresh_chart_heatmap_sub(&mut self, cx: &mut Context<Self>) {
+        let want = self
+            .chart_state
+            .as_ref()
+            .and_then(|s| s.heatmap_enabled().then(|| s.symbol().clone()));
+        let cur = self.chart_heatmap_sub.as_ref().map(|(s, _)| s.clone());
+        if want == cur {
+            return;
+        }
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        // Drop the old sub + stop its sampler before allocating, so the service
+        // refcount settles to zero and the `Unsubscribe` fires.
+        if let Some((old_symbol, _handle)) = self.chart_heatmap_sub.take() {
+            market.update(cx, |svc, _| {
+                svc.disable_book_sampling(old_symbol.as_ref(), chart::HEATMAP_DEPTH)
+            });
+        }
+        self.heatmap_history_last_request_ms = None;
+        if let Some(symbol) = want {
+            let handle = market.clone().update(cx, |svc, cx| {
+                let h = svc.ensure_book(symbol.as_ref(), chart::HEATMAP_DEPTH, cx);
+                svc.enable_book_sampling(symbol.as_ref(), chart::HEATMAP_DEPTH);
+                h
+            });
+            self.chart_heatmap_sub = Some((symbol, handle));
+        }
+    }
+
+    /// Toggle the chart's orderbook-heatmap overlay. Flips the flag, drops or
+    /// opens the book sub + sampler, and repaints. `window` is needed to evict
+    /// the cached atlas tile on disable.
+    pub fn toggle_chart_heatmap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.chart_state.as_mut() else {
+            return;
+        };
+        let now_on = !state.heatmap_enabled();
+        state.set_heatmap_enabled(now_on, window);
+        self.refresh_chart_heatmap_sub(cx);
+        cx.notify();
+        request_layout_save(cx);
+    }
+
+    /// Heatmap history fill — pages older book snapshots when the visible
+    /// window extends past the oldest loaded sample. Throttled (200ms) with the
+    /// service-side in-flight guard as a second line of defence. No-op when the
+    /// overlay is off or coverage already reaches the left edge.
+    fn maybe_request_heatmap_history(&mut self, cx: &mut Context<Self>) {
+        let Some(symbol) = self
+            .chart_state
+            .as_ref()
+            .and_then(|s| s.heatmap_enabled().then(|| s.symbol().clone()))
+        else {
+            return;
+        };
+        let Some(view_lo) = self
+            .chart_state
+            .as_ref()
+            .and_then(|s| s.view_time_range())
+            .map(|(lo, _)| lo)
+        else {
+            return;
+        };
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        // Enough coverage already? (`None` = empty series, so seed it.)
+        if let Some(oldest) = market
+            .read(cx)
+            .book_series_oldest_ms(symbol.as_ref(), chart::HEATMAP_DEPTH)
+        {
+            if oldest <= view_lo {
+                return;
+            }
+        }
+        const THROTTLE_MS: i64 = 200;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(last) = self.heatmap_history_last_request_ms {
+            if now_ms - last < THROTTLE_MS {
+                return;
+            }
+        }
+        self.heatmap_history_last_request_ms = Some(now_ms);
+        market.update(cx, |svc, cx| {
+            svc.load_older_book(symbol.as_ref(), chart::HEATMAP_DEPTH, cx)
+        });
+    }
+
+    /// Rebuild the chart's heatmap GPU texture for the current view if needed.
+    /// Reads the book time-series straight from the service (no per-frame clone)
+    /// and hands it to `ChartState::refresh_heatmap`, which throttles the actual
+    /// rebuild on a data/view/settings key. Called from `render` because it
+    /// needs a `&mut Window` (atlas eviction). No-op when the overlay is off.
+    fn refresh_chart_heatmap_texture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Symbol + retention floor for this frame: keep one extra visible-span
+        // of history on the left so a back-scroll has buffer before paging
+        // re-fills, and the build's 25% margin always sits inside what's kept.
+        let Some((symbol, retention_floor)) = self.chart_state.as_ref().and_then(|s| {
+            if !s.heatmap_enabled() {
+                return None;
+            }
+            let (lo, hi) = s.view_time_range()?;
+            let span = (hi - lo).max(1);
+            Some((s.symbol().clone(), lo - span))
+        }) else {
+            return;
+        };
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        // Evict (mut) before reading the series for the texture build, but
+        // throttled so the series length stays stable between batches (see the
+        // field doc).
+        const EVICT_INTERVAL_MS: i64 = 2000;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if self
+            .heatmap_last_evict_ms
+            .map_or(true, |last| now_ms - last >= EVICT_INTERVAL_MS)
+        {
+            self.heatmap_last_evict_ms = Some(now_ms);
+            market.update(cx, |svc, _| {
+                svc.evict_book_history_before(symbol.as_ref(), chart::HEATMAP_DEPTH, retention_floor)
+            });
+        }
+        let svc = market.read(cx);
+        let series = svc.book_series(symbol.as_ref(), chart::HEATMAP_DEPTH);
+        if let Some(chart) = self.chart_state.as_mut() {
+            chart.refresh_heatmap(series, now_ms, window);
         }
     }
 
@@ -2586,6 +2839,12 @@ impl Panel for ContentPanel {
                 profile: Some(*chart.profile_params()),
                 volume_unit: Some(volume_unit_id(chart.volume_unit()).to_string()),
                 indicators,
+                heatmap_enabled: chart.heatmap_enabled(),
+                heatmap_manual_ref: Some(chart.heatmap_settings().color_peak),
+                heatmap_color_lo: Some(chart.heatmap_settings().color_lo),
+                heatmap_opacity: Some(chart.heatmap_settings().max_opacity),
+                heatmap_show_text: Some(chart.heatmap_settings().show_text),
+                heatmap_extend_right: Some(chart.heatmap_settings().extend_right),
             }) {
                 state.info = PanelInfo::panel(value);
             }
@@ -2673,6 +2932,11 @@ impl Render for ContentPanel {
                 self.maybe_request_vp_history(cx);
                 self.maybe_request_liq_bars_history(cx);
                 self.maybe_request_oi_bars_history(cx);
+                self.maybe_request_heatmap_history(cx);
+                // Rebuild the heatmap texture (if dirty) before render captures
+                // its Arc — needs `&mut Window` for atlas eviction, which the
+                // paint closure (App-only) can't do.
+                self.refresh_chart_heatmap_texture(window, cx);
                 chart::render(
                     self.chart_state
                         .as_ref()
