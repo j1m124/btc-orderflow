@@ -119,8 +119,8 @@ const TRADE_WRITER_FLUSH: StdDuration = StdDuration::from_millis(100);
 /// full 1s detail; only DB-backed history is coarsened.
 const BOOK_SNAPSHOT_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
-/// Persisted-snapshot half-depth in **$5 buckets per side**: 500 buckets ×
-/// `BOOK_BUCKET_USD` ($5) ⇒ a hard **±$2500** price band around mid. This is a
+/// Persisted-snapshot half-depth in **$5 buckets per side**: 1000 buckets ×
+/// `BOOK_BUCKET_USD` ($5) ⇒ a hard **±$5000** price band around mid. This is a
 /// price bound, *not* a raw-level count — `top_n(N)` counts levels, which can't
 /// bound price span: a real book carries sparse, economically-dead resting
 /// orders far from mid (a $1k bid, a $105k ask) that the `depth@100ms` diff
@@ -131,7 +131,11 @@ const BOOK_SNAPSHOT_INTERVAL: StdDuration = StdDuration::from_secs(60);
 /// The heatmap (the only consumer) renders within this band, and the client's
 /// live sampler is bound to the same span. The live wire BookDelta stream is
 /// independent and may filter to any client-requested depth.
-const BOOK_SNAPSHOT_DEPTH: usize = 500;
+///
+/// Widened 500→1000 ($2500→$5000) so scroll-y reveals deeper resting liquidity.
+/// Cost is ~2× wider `book_snapshots` arrays (still cheap at the $5-bucket grain
+/// and 1m cadence); takes effect on the next server redeploy.
+const BOOK_SNAPSHOT_DEPTH: usize = 1000;
 
 /// Price-bucket width for the persisted snapshot, in dollars: **50 ticks ×
 /// $0.10** (BTCUSDT-perp tick). The in-band levels are aggregated into these $5
@@ -143,7 +147,7 @@ const BOOK_SNAPSHOT_DEPTH: usize = 500;
 const BOOK_BUCKET_USD: f64 = 5.0;
 
 /// Half-width of the served book price band, in dollars: `BOOK_SNAPSHOT_DEPTH`
-/// ($5 buckets) × `BOOK_BUCKET_USD` ⇒ **±$2500** around mid. Bounds the price
+/// ($5 buckets) × `BOOK_BUCKET_USD` ⇒ **±$5000** around mid. Bounds the price
 /// *span* of every book read — the persisted snapshot (`persist_snapshot`) and
 /// the live forwarder (`gateway::session`) — so no consumer ever sees the
 /// phantom far-from-mid tail. The forwarder applies it as an *intersection* with

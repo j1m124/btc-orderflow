@@ -319,7 +319,7 @@ texture refresh + paging + persistence), `workspace.rs` (settings floating-windo
   last cell honours `extend_right`). Both the cell and text painters iterate only `visible_bucket_range`
   (the full-extent table can hold ≫ on-screen buckets). Quad count is bounded by the table's
   `TEXT_MAX_SAMPLES` column cap × visible buckets; if it ever feels heavy, raise `MIN_CELL_H_FOR_CRISP`.
-- **±$2500 price band on the book — server-side, both paths.** The depth bumps above exposed a
+- **±$5000 price band on the book — server-side, both paths.** The depth bumps above exposed a
   latent bug: `BOOK_SNAPSHOT_DEPTH` / `HEATMAP_DEPTH` count **levels**, not price, and a real
   Binance book carries sparse, economically-dead resting orders far from mid (a $1k bid, a $105k
   ask) that the diff stream never removes. So `top_n(10000)` spanned **$100k+**, and the non-lazy-y
@@ -328,14 +328,15 @@ texture refresh + paging + persistence), `workspace.rs` (settings floating-windo
   still derives the band from the full extent of whatever it receives, which is now pre-bounded):
   a new `Book::top_n_within_band(n, band)` (`binance/book.rs`) intersects the level count with a
   ±`band` window around mid. `BOOK_BAND_USD` (`ingest.rs`) = `BOOK_SNAPSHOT_DEPTH` × `BOOK_BUCKET_USD`
-  = 500 × $5 = **±$2500/side**. Two call paths use it: `persist_snapshot` reads the whole book within
-  the band (`n = usize::MAX`) before bucketing (history rows now ≤500 buckets/side, the phantom tail
+  = 1000 × $5 = **±$5000/side** (widened from 500/$2500 so scroll-y reveals deeper liquidity). Two
+  call paths use it: `persist_snapshot` reads the whole book within
+  the band (`n = usize::MAX`) before bucketing (history rows now ≤1000 buckets/side, the phantom tail
   gone); the live forwarder (`gateway/session.rs`, all three `top_n` sites — initial snapshot, the
   per-batch delta-filter window, and the periodic resync) bounds the live stream the same way. The
   band is an **intersection** with each subscription's depth, so the orderbook ladder (depth 1000,
   always near mid) is unaffected — only the heatmap's depth-10000 sub is actually band-bounded.
-  `BOOK_SNAPSHOT_DEPTH` is now read as a **$5-bucket count** (500 ⇒ $2500), not a raw-level count.
-  *Trade-off:* "scroll-y reveals deep liquidity" is now capped at ±$2500; walls beyond that are no
+  `BOOK_SNAPSHOT_DEPTH` is now read as a **$5-bucket count** (1000 ⇒ $5000), not a raw-level count.
+  *Trade-off:* "scroll-y reveals deep liquidity" is now capped at ±$5000; walls beyond that are no
   longer stored or streamed. *Backlog:* the server change bounds only **new** rows — phantom rows
   already written (since the depth-10000 deploy) keep their $100k span until they age out under the
   14-day retention, so they must be deleted (`DELETE FROM book_snapshots WHERE array_length(bid_prices,1)
