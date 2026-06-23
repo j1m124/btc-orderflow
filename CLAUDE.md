@@ -71,6 +71,12 @@ Server and client deploy as **two independent images / containers** so a change 
 
 - **Build:** `Dockerfile.server` (native, ~3 stages) and `Dockerfile.client` (wasm + Vite → Caddy). CI: `.github/workflows/server.yml` + `client.yml`, each path-filtered. `crates/protocol/**` + `Cargo.lock` trigger **both** on purpose.
 - **Protocol-drift discipline (load-bearing — there is no version handshake):** when changing `crates/protocol`, **deploy server-first** and mark every new field `#[serde(default)]`. serde is asymmetrically tolerant — an old client ignores unknown fields / never-subscribed channels, but a *new* client reading an *old* server's frame errors on a missing field unless it defaults. Additive change → single push, order-independent. Breaking change (rename/remove/retype) → push server, wait for live, then push client, then refresh the browser tab (the long-lived WASM tab won't auto-reload). A version handshake + "please refresh" banner is deliberately deferred.
+- **Versioning convention (only the client carries semver):** server + protocol are SHA-identified (`/healthz` build, `BUILD_SHA`); the **client owns the app's semver** in `crates/client/Cargo.toml` and it's the one human-facing version (bottom bar `v<version>-<sha>`). Because there's no wire handshake, the bump rule is **pinned to protocol compatibility** so the number visibly moves exactly when cross-deploy compatibility is at stake — it's the human stand-in for the deferred handshake:
+  - **PATCH** (`0.2.0`→`0.2.1`) — client-only changes (UI, render, fixes); no protocol change.
+  - **MINOR** (`0.2.x`→`0.3.0`) — new client capability, **or** an *additive* protocol change (new `#[serde(default)]` field / channel — the order-independent case above).
+  - **MAJOR** (`0.x`→`1.0`, then `1.x`→`2.0`) — a *breaking* protocol change (rename/remove/retype — the coordinated server-first + tab-refresh case). A major bump is the cue that a plain redeploy is **not** safe.
+
+  Mechanics: bump the `version` field → push to `main` → `.github/workflows/client.yml` stamps the GHCR image `:<version>` and pushes a `client-v<version>` git tag (idempotent — a non-bump push just refreshes `:latest`). Server/protocol need no bump.
 
 ## Architecture
 
@@ -97,7 +103,7 @@ Shared serde-only types. Tagged enums (`ClientFrame.op`, `ServerFrame.type`) mat
 **Workspace shell** (`workspace.rs::TerminalWorkspace`) holds:
 - `top_bar`: title, Draw menu (12 drawing tools), Objects popover, `+ Panel` menu, `Layouts` menu, screenshot button, settings button.
 - `dock_area`: gpui-component's `DockArea` (`LAYOUT_VERSION = 5`; bump on panel-ID changes so persisted layouts reset).
-- `bottom_bar`: connection status (driven by the WS), clock, FPS, version (from `BUILD_SHA` via `build.rs`).
+- `bottom_bar`: connection status (driven by the WS), clock, FPS, version — the client's semver (`CARGO_PKG_VERSION` from `crates/client/Cargo.toml`) plus the short build SHA (from `BUILD_SHA` via `build.rs`), e.g. `v0.2.0-abc1234`. The client is the only crate carrying a real semver; server + protocol stay SHA-only. Bumping the client `version` field also stamps the GHCR image `:<version>` and pushes a `client-v<version>` git tag (see `.github/workflows/client.yml`).
 - Floating layer: `FloatingWindow` slots (indicator settings, footprint render settings, drawing settings, code editor) and the `FloatingStrip` shown when a drawing is selected.
 - Subscribes to `DockEvent::LayoutChanged` and debounces a save (500ms) to `persistence`.
 
