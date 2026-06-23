@@ -26,7 +26,9 @@ btc-orderflow/
 ├── Cargo.toml                     # Workspace root.
 ├── .cargo/config.toml             # wasm-bindgen-test-runner only; no global target.
 ├── docker-compose.yml             # TimescaleDB (port 5432).
-├── Dockerfile                     # 5-stage cargo-chef build → debian-slim runtime.
+├── Dockerfile.server              # Native server image (cargo-chef → debian-slim).
+├── Dockerfile.client              # WASM + Vite → Caddy static image (owns COOP/COEP).
+│                                  #   (split deploy — see "Split deployment" below)
 └── Makefile                       # Single entry point for every target.
 ```
 
@@ -59,9 +61,16 @@ After WASM source changes during `make dev`, re-run `./scripts/build-wasm.sh` an
 
 `gpui` and `gpui_platform` are git deps with **no `rev` pin** — they unify with the (un-revved) `gpui` dep declared inside `gpui-component`. Adding a `rev` makes cargo treat them as two separate copies and nothing typechecks. `gpui-component` itself is pinned to `d3d6e56c96659fb7516e2c743b80331af62e546d` and path-patched to the vendored fork. Reproducibility comes from `Cargo.lock`, which is committed.
 
-`wasm-bindgen-cli` version (in `Makefile`, `Dockerfile`, and on your machine) must match the `wasm-bindgen` crate version pulled in by `Cargo.lock`. Currently `0.2.120`. Mismatch = JS bindings reference symbols the WASM doesn't export.
+`wasm-bindgen-cli` version (in `Makefile`, `Dockerfile.client`, and on your machine) must match the `wasm-bindgen` crate version pulled in by `Cargo.lock`. Currently `0.2.120`. Mismatch = JS bindings reference symbols the WASM doesn't export.
 
 `sqlx-cli` is pinned the same way (`SQLX_CLI_VERSION` in `Makefile`, currently `0.8.6`, matching the `sqlx` crate). Drift here is less catastrophic — the CLI is mostly forward-compatible — but keeps reversible-migration semantics in sync with the runtime applier.
+
+## Split deployment
+
+Server and client deploy as **two independent images / containers** so a change to one never rebuilds or redeploys the other (they develop at different paces; a client tweak must not restart the server and drop WS connections / re-trigger the Binance cold-start). Prod topology: one domain (`orderflow.j1mdev.net`), Traefik path-routes `Path(/ws)` → the server container (axum; `/ws` + `/healthz` only, no `STATIC_DIR`), and `PathPrefix(/)` → a Caddy static container (`Dockerfile.client` → `www/Caddyfile`) that serves `dist/` and owns the SPA fallback + COOP/COEP + cache headers. Same-origin throughout, so the client's `window.location` → `wss://<host>/ws` derivation needs no change. `/healthz` is internal-only (Docker HEALTHCHECK), not publicly routed.
+
+- **Build:** `Dockerfile.server` (native, ~3 stages) and `Dockerfile.client` (wasm + Vite → Caddy). CI: `.github/workflows/server.yml` + `client.yml`, each path-filtered. `crates/protocol/**` + `Cargo.lock` trigger **both** on purpose.
+- **Protocol-drift discipline (load-bearing — there is no version handshake):** when changing `crates/protocol`, **deploy server-first** and mark every new field `#[serde(default)]`. serde is asymmetrically tolerant — an old client ignores unknown fields / never-subscribed channels, but a *new* client reading an *old* server's frame errors on a missing field unless it defaults. Additive change → single push, order-independent. Breaking change (rename/remove/retype) → push server, wait for live, then push client, then refresh the browser tab (the long-lived WASM tab won't auto-reload). A version handshake + "please refresh" banner is deliberately deferred.
 
 ## Architecture
 
@@ -73,7 +82,7 @@ Single binary, single tokio runtime. Tasks: Binance ingest (two WS connections �
 
 Five `tokio::sync::broadcast` channels (kline / trade / depth / liquidation / open_interest) fan ingest out to writers and per-client gateway forwarders. Writers hold permanent receivers so channels never go zero-consumer. Boot ordering in `main.rs` matters: channels → writers → aggregator/maintainer → ingest → gateway.
 
-Gateway (`gateway/`): axum on `127.0.0.1:8787` serving `GET /healthz`, `WS /ws` (optional `ALLOWED_ORIGINS` allowlist), and a static-SPA fallback from `STATIC_DIR` with COOP/COEP headers. Per-client session: one writer task draining a shared mpsc, one forwarder task per `SubId`. Every forwarder subscribes to the broadcast BEFORE its snapshot query, then dedupes the live stream against the snapshot tail (`open_time` / `agg_id` / `ts_ms` cursors). Trades, footprint, book, and liquidation forwarders conflate into 100ms batches; broadcast lag → send `Resnap` and exit (client resubscribes).
+Gateway (`gateway/`): axum on `127.0.0.1:8787` serving `GET /healthz` (returns the server build SHA from `build.rs`), `WS /ws` (optional `ALLOWED_ORIGINS` allowlist), and — only when `STATIC_DIR` is set (local use; **unset in prod** since the deploy split) — a static-SPA fallback with COOP/COEP headers. Per-client session: one writer task draining a shared mpsc, one forwarder task per `SubId`. Every forwarder subscribes to the broadcast BEFORE its snapshot query, then dedupes the live stream against the snapshot tail (`open_time` / `agg_id` / `ts_ms` cursors). Trades, footprint, book, and liquidation forwarders conflate into 100ms batches; broadcast lag → send `Resnap` and exit (client resubscribes).
 
 Storage: five hypertables — `candles` (PK `(symbol, tf, open_time)`, 1-day chunks), `trades` (1-hour chunks), `book_snapshots` (1-hour chunks), `liquidations` (1-day chunks), `open_interest` (PK `(symbol, ts)`, 1-day chunks). All five share a uniform **14-day retention** (was trades/book_snapshots 48h + candles/liq/OI 7d; widened to a fortnight across the board by migration `20260623032808_extend_retention_14d`). Raw events are persisted for every source *except* `book_snapshots`, which stores depth pre-aggregated into 50-tick ($5) price bins within a ±$5000 band around mid (the heatmap is its only consumer and renders at that grain over that span, so neither finer granularity nor deeper liquidity can be recovered retroactively from these rows). Footprint cells, sub-second bars, liquidation bars, and open-interest OHLC are computed on read with `time_bucket` queries, so any bucket size / TF works retroactively for those.
 
@@ -109,10 +118,10 @@ The chart panel (`panels/chart.rs`) is a thin facade over focused submodules: `c
 - **gpui's render canvas is anonymous.** gpui_web appends its own `<canvas>` to `<body>` at boot; the static `#canvas` in `www/index.html` is loading-shell decoration that `main.js` removes. Query `body > canvas`, never `#canvas`.
 - **Inner `v_flex().size_full()` blocks scrolling.** A child with `size_full` is clamped to parent height — content can't overflow, so the outer `overflow_y_scroll` div has nothing to scroll. Use `.w_full()` on the inner content and reserve `.size_full()` for the scroll wrapper.
 - **Bun + Node mismatch.** `www/package.json` scripts use `bun --bun vite` (not `bun run vite`) to force Bun's runtime. Without `--bun`, Bun shells out to Node — and if your Node is older than 20.19, Vite 8 won't load. (Exception: `make dev-vps` deliberately runs Vite under Node because Bun lacks `socket.destroySoon`, which Vite's WS proxy needs.)
-- **Vite COOP/COEP headers** are required for SharedArrayBuffer (gpui_platform wants it). Set in `vite.config.js`; the prod gateway sets the same headers on the static fallback.
+- **Vite COOP/COEP headers** are required for SharedArrayBuffer (gpui_platform wants it). Set in `vite.config.js` for dev; in prod the **Caddy client container** (`www/Caddyfile`) sets the same headers — keep all three (dev Vite, `www/Caddyfile`, and the dormant server `response_headers`) in lockstep.
 - **sqlx is non-macro form.** Queries use `sqlx::query` / `sqlx::query_as::<_, T>(...)` rather than the `query!` macro, because that macro needs either a live DB at compile time or a committed `.sqlx/` offline cache. We give up the compile-time column check; runtime type errors surface on the first query against a mis-typed column.
 - **S1/S5 are not Binance streams.** Any code mapping timeframes to Binance kline streams or REST backfills must filter on `Timeframe::is_native_kline()`; sub-second bars come from aggTrades (live: subsec aggregator; history: `time_bucket` over `trades`).
-- **Dockerfile layer caching is deliberate.** The cargo-chef cook layer is the only thing that makes CI fast; `BUILD_SHA`/`BUILD_REF` ARGs must stay declared *after* the cook, the chef base image stays digest-pinned, and `vendor/` must be COPYed before the cook (chef's recipe misses path-patched manifests). See the rationale comments in the Dockerfile before restructuring it.
+- **Dockerfile layer caching is deliberate.** The cargo-chef cook layer is the only thing that makes CI fast; `BUILD_SHA`/`BUILD_REF` ARGs must stay declared *after* the cook, the chef base image stays digest-pinned, and `vendor/` must be COPYed before the cook (chef's recipe misses path-patched manifests). This holds for **both** `Dockerfile.server` and `Dockerfile.client` — each has its own cook layer, cached under a distinct GHA `scope=` (`server`/`client`) so they don't evict each other. See the rationale comments in each Dockerfile before restructuring.
 
 ## When extending
 

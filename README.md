@@ -18,7 +18,8 @@ btc-orderflow/
 │       └── migrations/
 ├── www/             # Vite + Bun host for the WASM blob.
 ├── docker-compose.yml   # Local TimescaleDB.
-├── Dockerfile           # Multi-stage prod build (rust + bun → debian-slim).
+├── Dockerfile.server    # Native server image (cargo-chef → debian-slim).
+├── Dockerfile.client    # WASM + Vite → Caddy static image.
 └── Makefile             # Single entry point for every workflow.
 ```
 
@@ -51,7 +52,7 @@ The deep dive lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The short v
 
 ## Deploy
 
-`main` push → `.github/workflows/deploy.yml` builds the multi-stage image → pushes to GHCR (`:latest` + `:sha-<short>`) → (optionally) pings Dokploy's redeploy webhook. The runtime image only needs `DATABASE_URL` and `ALLOWED_ORIGINS` env vars at start. Currently running on Hetzner CPX22 via Dokploy.
+`main` push → two path-filtered workflows build independently: `.github/workflows/server.yml` (native server image) and `client.yml` (WASM + Caddy static image), each → GHCR (`:latest` + `:sha-<short>`) → (optionally) pings its own Dokploy redeploy webhook. Server and client deploy on separate cadences (a client change never restarts the server); a wire-protocol change rebuilds both — deploy server-first (see CLAUDE.md "Split deployment"). The server image only needs `DATABASE_URL` + `ALLOWED_ORIGINS`; the client image is static. Both behind one Traefik on Hetzner CPX22 via Dokploy.
 
 ## Stack
 
