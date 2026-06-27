@@ -54,6 +54,14 @@ pub enum FieldKind {
         get: Rc<dyn Fn(&App) -> f64>,
         set: Rc<dyn Fn(f64, &mut App)>,
     },
+    /// A horizontal slider over `opts.min..=opts.max` with a live value readout
+    /// (formatted via the same `format`/`suffix` as a number field). Suits
+    /// bounded ratios like percentages where dragging beats typing.
+    Slider {
+        opts: NumberOpts,
+        get: Rc<dyn Fn(&App) -> f64>,
+        set: Rc<dyn Fn(f64, &mut App)>,
+    },
     Switch {
         get: Rc<dyn Fn(&App) -> bool>,
         set: Rc<dyn Fn(bool, &mut App)>,
@@ -97,14 +105,19 @@ impl DropdownOption {
     }
 }
 
-/// Bounds + step for the number input. `format` controls how the current
-/// value is displayed (e.g., trailing `%`, fixed decimals).
+/// Bounds + step for the number input. `format` controls only the *numeric*
+/// rendering of the editable value (e.g. fixed decimals) — it must NOT embed a
+/// unit, since it becomes the text inside the input box. The unit belongs in
+/// [`NumberOpts::suffix`], which renders as a muted label *beside* the input so
+/// the editable field stays a bare number.
 #[derive(Clone)]
 pub struct NumberOpts {
     pub min: f64,
     pub max: f64,
     pub step: f64,
     pub format: Option<Rc<dyn Fn(f64) -> SharedString>>,
+    /// Unit shown next to (not inside) the input — e.g. `%`, `ticks`, `h`.
+    pub suffix: Option<SharedString>,
 }
 
 impl Default for NumberOpts {
@@ -114,6 +127,7 @@ impl Default for NumberOpts {
             max: f64::MAX,
             step: 1.0,
             format: None,
+            suffix: None,
         }
     }
 }
@@ -126,6 +140,7 @@ impl NumberOpts {
             max: max as f64,
             step: 1.0,
             format: None,
+            suffix: None,
         }
     }
 
@@ -135,6 +150,7 @@ impl NumberOpts {
             max,
             step,
             format: None,
+            suffix: None,
         }
     }
 
@@ -148,6 +164,13 @@ impl NumberOpts {
         F: Fn(f64) -> SharedString + 'static,
     {
         self.format = Some(Rc::new(f));
+        self
+    }
+
+    /// Set the unit label rendered beside the input (`%`, `ticks`, `h`, …).
+    /// Keeps the editable field a bare number while still showing the unit.
+    pub fn suffix(mut self, unit: impl Into<SharedString>) -> Self {
+        self.suffix = Some(unit.into());
         self
     }
 }
@@ -204,6 +227,20 @@ impl Field {
         S: Fn(f64, &mut App) + 'static,
     {
         Self::with_kind(label, FieldKind::Number {
+            opts,
+            get: Rc::new(get),
+            set: Rc::new(set),
+        })
+    }
+
+    /// Bounded numeric value as a drag slider with a live readout. Same
+    /// `NumberOpts` as [`Field::number`] (bounds / step / `format` / `suffix`).
+    pub fn slider<G, S>(label: impl Into<SharedString>, opts: NumberOpts, get: G, set: S) -> Self
+    where
+        G: Fn(&App) -> f64 + 'static,
+        S: Fn(f64, &mut App) + 'static,
+    {
+        Self::with_kind(label, FieldKind::Slider {
             opts,
             get: Rc::new(get),
             set: Rc::new(set),

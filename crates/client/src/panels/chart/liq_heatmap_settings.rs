@@ -18,13 +18,16 @@ use gpui::{
 use gpui_component::slider::{Slider, SliderEvent, SliderScale, SliderState};
 use gpui_component::{ActiveTheme as _, v_flex};
 
-use super::paint::{LIQ_COLOR_RANGE_MAX, LIQ_COLOR_RANGE_MIN};
+use super::paint::{Colormap, LIQ_COLOR_RANGE_MAX, LIQ_COLOR_RANGE_MIN};
 use crate::indicators::liq_heatmap::{
-    DEFAULT_BUCKET, MAX_BUCKET_TICKS, MIN_BUCKET_TICKS, TICK_SIZE,
+    DEFAULT_BUCKET, DEFAULT_PROFILE_WIDTH_PCT, MAX_BUCKET_TICKS, MAX_PROFILE_WIDTH_PCT,
+    MIN_BUCKET_TICKS, MIN_PROFILE_WIDTH_PCT, TICK_SIZE,
 };
 use crate::indicators::{InstanceId, LiqHeatmapParams};
 use crate::panels::ContentPanel;
-use crate::settings_form::{Field, IndicatorTarget, NumberOpts, SettingsForm, SettingsGroup};
+use crate::settings_form::{
+    DropdownOption, Field, IndicatorTarget, NumberOpts, SettingsForm, SettingsGroup,
+};
 
 pub struct LiqHeatmapSettingsView {
     /// Routes reads/writes to the liq-heatmap instance's params, going through
@@ -159,8 +162,7 @@ fn bucket_ticks(bucket: f64) -> f64 {
 fn build_liq_form(tgt: &IndicatorTarget<LiqHeatmapParams>) -> SettingsForm {
     let bucket_field = Field::number(
         "Tick size",
-        NumberOpts::int(MIN_BUCKET_TICKS, MAX_BUCKET_TICKS)
-            .format(|v| SharedString::from(format!("{} ticks", v.round().max(1.0) as i64))),
+        NumberOpts::int(MIN_BUCKET_TICKS, MAX_BUCKET_TICKS).suffix("ticks"),
         tgt.getter(bucket_ticks(DEFAULT_BUCKET), |p: &LiqHeatmapParams| {
             bucket_ticks(p.bucket)
         }),
@@ -171,9 +173,9 @@ fn build_liq_form(tgt: &IndicatorTarget<LiqHeatmapParams>) -> SettingsForm {
     )
     .description("Heatmap row height in ticks — 1 tick = $0.10 (the BTCUSDT price increment). Coarser merges nearby magnets into fatter bands.");
 
-    let opacity_field = Field::number(
+    let opacity_field = Field::slider(
         "Max opacity",
-        NumberOpts::int(5, 100).format(|v| SharedString::from(format!("{}%", v.round() as i64))),
+        NumberOpts::int(5, 100).suffix("%"),
         tgt.getter(85.0, |p: &LiqHeatmapParams| {
             (p.settings.max_opacity as f64 * 100.0).round()
         }),
@@ -183,10 +185,27 @@ fn build_liq_form(tgt: &IndicatorTarget<LiqHeatmapParams>) -> SettingsForm {
     )
     .description("Opacity of the hottest cell — lower keeps candles readable.");
 
-    let mmr_field = Field::number(
+    let colormap_field = Field::dropdown(
+        "Colour map",
+        Colormap::ALL
+            .iter()
+            .map(|c| DropdownOption::new(c.as_str(), c.label()))
+            .collect(),
+        tgt.getter(
+            SharedString::from(Colormap::Plasma.as_str()),
+            |p: &LiqHeatmapParams| SharedString::from(p.settings.colormap.as_str()),
+        ),
+        tgt.setter(|p: &mut LiqHeatmapParams, v: SharedString| {
+            p.settings.colormap = Colormap::from_token(v.as_ref());
+        }),
+    )
+    .description("Colour gradient for the heat ramp (also recolours the profile).");
+
+    let mmr_field = Field::slider(
         "Maint. margin",
         NumberOpts::float(0.0, 5.0, 0.05)
-            .format(|v| SharedString::from(format!("{:.2}%", v))),
+            .format(|v| SharedString::from(format!("{:.2}", v)))
+            .suffix("%"),
         tgt.getter(0.4, |p: &LiqHeatmapParams| p.mmr * 100.0),
         tgt.setter(|p: &mut LiqHeatmapParams, v: f64| {
             p.mmr = (v / 100.0).clamp(0.0, 0.1);
@@ -196,7 +215,7 @@ fn build_liq_form(tgt: &IndicatorTarget<LiqHeatmapParams>) -> SettingsForm {
 
     let lookback_field = Field::number(
         "Lookback",
-        NumberOpts::int(1, 168).format(|v| SharedString::from(format!("{}h", v.round() as i64))),
+        NumberOpts::int(1, 168).suffix("h"),
         tgt.getter(24.0, |p: &LiqHeatmapParams| {
             (p.lookback_ms as f64 / 3_600_000.0).round()
         }),
@@ -215,6 +234,29 @@ fn build_liq_form(tgt: &IndicatorTarget<LiqHeatmapParams>) -> SettingsForm {
     )
     .description("Draw the estimated notional inside each cell when zoomed in enough.");
 
+    let show_profile_field = Field::switch(
+        "Show profile",
+        tgt.getter(false, |p: &LiqHeatmapParams| p.show_profile),
+        tgt.setter(|p: &mut LiqHeatmapParams, v: bool| {
+            p.show_profile = v;
+        }),
+    )
+    .description("Right-edge histogram of peak estimated liq notional per price across the visible range — a price-axis summary of the heatmap.");
+
+    let tgt_vis = tgt.clone();
+    let profile_width_field = Field::slider(
+        "Profile width",
+        NumberOpts::float(MIN_PROFILE_WIDTH_PCT, MAX_PROFILE_WIDTH_PCT, 1.0).suffix("%"),
+        tgt.getter(DEFAULT_PROFILE_WIDTH_PCT as f64, |p: &LiqHeatmapParams| {
+            p.profile_width_pct as f64
+        }),
+        tgt.setter(|p: &mut LiqHeatmapParams, v: f64| {
+            p.profile_width_pct = v.clamp(MIN_PROFILE_WIDTH_PCT, MAX_PROFILE_WIDTH_PCT) as f32;
+        }),
+    )
+    .description("Length of the longest profile bar, as a percent of the chart's plot width.")
+    .visible_if(move |cx| tgt_vis.read(cx, |p| p.show_profile).unwrap_or(false));
+
     let extend_right_field = Field::switch(
         "Extend latest to edge",
         tgt.getter(true, |p: &LiqHeatmapParams| p.settings.extend_right),
@@ -228,9 +270,12 @@ fn build_liq_form(tgt: &IndicatorTarget<LiqHeatmapParams>) -> SettingsForm {
         SettingsGroup::new("General")
             .item(bucket_field)
             .item(opacity_field)
+            .item(colormap_field)
             .item(mmr_field)
             .item(lookback_field)
             .item(show_text_field)
+            .item(show_profile_field)
+            .item(profile_width_field)
             .item(extend_right_field),
     )
 }

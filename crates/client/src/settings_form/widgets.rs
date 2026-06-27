@@ -26,6 +26,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
     menu::{DropdownMenu as _, PopupMenuItem},
+    slider::{Slider, SliderEvent, SliderState, SliderValue},
     switch::Switch,
     v_flex,
 };
@@ -202,7 +203,25 @@ pub(super) fn render_number(
     }
 
     let input = state.read(cx).input.clone();
-    NumberInput::new(&input).small().into_any_element()
+    let number = NumberInput::new(&input).small();
+    match opts.suffix.clone() {
+        // Unit rendered beside the field so the editable value stays a bare
+        // number (the input box never shows "%", "ticks", "h", …).
+        Some(unit) => h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().min_w_0().child(number))
+            .child(
+                div()
+                    .flex_none()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(unit),
+            )
+            .into_any_element(),
+        None => number.into_any_element(),
+    }
 }
 
 fn format_display(v: f64, opts: &NumberOpts) -> SharedString {
@@ -246,6 +265,96 @@ fn parse_formatted(s: &str) -> Option<f64> {
         }
     }
     s[start?..end].parse::<f64>().ok()
+}
+
+// ───────────────────────────── slider ─────────────────────────────
+
+struct SliderFieldState {
+    state: Entity<SliderState>,
+    last_set: f64,
+    _sub: Subscription,
+}
+
+pub(super) fn render_slider(
+    row_key: SharedString,
+    opts: NumberOpts,
+    get: Rc<dyn Fn(&App) -> f64>,
+    set: Rc<dyn Fn(f64, &mut App)>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let key = SharedString::from(format!("{}-slider", row_key));
+    let initial = get(cx);
+    let (min, max, step) = (opts.min as f32, opts.max as f32, opts.step.max(f64::EPSILON) as f32);
+    let set_for_state = set.clone();
+    let slider = window.use_keyed_state(key, cx, move |window, cx| {
+        let state = cx.new(|_| {
+            SliderState::new()
+                .min(min)
+                .max(max)
+                .step(step)
+                .default_value(initial as f32)
+        });
+        let setter = set_for_state.clone();
+        let sub = window.subscribe(&state, cx, move |_state, ev: &SliderEvent, _w, cx| {
+            let SliderEvent::Change(value) = ev;
+            setter(value.end() as f64, cx);
+        });
+        SliderFieldState {
+            state,
+            last_set: initial,
+            _sub: sub,
+        }
+    });
+
+    // Mirror an external param change (another control / reset) back into the
+    // thumb position so the slider tracks the source of truth.
+    let snapshot = slider.read(cx);
+    let state_entity = snapshot.state.clone();
+    if (snapshot.last_set - initial).abs() > f64::EPSILON {
+        slider.update(cx, |s, _| s.last_set = initial);
+        state_entity.update(cx, |s, cx| s.set_value(initial as f32, window, cx));
+    }
+
+    // Readout reflects the live thumb value during a drag (the entity updates
+    // before the param round-trips), so it never lags the handle.
+    let current = match state_entity.read(cx).value() {
+        SliderValue::Single(v) => v as f64,
+        SliderValue::Range(_, end) => end as f64,
+    };
+    let readout = value_with_unit(current, &opts);
+
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .child(div().flex_1().min_w_0().child(Slider::new(&state_entity)))
+        .child(
+            div()
+                .flex_none()
+                .min_w(px(44.))
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(readout),
+        )
+        .into_any_element()
+}
+
+/// Numeric display plus its unit suffix as one string (e.g. `85%`, `30 ticks`).
+/// Symbolic units (`%`) butt against the number; word units (`ticks`) get a
+/// space.
+fn value_with_unit(v: f64, opts: &NumberOpts) -> SharedString {
+    let num = format_display(v, opts);
+    match opts.suffix.as_ref() {
+        Some(unit) => {
+            let sep = match unit.chars().next() {
+                Some(c) if c.is_alphanumeric() => " ",
+                _ => "",
+            };
+            SharedString::from(format!("{}{}{}", num, sep, unit))
+        }
+        None => num,
+    }
 }
 
 // ───────────────────────────── switch / checkbox ─────────────────────────────

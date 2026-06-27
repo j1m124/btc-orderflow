@@ -183,6 +183,148 @@ const DEFAULT_COLOR_PEAK: f64 = 100.0;
 pub const COLOR_RANGE_MIN: f64 = 1.0;
 pub const COLOR_RANGE_MAX: f64 = 10_000.0;
 
+/// Colour gradient that maps a normalised heat value `t ∈ [0,1]` to RGB.
+/// Selected per-instance in [`HeatmapSettings`]; honoured by **both** the
+/// orderbook and liquidation heatmaps (the colorize / crisp-cell / text /
+/// profile paths all sample through it). Stored by token (`as_str`) so old
+/// persisted blobs without the field default to [`Colormap::Heat`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Colormap {
+    /// The original ramp: blue → cyan → green → yellow → red.
+    #[default]
+    Heat,
+    /// Perceptually-uniform black → purple → red → orange → near-white.
+    Inferno,
+    /// Black → purple → magenta → orange → cream.
+    Magma,
+    /// Indigo → magenta → orange → yellow.
+    Plasma,
+    /// Dark purple → blue → teal → green → yellow.
+    Viridis,
+    /// Bright "improved rainbow" — purple → blue → teal → green → orange → red.
+    Turbo,
+    /// Simple dark → light grey.
+    Grayscale,
+}
+
+impl Colormap {
+    /// All variants in picker order. `Heat` first (the default / legacy look).
+    pub const ALL: [Colormap; 7] = [
+        Colormap::Heat,
+        Colormap::Inferno,
+        Colormap::Magma,
+        Colormap::Plasma,
+        Colormap::Viridis,
+        Colormap::Turbo,
+        Colormap::Grayscale,
+    ];
+
+    /// Stable serde / dropdown-value token.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Colormap::Heat => "heat",
+            Colormap::Inferno => "inferno",
+            Colormap::Magma => "magma",
+            Colormap::Plasma => "plasma",
+            Colormap::Viridis => "viridis",
+            Colormap::Turbo => "turbo",
+            Colormap::Grayscale => "grayscale",
+        }
+    }
+
+    /// Human label for the picker.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Colormap::Heat => "Heat",
+            Colormap::Inferno => "Inferno",
+            Colormap::Magma => "Magma",
+            Colormap::Plasma => "Plasma",
+            Colormap::Viridis => "Viridis",
+            Colormap::Turbo => "Turbo",
+            Colormap::Grayscale => "Grayscale",
+        }
+    }
+
+    /// Parse a [`Colormap::as_str`] token; unknown → [`Colormap::Heat`].
+    pub fn from_token(s: &str) -> Colormap {
+        Colormap::ALL
+            .into_iter()
+            .find(|c| c.as_str() == s)
+            .unwrap_or(Colormap::Heat)
+    }
+
+    /// Gradient stops `(position, (r, g, b))`, ascending position over `[0,1]`.
+    /// 5-stop perceptual approximations of the matplotlib maps (Turbo 6, grey 2).
+    fn stops(&self) -> &'static [(f32, (f32, f32, f32))] {
+        match self {
+            Colormap::Heat => &[
+                (0.00, (40.0, 60.0, 180.0)),
+                (0.25, (40.0, 160.0, 200.0)),
+                (0.50, (60.0, 200.0, 120.0)),
+                (0.75, (230.0, 200.0, 60.0)),
+                (1.00, (230.0, 70.0, 50.0)),
+            ],
+            Colormap::Inferno => &[
+                (0.00, (0.0, 0.0, 4.0)),
+                (0.25, (87.0, 16.0, 110.0)),
+                (0.50, (188.0, 55.0, 84.0)),
+                (0.75, (249.0, 142.0, 9.0)),
+                (1.00, (252.0, 255.0, 164.0)),
+            ],
+            Colormap::Magma => &[
+                (0.00, (0.0, 0.0, 4.0)),
+                (0.25, (81.0, 18.0, 124.0)),
+                (0.50, (183.0, 55.0, 121.0)),
+                (0.75, (252.0, 137.0, 97.0)),
+                (1.00, (252.0, 253.0, 191.0)),
+            ],
+            Colormap::Plasma => &[
+                (0.00, (13.0, 8.0, 135.0)),
+                (0.25, (126.0, 3.0, 168.0)),
+                (0.50, (204.0, 71.0, 120.0)),
+                (0.75, (248.0, 149.0, 64.0)),
+                (1.00, (240.0, 249.0, 33.0)),
+            ],
+            Colormap::Viridis => &[
+                (0.00, (68.0, 1.0, 84.0)),
+                (0.25, (59.0, 82.0, 139.0)),
+                (0.50, (33.0, 145.0, 140.0)),
+                (0.75, (94.0, 201.0, 98.0)),
+                (1.00, (253.0, 231.0, 37.0)),
+            ],
+            Colormap::Turbo => &[
+                (0.00, (48.0, 18.0, 59.0)),
+                (0.20, (52.0, 110.0, 235.0)),
+                (0.40, (30.0, 200.0, 180.0)),
+                (0.60, (150.0, 230.0, 60.0)),
+                (0.80, (250.0, 165.0, 40.0)),
+                (1.00, (220.0, 40.0, 30.0)),
+            ],
+            Colormap::Grayscale => &[
+                (0.00, (28.0, 28.0, 28.0)),
+                (1.00, (245.0, 245.0, 245.0)),
+            ],
+        }
+    }
+
+    /// Sample the gradient at `t ∈ [0,1]` → 8-bit RGB (linear interpolation
+    /// between the bracketing stops).
+    #[inline]
+    pub fn sample(&self, t: f32) -> (u8, u8, u8) {
+        let stops = self.stops();
+        let t = t.clamp(0.0, 1.0);
+        let mut i = 0;
+        while i + 1 < stops.len() && t > stops[i + 1].0 {
+            i += 1;
+        }
+        let (t0, c0) = stops[i];
+        let (t1, c1) = stops[(i + 1).min(stops.len() - 1)];
+        let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+        let lerp = |a: f32, b: f32| (a + (b - a) * f).round().clamp(0.0, 255.0) as u8;
+        (lerp(c0.0, c1.0), lerp(c0.1, c1.1), lerp(c0.2, c1.2))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct HeatmapSettings {
@@ -194,6 +336,8 @@ pub struct HeatmapSettings {
     /// Ramp alpha at full intensity (0..1). Caps how opaque the hottest cell
     /// gets so candles stay readable on top.
     pub max_opacity: f32,
+    /// Colour gradient applied to the normalised heat value.
+    pub colormap: Colormap,
     /// Draw the per-cell book size as centred text when cells are large enough.
     /// When off, the logical-cell value table is never retained on rebuild.
     pub show_text: bool,
@@ -209,6 +353,7 @@ impl Default for HeatmapSettings {
             color_lo: DEFAULT_COLOR_LO,
             color_peak: DEFAULT_COLOR_PEAK,
             max_opacity: 0.85,
+            colormap: Colormap::Heat,
             show_text: true,
             extend_right: true,
         }
@@ -241,6 +386,9 @@ pub struct HeatmapValues {
     /// Ramp alpha at full intensity — mirrors `settings.max_opacity` so the
     /// crisp-cell painter matches the blit's opacity.
     pub max_opacity: f32,
+    /// Colour gradient — mirrors `settings.colormap` so the crisp-cell + text
+    /// paths sample the same ramp the texture was colorized with.
+    pub colormap: Colormap,
     /// Whether to draw the in-cell numeric text. The value table is now retained
     /// for crisp-cell rendering regardless of this, so the text path gates on it.
     pub show_text: bool,
@@ -522,6 +670,8 @@ impl HeatmapLayer {
             price_lo: c.price_lo,
             price_hi: c.price_hi,
             values: c.values.clone(),
+            // The orderbook heatmap has no profile layer.
+            profile: None,
         })
     }
 }
@@ -536,6 +686,32 @@ pub struct HeatmapRect {
     pub price_lo: f64,
     pub price_hi: f64,
     pub values: Option<Arc<HeatmapValues>>,
+    /// Optional right-anchored price profile painted *in front* of candles (via
+    /// [`paint_heatmap_profile`]). Only the liquidation heatmap populates it
+    /// (the orderbook heatmap leaves it `None`).
+    pub profile: Option<Arc<HeatmapProfile>>,
+}
+
+/// Aggregated per-price-bucket magnitude for the right-anchored **profile** — a
+/// horizontal histogram summarising the heatmap over the built time range
+/// (bucket `k` spans price `[price_lo + k·bucket, … + bucket)`). Each bucket
+/// holds the **peak** magnitude any single column reached there, *not* a sum:
+/// magnets persist across columns, so summing would inflate a level by how long
+/// it sat on screen rather than its strength — and the peak keeps each bar on
+/// the **same value scale as the heatmap cells**, so bar length + colour
+/// (both via the shared log ramp `lo` / `log_lo` / `log_span`) match the hottest
+/// cell at that price exactly.
+pub struct HeatmapProfile {
+    pub bucket: f64,
+    pub price_lo: f64,
+    pub n_buckets: usize,
+    /// `peaks[k]` = the largest magnitude bucket `k` reached in any one column.
+    pub peaks: Vec<f32>,
+    pub lo: f64,
+    pub log_lo: f32,
+    pub log_span: f32,
+    pub max_opacity: f32,
+    pub colormap: Colormap,
 }
 
 /// Paint the heatmap behind the candles. When the value table is present and
@@ -638,6 +814,90 @@ pub fn paint_heatmap(
     }
 }
 
+/// Paint the right-anchored magnet **profile**: one horizontal bar per visible
+/// price bucket, length + colour following the same log colour ramp as the
+/// heatmap (so the profile reads as a price-axis projection of the heat). Drawn
+/// *in front* of candles (called after the main chart), anchored to the **right
+/// edge of the plot area** — `canvas_w − y_axis_gap`, so it doesn't overlap the
+/// price axis (matching VRVP's `chart_left + chart_w` anchor) — and growing
+/// leftward. `width_frac` is the peak bar's length as a fraction of the plot
+/// width. Below-`lo` buckets are skipped. Pure paint-time mapping over the
+/// pre-aggregated [`HeatmapProfile`] — no aggregation here.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_heatmap_profile(
+    profile: &HeatmapProfile,
+    origin: Point<Pixels>,
+    canvas_w: f32,
+    y_axis_gap: f32,
+    width_frac: f32,
+    y_lo: f64,
+    y_hi: f64,
+    canvas_h: f32,
+    window: &mut Window,
+) {
+    if profile.bucket <= 0.0 || profile.n_buckets == 0 || y_hi <= y_lo || canvas_w <= 0.0 {
+        return;
+    }
+    // Anchor at the right edge of the *plot* area (price axis excluded), so the
+    // profile never paints over the y-axis labels.
+    let anchor_x = (canvas_w - y_axis_gap).max(1.0);
+    let band_w = (anchor_x * width_frac.clamp(0.0, 1.0)).max(1.0);
+    let lo_f = profile.lo as f32;
+
+    // Only buckets whose price band overlaps the visible range.
+    let k_lo = (((y_lo - profile.price_lo) / profile.bucket).floor().max(0.0) as usize)
+        .min(profile.n_buckets);
+    let k_hi = (((y_hi - profile.price_lo) / profile.bucket).ceil() + 1.0)
+        .max(0.0) as usize;
+    let k_hi = k_hi.min(profile.n_buckets);
+
+    for k in k_lo..k_hi {
+        let v = profile.peaks[k];
+        if v <= 0.0 || (v as f64) < profile.lo || v < lo_f {
+            continue;
+        }
+        let bp_lo = profile.price_lo + k as f64 * profile.bucket;
+        let bp_hi = bp_lo + profile.bucket;
+        let y_top = price_to_screen(y_lo, y_hi, bp_hi, canvas_h);
+        let y_bot = price_to_screen(y_lo, y_hi, bp_lo, canvas_h);
+        let h = y_bot - y_top;
+        if h <= 0.0 {
+            continue;
+        }
+        // Log-normalised intensity drives both bar length and colour — same
+        // mapping the texture/crisp-cell paths use, so length tracks heat.
+        let norm = (((1.0 + v).ln() - profile.log_lo) / profile.log_span).clamp(0.0, 1.0);
+        if norm <= 0.0 {
+            continue;
+        }
+        let bar_w = (band_w * norm).max(1.0);
+        let (r, g, bl) = profile.colormap.sample(norm);
+        let a = (norm.powf(0.6) * profile.max_opacity).clamp(0.0, 1.0);
+        if a <= 0.0 {
+            continue;
+        }
+        let color: Hsla = Rgba {
+            r: r as f32 / 255.0,
+            g: g as f32 / 255.0,
+            b: bl as f32 / 255.0,
+            a,
+        }
+        .into();
+        let bounds = Bounds {
+            origin: point(px(anchor_x - bar_w) + origin.x, px(y_top) + origin.y),
+            size: size(px(bar_w), px(h)),
+        };
+        window.paint_quad(PaintQuad {
+            bounds,
+            corner_radii: Corners::default(),
+            background: color.into(),
+            border_widths: Edges::default(),
+            border_color: gpui::transparent_black(),
+            border_style: BorderStyle::default(),
+        });
+    }
+}
+
 /// Paint each visible, lit cell as a solid quad with hard edges — the crisp
 /// alternative to the bilinear texture blit. Cells tile exactly (a cell's edges
 /// are shared with its neighbours), so equal-colour neighbours read seamless
@@ -696,7 +956,7 @@ fn paint_heatmap_cells(
             let y_top = price_to_screen(y_lo, y_hi, bp_hi, canvas_h);
             let y_bot = price_to_screen(y_lo, y_hi, bp_lo, canvas_h);
             let norm = (((1.0 + v).ln() - values.log_lo) / values.log_span).clamp(0.0, 1.0);
-            let (r, g, bl) = ramp(norm);
+            let (r, g, bl) = values.colormap.sample(norm);
             let a = (norm.powf(0.6) * values.max_opacity).clamp(0.0, 1.0);
             if a <= 0.0 {
                 continue;
@@ -801,9 +1061,10 @@ fn paint_heatmap_text(
             let y_top = price_to_screen(y_lo, y_hi, bp_hi, canvas_h);
             let y_bot = price_to_screen(y_lo, y_hi, bp_lo, canvas_h);
             let h = y_bot - y_top;
-            // Contrast: dark text on bright (yellow/green) cells, light on dark.
+            // Contrast: dark text on bright cells, light on dark — luminance of
+            // the actual ramp colour, so it adapts to the selected colormap.
             let norm = (((1.0 + v).ln() - values.log_lo) / values.log_span).clamp(0.0, 1.0);
-            let (cr, cg, cb) = ramp(norm);
+            let (cr, cg, cb) = values.colormap.sample(norm);
             let lum = 0.299 * cr as f32 + 0.587 * cg as f32 + 0.114 * cb as f32;
             let color = if lum > 140.0 {
                 hsla(0.0, 0.0, 0.0, 0.95)
@@ -985,6 +1246,7 @@ pub(super) fn colorize_range(
     log_lo: f32,
     log_span: f32,
     max_opacity: f32,
+    colormap: Colormap,
     c_lo: usize,
     c_hi: usize,
     buf: &mut [u8],
@@ -1014,7 +1276,7 @@ pub(super) fn colorize_range(
                 buf[idx..idx + 4].fill(0);
                 continue;
             }
-            let (r, g, bl) = ramp(norm);
+            let (r, g, bl) = colormap.sample(norm);
             any = true;
             // image::RgbaImage is row-major: pixel (x=col, y=row), BGRA order.
             buf[idx] = bl;
@@ -1052,6 +1314,7 @@ pub(super) fn build_values(
             log_lo,
             log_span,
             max_opacity: settings.max_opacity,
+            colormap: settings.colormap,
             show_text: settings.show_text,
             extend_right: settings.extend_right,
             samples: samples.to_vec(),
@@ -1231,6 +1494,7 @@ fn try_patch(
         log_lo,
         log_span,
         settings.max_opacity,
+        settings.colormap,
         c_start,
         cols,
         buf,
@@ -1440,6 +1704,7 @@ fn build_full(
         log_lo,
         log_span,
         settings.max_opacity,
+        settings.colormap,
         0,
         cols,
         buf,
@@ -1474,23 +1739,5 @@ fn build_full(
     })
 }
 
-/// Single perceptual-ish ramp blue → cyan → green → yellow → red. `t` in [0,1].
-fn ramp(t: f32) -> (u8, u8, u8) {
-    const STOPS: [(f32, (f32, f32, f32)); 5] = [
-        (0.00, (40.0, 60.0, 180.0)),
-        (0.25, (40.0, 160.0, 200.0)),
-        (0.50, (60.0, 200.0, 120.0)),
-        (0.75, (230.0, 200.0, 60.0)),
-        (1.00, (230.0, 70.0, 50.0)),
-    ];
-    let t = t.clamp(0.0, 1.0);
-    let mut i = 0;
-    while i + 1 < STOPS.len() && t > STOPS[i + 1].0 {
-        i += 1;
-    }
-    let (t0, c0) = STOPS[i];
-    let (t1, c1) = STOPS[(i + 1).min(STOPS.len() - 1)];
-    let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
-    let lerp = |a: f32, b: f32| (a + (b - a) * f).round().clamp(0.0, 255.0) as u8;
-    (lerp(c0.0, c1.0), lerp(c0.1, c1.1), lerp(c0.2, c1.2))
-}
+// The colour ramp now lives on `Colormap::sample` (see the enum near the top),
+// so the gradient is user-selectable per heatmap instead of a single fixed ramp.

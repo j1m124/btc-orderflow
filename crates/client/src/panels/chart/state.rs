@@ -1568,6 +1568,7 @@ impl ChartState {
     ) -> (
         crate::indicators::liq_heatmap::sim::SimParams,
         super::paint::HeatmapSettings,
+        bool,
     ) {
         self.liq_heatmap_instance()
             .and_then(|i| {
@@ -1575,10 +1576,10 @@ impl ChartState {
                     .as_any()
                     .downcast_ref::<crate::indicators::LiqHeatmapParams>()
             })
-            .map(|p| (p.sim_params(), p.settings))
+            .map(|p| (p.sim_params(), p.settings, p.show_profile))
             .unwrap_or_else(|| {
                 let p = crate::indicators::LiqHeatmapParams::default();
-                (p.sim_params(), p.settings)
+                (p.sim_params(), p.settings, p.show_profile)
             })
     }
 
@@ -1589,9 +1590,10 @@ impl ChartState {
     /// `&mut Window` is available for atlas eviction.
     pub fn refresh_liq_heatmap(&mut self, now_ms: i64, window: &mut Window) {
         let on = self.liq_heatmap_enabled();
-        let (sim_params, settings) = self.liq_heatmap_instance_params();
+        let (sim_params, settings, show_profile) = self.liq_heatmap_instance_params();
         self.liq_heatmap.enabled = on;
         self.liq_heatmap.settings = settings;
+        self.liq_heatmap.show_profile = show_profile;
         if !on {
             self.liq_heatmap.drop_cache(window);
             return;
@@ -1633,5 +1635,20 @@ impl ChartState {
     /// `None` when off / unbuilt. Captured into the chart's paint closure.
     pub(super) fn liq_heatmap_paint_rect(&self) -> Option<super::paint::HeatmapRect> {
         self.liq_heatmap.paint_rect()
+    }
+
+    /// Profile bar-width as a fraction of the plot width, from the instance
+    /// params (paint-time only — not in the texture rebuild key). Defaults when
+    /// no instance is attached.
+    pub(super) fn liq_heatmap_profile_width_frac(&self) -> f32 {
+        self.liq_heatmap_instance()
+            .and_then(|i| {
+                i.kind
+                    .as_any()
+                    .downcast_ref::<crate::indicators::LiqHeatmapParams>()
+            })
+            .map(|p| p.profile_width_pct)
+            .unwrap_or(crate::indicators::liq_heatmap::DEFAULT_PROFILE_WIDTH_PCT)
+            / 100.0
     }
 }

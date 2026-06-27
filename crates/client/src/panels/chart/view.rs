@@ -39,7 +39,8 @@ use super::drawings_view;
 use super::footprint_settings::OpenChartRenderSettings;
 use super::paint::{
     DrawingColors, HeatmapRect, MainChartColors, OverlayPaintItem, PanePaintItem, paint_heatmap,
-    paint_main_chart, paint_overlay_indicators, paint_sub_pane, render_drawings_overlay,
+    paint_heatmap_profile, paint_main_chart, paint_overlay_indicators, paint_sub_pane,
+    render_drawings_overlay,
 };
 use super::state::{
     CHART_MAX_VIEW, CHART_MIN_VIEW, CanvasDrag, ChartState, SCROLL_ZOOM_RATE, SplitterDrag,
@@ -784,6 +785,8 @@ pub fn render(
     // Predictive liquidation-heatmap texture (also behind candles). Independent
     // layer / texture; painted after the orderbook heatmap, before the candles.
     let paint_liq_heatmap_rect: Option<HeatmapRect> = state.liq_heatmap_paint_rect();
+    // Profile bar width (fraction of plot width) for the liq-heatmap profile.
+    let paint_liq_profile_width_frac: f32 = state.liq_heatmap_profile_width_frac();
     // Pre-filter overlay indicators for the paint closure: skip hidden /
     // pane-placed instances, snapshot color + output so the closure stays
     // 'static. Per-render clone — `Series` is a `Vec<Option<f64>>`, so the
@@ -2453,6 +2456,25 @@ pub fn render(
                                     window,
                                     cx,
                                 );
+                                // Liquidation-heatmap profile paints in front of
+                                // candles (it's a right-edge price summary, not a
+                                // backdrop) but under overlay indicators + drawings.
+                                if let Some(profile) = paint_liq_heatmap_rect
+                                    .as_ref()
+                                    .and_then(|r| r.profile.as_ref())
+                                {
+                                    paint_heatmap_profile(
+                                        profile,
+                                        bounds.origin,
+                                        f32::from(bounds.size.width),
+                                        paint_y_axis_gap,
+                                        paint_liq_profile_width_frac,
+                                        y_lo,
+                                        y_hi,
+                                        f32::from(bounds.size.height),
+                                        window,
+                                    );
+                                }
                                 // Overlay indicators paint after candles + grid but
                                 // before drawings, so user-drawn lines stay on top.
                                 paint_overlay_indicators(

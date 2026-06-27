@@ -33,8 +33,8 @@ mod sub_panes;
 
 pub(super) use drawings_overlay::{DrawingColors, render_drawings_overlay};
 pub use heatmap::{
-    COLOR_RANGE_MAX, COLOR_RANGE_MIN, HEATMAP_DEPTH, HeatmapLayer, HeatmapRect, HeatmapSettings,
-    paint_heatmap,
+    COLOR_RANGE_MAX, COLOR_RANGE_MIN, Colormap, HEATMAP_DEPTH, HeatmapLayer, HeatmapRect,
+    HeatmapSettings, paint_heatmap, paint_heatmap_profile,
 };
 pub use liq_heatmap::{LIQ_COLOR_RANGE_MAX, LIQ_COLOR_RANGE_MIN, LiqHeatmapLayer};
 pub(super) use main_chart::{MainChartColors, paint_main_chart};

@@ -317,11 +317,11 @@ fn build_drawing_form(symbol: SharedString, id: DrawingId, snap: &DrawingSnapsho
             move |cx| pred(cx)
         });
 
-        let width_field = Field::number(
+        let width_field = Field::slider(
             "Width",
             NumberOpts::int(WIDTH_PCT_MIN as i64, WIDTH_PCT_MAX as i64)
                 .with_step(5.0)
-                .format(|v| SharedString::from(format!("{}%", v.round() as i64))),
+                .suffix("%"),
             getter_f64(symbol.clone(), id, |p| p.width_pct as f64),
             setter_frvp(symbol.clone(), id, |p, v: f64| {
                 let nxt = v.round().clamp(WIDTH_PCT_MIN as f64, WIDTH_PCT_MAX as f64);
@@ -404,11 +404,11 @@ fn build_drawing_form(symbol: SharedString, id: DrawingId, snap: &DrawingSnapsho
             getter_bool(symbol.clone(), id, |p| p.show_va),
             setter_frvp(symbol.clone(), id, |p, v: bool| p.show_va = v),
         );
-        let va_pct_field = Field::number(
+        let va_pct_field = Field::slider(
             "VA %",
             NumberOpts::int(VA_PERCENT_MIN as i64, VA_PERCENT_MAX as i64)
                 .with_step(1.0)
-                .format(|v| SharedString::from(format!("{}%", v.round() as i64))),
+                .suffix("%"),
             getter_f64(symbol.clone(), id, |p| p.va_percent as f64),
             setter_frvp(symbol.clone(), id, |p, v: f64| {
                 let nxt = v

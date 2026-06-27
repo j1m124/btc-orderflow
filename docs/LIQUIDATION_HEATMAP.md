@@ -200,6 +200,37 @@ the candles, after the orderbook heatmap, through the **shared**
   clamped `MIN_BUCKET_TICKS`=1 .. `MAX_BUCKET_TICKS`=100000, default 50 ticks = $5) — the
   getter/setter convert ticks↔dollars so the sim/render stay in dollars. Coarser merges
   nearby magnets into fatter rows.
+- **Magnet "profile" toggle** (post-ship addition). A `show_profile` bool on
+  `LiqHeatmapParams` (default off, in the texture rebuild key) draws a right-anchored
+  horizontal histogram: estimated liq notional per price bucket across the built columns.
+  Aggregated inline in the layer's `build_full` (one cheap pass over the sparse per-column
+  bucket lists) into a `HeatmapProfile` carried on the shared `HeatmapRect` (the orderbook
+  heatmap leaves it `None`). Painted by `paint_heatmap_profile` **in front of** candles
+  (after `paint_main_chart`, before overlay indicators). Key choices:
+  - **Per-bucket value is the PEAK** any single column reached, not a sum — magnets persist
+    across columns, so a sum would scale a level by its on-screen dwell instead of its
+    strength. The peak also keeps each bar on the **same value scale as the heatmap cells**,
+    so the shared log colour ramp (`lo`/`log_lo`/`log_span`) colours bar `k` identically to
+    the hottest cell at that price (bar length + colour both come from that ramp).
+  - **Anchored at `canvas_w − y_axis_gap`** (the plot's right edge, price axis excluded —
+    matching VRVP's `chart_left + chart_w`), so it never overlaps the y-axis labels.
+  - **Width is user-settable**: `profile_width_pct` on `LiqHeatmapParams` (peak bar = this %
+    of plot width; `MIN/MAX_PROFILE_WIDTH_PCT` 2..50, default `DEFAULT_PROFILE_WIDTH_PCT`
+    16%). Paint-time only — **not** in the rebuild key (read via
+    `ChartState::liq_heatmap_profile_width_frac`, passed straight to the painter).
+  - Settings: a "Show profile" switch + a "Profile width" **slider** (`%`, `visible_if`
+    show_profile) in the settings view.
+- **Selectable colour map** (post-ship, shared with the orderbook heatmap). The single
+  fixed `ramp()` was replaced by a `Colormap` enum (`heatmap.rs`) with `sample(t)` — variants
+  Heat (default / legacy), Inferno, Magma, Plasma, Viridis, Turbo, Grayscale (5-stop
+  perceptual approximations; Turbo 6, grey 2). `colormap` is a field on the **shared**
+  `HeatmapSettings` (`#[serde(default)]` → old blobs get Heat), so it's in the texture
+  rebuild key and **both** heatmaps honour it (the OB heatmap defaults to `Heat`, but the
+  liq heatmap overrides its default to **`Plasma`** in `default_liq_settings()` — its dark
+  indigo base reads better for sparse predictive magnets); it threads through `colorize_range`
+  (texture), `HeatmapValues` (crisp-cell + text — text contrast now derives from the actual
+  ramp luminance) and `HeatmapProfile` (profile bars). Exposed as a "Colour map" dropdown in
+  *both* the OB and liq settings views.
 
 **Not yet validated against a populated DB** — verified by `cargo test -p client
 --target wasm32-unknown-unknown` (sim) + `./scripts/build-wasm.sh` + `make check-client`.

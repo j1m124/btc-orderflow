@@ -138,8 +138,7 @@ fn build_footprint_form(target: WeakEntity<ContentPanel>, kind: RenderKind) -> S
     // the value as-is — no second tick division.
     let bucket_field = Field::number(
         "Bucket",
-        NumberOpts::int(1, 100_000)
-            .format(|v| SharedString::from(format!("{} ticks", v.round() as i64))),
+        NumberOpts::int(1, 100_000).suffix("ticks"),
         getter_f64(target.clone(), |p| p.bucket / BTCUSDT_TICK_SIZE),
         setter(target.clone(), |p: &mut FootprintParams, v: f64| {
             let ticks = v.max(1.0).round();

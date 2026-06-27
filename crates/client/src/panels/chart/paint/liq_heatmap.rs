@@ -25,8 +25,8 @@ use gpui::{RenderImage, Window};
 use image::{Frame, RgbaImage};
 
 use super::heatmap::{
-    HeatmapRect, HeatmapSample, HeatmapSettings, HeatmapValues, build_values, colorize_range,
-    flush_one,
+    HeatmapProfile, HeatmapRect, HeatmapSample, HeatmapSettings, HeatmapValues, build_values,
+    colorize_range, flush_one,
 };
 use crate::indicators::liq_heatmap::sim::{self, LiqColumn, SimParams};
 use crate::services::market_data::{Candle, MarkPriceBar, OpenInterestBar};
@@ -76,7 +76,12 @@ struct LiqCache {
     /// Cheap hash of the sim inputs (candle / OI / mark tails + lengths) — a
     /// change forces a rebuild on the next throttle tick.
     fingerprint: u64,
+    /// Whether the right-anchored magnet profile was built into this cache —
+    /// part of the rebuild key (toggling it rebuilds).
+    show_profile: bool,
     values: Option<Arc<HeatmapValues>>,
+    /// Aggregated per-bucket profile, built only when `show_profile`.
+    profile: Option<Arc<HeatmapProfile>>,
 }
 
 /// Persistent scratch reused across rebuilds so a per-tick rebuild doesn't
@@ -99,6 +104,8 @@ struct LiqScratch {
 pub struct LiqHeatmapLayer {
     pub enabled: bool,
     pub settings: HeatmapSettings,
+    /// Mirror of the instance's `show_profile` param, synced each frame.
+    pub show_profile: bool,
     cache: Option<LiqCache>,
     last_build_ms: i64,
     scratch: LiqScratch,
@@ -109,6 +116,7 @@ impl Default for LiqHeatmapLayer {
         Self {
             enabled: false,
             settings: HeatmapSettings::default(),
+            show_profile: false,
             cache: None,
             last_build_ms: 0,
             scratch: LiqScratch::default(),
@@ -166,6 +174,7 @@ impl LiqHeatmapLayer {
                 && c.mmr_bits == mmr_bits
                 && c.lookback_ms == sim_params.lookback_ms
                 && c.bucket_bits == bucket_bits
+                && c.show_profile == self.show_profile
                 && c.fingerprint == fingerprint);
         if reuse {
             return;
@@ -185,7 +194,7 @@ impl LiqHeatmapLayer {
 
         let built = build_full(
             candles, oi, mark, sim_params, lo_ms, hi_ms, y_lo, y_hi, cols, tf_ms, phase,
-            &self.settings, fingerprint, &mut self.scratch,
+            &self.settings, self.show_profile, fingerprint, &mut self.scratch,
         );
 
         self.last_build_ms = now_ms;
@@ -216,6 +225,7 @@ impl LiqHeatmapLayer {
             price_lo: c.price_lo,
             price_hi: c.price_hi,
             values: c.values.clone(),
+            profile: c.profile.clone(),
         })
     }
 }
@@ -268,6 +278,7 @@ fn build_full(
     tf_ms: i64,
     phase: i64,
     settings: &HeatmapSettings,
+    show_profile: bool,
     fingerprint: u64,
     scratch: &mut LiqScratch,
 ) -> Option<LiqCache> {
@@ -376,6 +387,7 @@ fn build_full(
         log_lo,
         log_span,
         settings.max_opacity,
+        settings.colormap,
         0,
         cols,
         buf,
@@ -383,6 +395,37 @@ fn build_full(
     if !any {
         return None;
     }
+
+    // Profile: peak magnitude per price bucket across every built column
+    // (band-relative via `base`). Peak — not sum — because magnets persist
+    // across columns (a sum would scale a level by its on-screen dwell, not its
+    // strength) and the peak keeps each bar on the heatmap cells' value scale so
+    // the shared log ramp colours them identically. Cheap: one pass over the
+    // sparse per-column bucket lists, built inline when the toggle is on.
+    let profile = if show_profile {
+        let mut peaks = vec![0.0f32; n_buckets];
+        for col in &columns {
+            for &(k_abs, v) in &col.buckets {
+                let k = k_abs - base;
+                if k >= 0 && (k as usize) < n_buckets && v > peaks[k as usize] {
+                    peaks[k as usize] = v;
+                }
+            }
+        }
+        Some(Arc::new(HeatmapProfile {
+            bucket: b,
+            price_lo: pl,
+            n_buckets,
+            peaks,
+            lo,
+            log_lo,
+            log_span,
+            max_opacity: settings.max_opacity,
+            colormap: settings.colormap,
+        }))
+    } else {
+        None
+    };
 
     let rgba = RgbaImage::from_raw(cols as u32, rows as u32, buf.clone())?;
     let image = Arc::new(RenderImage::new(vec![Frame::new(rgba)]));
@@ -402,7 +445,9 @@ fn build_full(
         lookback_ms: sim_params.lookback_ms,
         bucket_bits: sim_params.bucket.to_bits(),
         fingerprint,
+        show_profile,
         values,
+        profile,
     })
 }
 

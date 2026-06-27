@@ -210,6 +210,14 @@ impl SettingsForm {
                 window,
                 cx,
             ),
+            FieldKind::Slider { opts, get, set } => widgets::render_slider(
+                row_key.clone(),
+                opts.clone(),
+                get.clone(),
+                set.clone(),
+                window,
+                cx,
+            ),
             FieldKind::Switch { get, set } => {
                 widgets::render_switch(row_key.clone(), get.clone(), set.clone(), cx)
             }

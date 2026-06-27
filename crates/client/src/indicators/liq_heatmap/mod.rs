@@ -28,7 +28,7 @@ use super::instance::InstanceId;
 use super::kind::{ComputeCtx, CustomSettingsBuilder, IndicatorKind, PaneKind};
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::panels::ContentPanel;
-use crate::panels::chart::{HeatmapSettings, LiqHeatmapSettingsView};
+use crate::panels::chart::{Colormap, HeatmapSettings, LiqHeatmapSettingsView};
 use crate::services::market_data::Candle;
 
 /// Default maintenance-margin rate (0.4%). Flat across tiers in v1; tiered
@@ -66,6 +66,9 @@ fn default_liq_settings() -> HeatmapSettings {
     HeatmapSettings {
         color_lo: DEFAULT_LIQ_COLOR_LO,
         color_peak: DEFAULT_LIQ_COLOR_PEAK,
+        // Plasma reads better than the OB heatmap's Heat default for sparse
+        // predictive magnets (dark indigo base, bright magnet peaks).
+        colormap: Colormap::Plasma,
         ..HeatmapSettings::default()
     }
 }
@@ -83,6 +86,16 @@ pub struct LiqHeatmapParams {
     /// Price-bucket width ("tick size") in dollars.
     #[serde(default = "default_bucket")]
     pub bucket: f64,
+    /// Draw the right-anchored per-price magnet **profile** (a horizontal
+    /// histogram of peak estimated liq notional per bucket across the visible
+    /// range, painted in front of candles). Off by default — it's an extra
+    /// summary layer over the heatmap, not part of its core look.
+    #[serde(default = "default_show_profile")]
+    pub show_profile: bool,
+    /// Width of the profile's longest (peak) bar, as a percent of the chart's
+    /// plot width. Paint-time only — not part of the texture rebuild key.
+    #[serde(default = "default_profile_width_pct")]
+    pub profile_width_pct: f32,
     #[serde(default = "default_liq_settings")]
     pub settings: HeatmapSettings,
 }
@@ -96,6 +109,18 @@ fn default_lookback_ms() -> i64 {
 fn default_bucket() -> f64 {
     DEFAULT_BUCKET
 }
+fn default_show_profile() -> bool {
+    false
+}
+fn default_profile_width_pct() -> f32 {
+    DEFAULT_PROFILE_WIDTH_PCT
+}
+
+/// Default profile bar width (% of plot width). Mirrors the old fixed 16%.
+pub const DEFAULT_PROFILE_WIDTH_PCT: f32 = 16.0;
+/// Min / max profile width the user may set (% of plot width).
+pub const MIN_PROFILE_WIDTH_PCT: f64 = 2.0;
+pub const MAX_PROFILE_WIDTH_PCT: f64 = 50.0;
 
 impl Default for LiqHeatmapParams {
     fn default() -> Self {
@@ -103,6 +128,8 @@ impl Default for LiqHeatmapParams {
             mmr: DEFAULT_MMR,
             lookback_ms: DEFAULT_LOOKBACK_MS,
             bucket: DEFAULT_BUCKET,
+            show_profile: default_show_profile(),
+            profile_width_pct: DEFAULT_PROFILE_WIDTH_PCT,
             settings: default_liq_settings(),
         }
     }

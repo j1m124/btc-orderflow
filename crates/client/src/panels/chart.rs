@@ -35,7 +35,7 @@ pub use footprint_settings::{ChartRenderSettingsView, OpenChartRenderSettings};
 pub use heatmap_settings::HeatmapSettingsView;
 pub use liq_heatmap_settings::LiqHeatmapSettingsView;
 pub use paint::{
-    COLOR_RANGE_MAX, COLOR_RANGE_MIN, HEATMAP_DEPTH, HeatmapSettings, LIQ_COLOR_RANGE_MAX,
+    COLOR_RANGE_MAX, COLOR_RANGE_MIN, Colormap, HEATMAP_DEPTH, HeatmapSettings, LIQ_COLOR_RANGE_MAX,
     LIQ_COLOR_RANGE_MIN,
 };
 pub use state::ChartState;

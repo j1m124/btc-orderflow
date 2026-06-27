@@ -17,10 +17,12 @@ use gpui::{
 use gpui_component::slider::{Slider, SliderEvent, SliderScale, SliderState};
 use gpui_component::{ActiveTheme as _, v_flex};
 
-use super::paint::{COLOR_RANGE_MAX, COLOR_RANGE_MIN};
+use super::paint::{COLOR_RANGE_MAX, COLOR_RANGE_MIN, Colormap};
 use crate::indicators::{InstanceId, OrderbookHeatmapParams};
 use crate::panels::ContentPanel;
-use crate::settings_form::{Field, IndicatorTarget, NumberOpts, SettingsForm, SettingsGroup};
+use crate::settings_form::{
+    DropdownOption, Field, IndicatorTarget, NumberOpts, SettingsForm, SettingsGroup,
+};
 
 pub struct HeatmapSettingsView {
     /// Routes reads/writes to the heatmap instance's params, going through
@@ -152,9 +154,9 @@ fn fmt_amt(v: f32) -> String {
 }
 
 fn build_heatmap_form(tgt: &IndicatorTarget<OrderbookHeatmapParams>) -> SettingsForm {
-    let opacity_field = Field::number(
+    let opacity_field = Field::slider(
         "Max opacity",
-        NumberOpts::int(5, 100).format(|v| SharedString::from(format!("{}%", v.round() as i64))),
+        NumberOpts::int(5, 100).suffix("%"),
         tgt.getter(85.0, |p: &OrderbookHeatmapParams| {
             (p.settings.max_opacity as f64 * 100.0).round()
         }),
@@ -163,6 +165,22 @@ fn build_heatmap_form(tgt: &IndicatorTarget<OrderbookHeatmapParams>) -> Settings
         }),
     )
     .description("Opacity of the hottest cell — lower keeps candles readable.");
+
+    let colormap_field = Field::dropdown(
+        "Colour map",
+        Colormap::ALL
+            .iter()
+            .map(|c| DropdownOption::new(c.as_str(), c.label()))
+            .collect(),
+        tgt.getter(
+            SharedString::from(Colormap::default().as_str()),
+            |p: &OrderbookHeatmapParams| SharedString::from(p.settings.colormap.as_str()),
+        ),
+        tgt.setter(|p: &mut OrderbookHeatmapParams, v: SharedString| {
+            p.settings.colormap = Colormap::from_token(v.as_ref());
+        }),
+    )
+    .description("Colour gradient for the heat ramp.");
 
     let show_text_field = Field::switch(
         "Show cell values",
@@ -185,6 +203,7 @@ fn build_heatmap_form(tgt: &IndicatorTarget<OrderbookHeatmapParams>) -> Settings
     SettingsForm::new(SharedString::from("heatmap")).group(
         SettingsGroup::new("General")
             .item(opacity_field)
+            .item(colormap_field)
             .item(show_text_field)
             .item(extend_right_field),
     )

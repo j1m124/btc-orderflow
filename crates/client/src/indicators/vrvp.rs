@@ -201,10 +201,10 @@ impl IndicatorKind for VrvpParams {
         )
         .visible_if(is_pure_delta_mode);
 
-        let width_field = Field::number(
+        let width_field = Field::slider(
             "Width",
             NumberOpts::int(WIDTH_PCT_MIN as i64, WIDTH_PCT_MAX as i64).with_step(5.0)
-                .format(|v| SharedString::from(format!("{}%", v.round() as i64))),
+                .suffix("%"),
             target.getter(30.0, |p: &VrvpParams| p.params.width_pct as f64),
             target.setter(|p: &mut VrvpParams, v: f64| {
                 let cur = v.round().clamp(WIDTH_PCT_MIN as f64, WIDTH_PCT_MAX as f64);
@@ -250,10 +250,10 @@ impl IndicatorKind for VrvpParams {
             target.getter(true, |p: &VrvpParams| p.params.show_va),
             target.setter(|p: &mut VrvpParams, v: bool| p.params.show_va = v),
         );
-        let va_pct_field = Field::number(
+        let va_pct_field = Field::slider(
             "VA %",
             NumberOpts::int(VA_PERCENT_MIN as i64, VA_PERCENT_MAX as i64).with_step(1.0)
-                .format(|v| SharedString::from(format!("{}%", v.round() as i64))),
+                .suffix("%"),
             target.getter(70.0, |p: &VrvpParams| p.params.va_percent as f64),
             target.setter(|p: &mut VrvpParams, v: f64| {
                 let cur = v.round().clamp(VA_PERCENT_MIN as f64, VA_PERCENT_MAX as f64);
