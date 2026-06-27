@@ -33,9 +33,20 @@ use crate::services::market_data::{Candle, MarkPriceBar, OpenInterestBar};
 /// via [`SimParams::bucket`].
 pub const DEFAULT_PRICE_BUCKET: f64 = 5.0;
 
-/// Leverage tiers modeled (Model 1). Equal weight in v1 — each tier-side gets
-/// `1 / LEVERAGE_TIERS.len()` of the side's notional.
-pub const LEVERAGE_TIERS: [f64; 4] = [10.0, 25.0, 50.0, 100.0];
+/// Leverage levels the heatmap can model, low → high. The user toggles a
+/// subset (carried as a parallel `[bool; N_LEVERAGE]` on [`SimParams`]); the
+/// sim spreads each side's notional equally across the **active** levels — each
+/// active level-side gets `1 / active_count` of the side's notional.
+pub const AVAILABLE_LEVERAGE: [f64; 6] = [5.0, 10.0, 25.0, 50.0, 75.0, 100.0];
+
+/// Number of toggleable leverage levels — the width of the selection array.
+pub const N_LEVERAGE: usize = AVAILABLE_LEVERAGE.len();
+
+/// Default active selection: 50×, 75×, 100× (indices 3, 4, 5 of
+/// [`AVAILABLE_LEVERAGE`]). Keep in sync with the array above if its order
+/// changes.
+pub const DEFAULT_LEVERAGE_SELECTED: [bool; N_LEVERAGE] =
+    [false, false, false, true, true, true];
 
 /// Tunable sim inputs carried on the indicator's params.
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +62,10 @@ pub struct SimParams {
     /// buckets merge nearby magnets into fewer, fatter rows; finer buckets keep
     /// them distinct. The render layer must use the same value.
     pub bucket: f64,
+    /// Active leverage selection, parallel to [`AVAILABLE_LEVERAGE`]. The sim
+    /// places notional only at the toggled-on levels; an all-`false` selection
+    /// places nothing.
+    pub tiers: [bool; N_LEVERAGE],
 }
 
 impl SimParams {
@@ -62,6 +77,17 @@ impl SimParams {
         } else {
             DEFAULT_PRICE_BUCKET
         }
+    }
+
+    /// The active leverage levels (toggles resolved against the pool), low →
+    /// high. Empty when the user has deselected everything (the sim then places
+    /// nothing).
+    pub fn active_tiers(&self) -> Vec<f64> {
+        AVAILABLE_LEVERAGE
+            .iter()
+            .zip(self.tiers.iter())
+            .filter_map(|(l, on)| on.then_some(*l))
+            .collect()
     }
 }
 
@@ -146,7 +172,8 @@ pub fn simulate(
     let sim_start_ms = emit_start_ms.saturating_sub(params.lookback_ms.max(0));
     let start = candles.partition_point(|c| c.open_time < sim_start_ms);
 
-    let n_tiers = LEVERAGE_TIERS.len() as f64;
+    let active_tiers = params.active_tiers();
+    let n_tiers = active_tiers.len() as f64;
     // Emission band as an exclusive bucket-index range.
     let band_buckets = band.map(|(lo, hi)| (bucket_of(lo, bucket), bucket_of(hi, bucket) + 1));
 
@@ -174,7 +201,7 @@ pub fn simulate(
         let oi_prev = if i > 0 { oi_close[i - 1] } else { None };
         if let (Some(oi_now), Some(oi_prev)) = (oi_now, oi_prev) {
             let d_oi = oi_now - oi_prev;
-            if d_oi > 0.0 && c.volume > 0.0 {
+            if d_oi > 0.0 && c.volume > 0.0 && !active_tiers.is_empty() {
                 let delta = c.taker_buy_vol.map_or(0.0, |tb| 2.0 * tb - c.volume);
                 let long_frac = 0.5 + 0.5 * (delta / c.volume).clamp(-1.0, 1.0);
                 let long_n = d_oi * long_frac;
@@ -190,7 +217,7 @@ pub fn simulate(
                 let entry = c.vwap.or(mark_close[i]).unwrap_or(c.close);
                 let long_per = long_n / n_tiers;
                 let short_per = short_n / n_tiers;
-                for l in LEVERAGE_TIERS {
+                for &l in &active_tiers {
                     // Longs liquidate below entry, shorts above; MMR widens the
                     // band toward entry (a position is closed before price
                     // reaches the raw 1/L distance). Only insert a side that
@@ -276,8 +303,17 @@ mod tests {
         }
     }
 
+    /// Test leverage selection: the legacy 10/25/50/100× set (indices 1–4 of
+    /// `AVAILABLE_LEVERAGE`) so the four-band assertions below stay meaningful.
+    const TEST_TIERS: [bool; N_LEVERAGE] = [false, true, true, true, true, false];
+
     fn params() -> SimParams {
-        SimParams { mmr: 0.004, lookback_ms: 24 * 60 * 60 * 1000, bucket: 5.0 }
+        SimParams {
+            mmr: 0.004,
+            lookback_ms: 24 * 60 * 60 * 1000,
+            bucket: 5.0,
+            tiers: TEST_TIERS,
+        }
     }
 
     /// Total notional across all buckets in a column.
@@ -435,8 +471,8 @@ mod tests {
         let ois = vec![oi(0, 1_000.0), oi(TF, 1_100.0)];
         let marks = vec![mark(0, entry), mark(TF, entry)];
 
-        let fine = SimParams { mmr: 0.004, lookback_ms: 24 * 60 * 60 * 1000, bucket: 1.0 };
-        let coarse = SimParams { mmr: 0.004, lookback_ms: 24 * 60 * 60 * 1000, bucket: 1_000.0 };
+        let fine = SimParams { mmr: 0.004, lookback_ms: 24 * 60 * 60 * 1000, bucket: 1.0, tiers: TEST_TIERS };
+        let coarse = SimParams { mmr: 0.004, lookback_ms: 24 * 60 * 60 * 1000, bucket: 1_000.0, tiers: TEST_TIERS };
         let out_fine = simulate(&candles, &ois, &marks, fine, 0, None);
         let out_coarse = simulate(&candles, &ois, &marks, coarse, 0, None);
         let cf = out_fine.last().unwrap();
@@ -451,6 +487,49 @@ mod tests {
         assert_eq!(k as f64 * 1_000.0, 9_000.0);
         // Total notional is conserved across the regrid.
         assert!((col_total(cf) - col_total(cc)).abs() < 1e-3);
+    }
+
+    #[wasm_bindgen_test]
+    fn leverage_selection_controls_bands() {
+        // Long-heavy placement at a $1 bucket. Selecting only 5× yields exactly
+        // one band, at ~entry·(1 − 1/5 + mmr); an empty selection places nothing.
+        let entry = 10_000.0;
+        let candles = vec![
+            candle(0, entry, entry, entry, entry, 100.0, 100.0),
+            candle(TF, entry, entry, entry, entry, 100.0, 100.0),
+        ];
+        let ois = vec![oi(0, 1_000.0), oi(TF, 1_100.0)];
+        let marks = vec![mark(0, entry), mark(TF, entry)];
+
+        // Only 5× (index 0) active.
+        let only_5x = SimParams {
+            mmr: 0.004,
+            lookback_ms: 24 * 60 * 60 * 1000,
+            bucket: 1.0,
+            tiers: [true, false, false, false, false, false],
+        };
+        let out = simulate(&candles, &ois, &marks, only_5x, 0, None);
+        let last = out.last().unwrap();
+        assert_eq!(last.buckets.len(), 1, "a single selected tier → one band");
+        let (k, _) = last.buckets[0];
+        assert_eq!(
+            k,
+            bucket_of(entry * (1.0 - 1.0 / 5.0 + 0.004), 1.0),
+            "the 5× long band sits at ~8040"
+        );
+
+        // Nothing selected → nothing placed (a column is still emitted).
+        let none = SimParams {
+            mmr: 0.004,
+            lookback_ms: 24 * 60 * 60 * 1000,
+            bucket: 1.0,
+            tiers: [false; N_LEVERAGE],
+        };
+        let out = simulate(&candles, &ois, &marks, none, 0, None);
+        assert!(
+            out.last().unwrap().buckets.is_empty(),
+            "an empty leverage selection places nothing"
+        );
     }
 
     #[wasm_bindgen_test]

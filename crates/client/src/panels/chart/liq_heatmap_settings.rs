@@ -19,6 +19,7 @@ use gpui_component::slider::{Slider, SliderEvent, SliderScale, SliderState};
 use gpui_component::{ActiveTheme as _, v_flex};
 
 use super::paint::{Colormap, LIQ_COLOR_RANGE_MAX, LIQ_COLOR_RANGE_MIN};
+use crate::indicators::liq_heatmap::sim::{AVAILABLE_LEVERAGE, DEFAULT_LEVERAGE_SELECTED};
 use crate::indicators::liq_heatmap::{
     DEFAULT_BUCKET, DEFAULT_PROFILE_WIDTH_PCT, MAX_BUCKET_TICKS, MAX_PROFILE_WIDTH_PCT,
     MIN_BUCKET_TICKS, MIN_PROFILE_WIDTH_PCT, TICK_SIZE,
@@ -26,7 +27,7 @@ use crate::indicators::liq_heatmap::{
 use crate::indicators::{InstanceId, LiqHeatmapParams};
 use crate::panels::ContentPanel;
 use crate::settings_form::{
-    DropdownOption, Field, IndicatorTarget, NumberOpts, SettingsForm, SettingsGroup,
+    DropdownOption, Field, IndicatorTarget, MultiCheckItem, NumberOpts, SettingsForm, SettingsGroup,
 };
 
 pub struct LiqHeatmapSettingsView {
@@ -225,6 +226,31 @@ fn build_liq_form(tgt: &IndicatorTarget<LiqHeatmapParams>) -> SettingsForm {
     )
     .description("Warm-up window — how far back positions are tracked before the visible range.");
 
+    // One checkbox per modeled leverage level (`5×…100×`). Each side's notional
+    // is spread equally across the checked levels; the bands sit closer to the
+    // entry as leverage rises.
+    let leverage_field = Field::multi_checkbox(
+        "Leverage",
+        AVAILABLE_LEVERAGE
+            .iter()
+            .enumerate()
+            .map(|(ix, lev)| {
+                MultiCheckItem::new(
+                    SharedString::from(format!("{}×", *lev as i64)),
+                    tgt.getter(DEFAULT_LEVERAGE_SELECTED[ix], move |p: &LiqHeatmapParams| {
+                        p.leverage.get(ix).copied().unwrap_or(false)
+                    }),
+                    tgt.setter(move |p: &mut LiqHeatmapParams, v: bool| {
+                        if let Some(slot) = p.leverage.get_mut(ix) {
+                            *slot = v;
+                        }
+                    }),
+                )
+            })
+            .collect(),
+    )
+    .description("Leverage levels used to estimate liquidation prices. Each side's notional is split equally across the checked levels.");
+
     let show_text_field = Field::switch(
         "Show cell values",
         tgt.getter(true, |p: &LiqHeatmapParams| p.settings.show_text),
@@ -273,6 +299,7 @@ fn build_liq_form(tgt: &IndicatorTarget<LiqHeatmapParams>) -> SettingsForm {
             .item(colormap_field)
             .item(mmr_field)
             .item(lookback_field)
+            .item(leverage_field)
             .item(show_text_field)
             .item(show_profile_field)
             .item(profile_width_field)

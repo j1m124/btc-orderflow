@@ -73,6 +73,9 @@ struct LiqCache {
     /// Price-bucket width ("tick size") this texture was built at — part of the
     /// rebuild key (changing it re-buckets everything).
     bucket_bits: u64,
+    /// Active leverage selection this texture was built with — part of the
+    /// rebuild key (toggling a level re-places magnets).
+    tiers: [bool; sim::N_LEVERAGE],
     /// Cheap hash of the sim inputs (candle / OI / mark tails + lengths) — a
     /// change forces a rebuild on the next throttle tick.
     fingerprint: u64,
@@ -174,6 +177,7 @@ impl LiqHeatmapLayer {
                 && c.mmr_bits == mmr_bits
                 && c.lookback_ms == sim_params.lookback_ms
                 && c.bucket_bits == bucket_bits
+                && c.tiers == sim_params.tiers
                 && c.show_profile == self.show_profile
                 && c.fingerprint == fingerprint);
         if reuse {
@@ -444,6 +448,7 @@ fn build_full(
         mmr_bits: sim_params.mmr.to_bits(),
         lookback_ms: sim_params.lookback_ms,
         bucket_bits: sim_params.bucket.to_bits(),
+        tiers: sim_params.tiers,
         fingerprint,
         show_profile,
         values,

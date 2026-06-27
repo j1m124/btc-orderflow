@@ -86,6 +86,11 @@ pub struct LiqHeatmapParams {
     /// Price-bucket width ("tick size") in dollars.
     #[serde(default = "default_bucket")]
     pub bucket: f64,
+    /// Active leverage selection, parallel to [`sim::AVAILABLE_LEVERAGE`]
+    /// (`[5, 10, 25, 50, 75, 100]×`). The sim spreads each side's notional
+    /// equally across the toggled-on levels. Default: 50×/75×/100×.
+    #[serde(default = "default_leverage")]
+    pub leverage: [bool; sim::N_LEVERAGE],
     /// Draw the right-anchored per-price magnet **profile** (a horizontal
     /// histogram of peak estimated liq notional per bucket across the visible
     /// range, painted in front of candles). Off by default — it's an extra
@@ -109,6 +114,9 @@ fn default_lookback_ms() -> i64 {
 fn default_bucket() -> f64 {
     DEFAULT_BUCKET
 }
+fn default_leverage() -> [bool; sim::N_LEVERAGE] {
+    sim::DEFAULT_LEVERAGE_SELECTED
+}
 fn default_show_profile() -> bool {
     false
 }
@@ -128,6 +136,7 @@ impl Default for LiqHeatmapParams {
             mmr: DEFAULT_MMR,
             lookback_ms: DEFAULT_LOOKBACK_MS,
             bucket: DEFAULT_BUCKET,
+            leverage: sim::DEFAULT_LEVERAGE_SELECTED,
             show_profile: default_show_profile(),
             profile_width_pct: DEFAULT_PROFILE_WIDTH_PCT,
             settings: default_liq_settings(),
@@ -142,6 +151,7 @@ impl LiqHeatmapParams {
             mmr: self.mmr,
             lookback_ms: self.lookback_ms,
             bucket: self.bucket,
+            tiers: self.leverage,
         }
     }
 }
