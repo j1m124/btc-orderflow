@@ -604,6 +604,16 @@ pub struct ContentPanel {
     /// time-series, not bars). Holding it also keeps the service's 1s book
     /// sampler running for this symbol.
     chart_heatmap_sub: Option<(SharedString, crate::services::market_data::SubscriptionHandle)>,
+    /// Symbol the chart currently has the service's 1s book *sampler* enabled on
+    /// (`None` = sampler off). Tracked separately from `chart_heatmap_sub`
+    /// because the live snapshot (the `ensure_book` handle) and the history
+    /// sampler have independent consumers: the heatmap + OB-imbalance replay the
+    /// `book_history` time-series and need the sampler, but the orderbook
+    /// *profile* reads only the live snapshot — sampling for a profile-only
+    /// chart would grow `book_history` unbounded (eviction is gated on the
+    /// heatmap painting). So the sub stays up for any consumer while the sampler
+    /// is refcounted only for the history consumers.
+    chart_book_sampling: Option<SharedString>,
     watchlist_sub_handles: HashMap<SharedString, crate::services::market_data::SubscriptionHandle>,
     pub(crate) trades_symbol: Option<SharedString>,
     pub(crate) trades_min_usd: Option<Option<f64>>,
@@ -1499,6 +1509,7 @@ impl ContentPanel {
             chart_oi_bars_sub: None,
             chart_mark_price_sub: None,
             chart_heatmap_sub: None,
+            chart_book_sampling: None,
             watchlist_sub_handles: watchlist_handles,
             trades_symbol,
             trades_min_usd,
@@ -2250,21 +2261,33 @@ impl ContentPanel {
     }
 
     /// Reconcile the shared chart book subscription + 1s sampler against the
-    /// chart's book consumers — the heatmap overlay AND the OB-imbalance
-    /// indicators (which read the same book time-series). Single-slot allocate /
-    /// drop keyed on symbol (depth is the fixed `chart::HEATMAP_DEPTH`, deep
-    /// enough for every OB depth preset). Holding the sub also keeps the service
-    /// sampling the live book into the time-series both consumers replay.
-    /// Idempotent — same want ⇒ no churn. Clears the imbalance cache when no OB
-    /// consumer remains so stale rows don't linger.
+    /// chart's book consumers. Two refcounted resources on the same
+    /// `chart::HEATMAP_DEPTH` key, with *different* consumer sets:
+    /// - **Live snapshot** (`ensure_book` handle): any consumer — the heatmap
+    ///   overlay, the OB-imbalance indicators, OR the orderbook *profile*.
+    /// - **1s history sampler** (`enable_book_sampling` → `book_history`): only
+    ///   the history consumers (heatmap + OB-imbalance, which replay the time-
+    ///   series). The profile reads only the live snapshot, so it does NOT turn
+    ///   on the sampler — doing so would grow `book_history` unbounded, since
+    ///   eviction is gated on the heatmap painting.
+    ///
+    /// Single-slot allocate / drop keyed on symbol (depth is fixed — deep enough
+    /// for every OB depth preset). Idempotent — same want ⇒ no churn. Clears the
+    /// imbalance cache when no OB consumer remains so stale rows don't linger.
     pub(crate) fn refresh_chart_book_sub(&mut self, cx: &mut Context<Self>) {
-        // A heatmap *instance* (even hidden — hiding is paint-only) keeps the sub
-        // up, so a re-show and the OB-imbalance consumer both keep their data.
+        // Any book consumer (even a hidden instance — hiding is paint-only) keeps
+        // the live sub up, so a re-show / OB-imbalance / the profile all retain
+        // their data.
         let want = self.chart_state.as_ref().and_then(|s| {
+            (s.has_heatmap_indicator() || s.wants_book_imbalance() || s.has_profile_indicator())
+                .then(|| s.symbol().clone())
+        });
+        // The sampler is only for the history consumers (heatmap / OB-imbalance).
+        let want_sampling = self.chart_state.as_ref().and_then(|s| {
             (s.has_heatmap_indicator() || s.wants_book_imbalance()).then(|| s.symbol().clone())
         });
         // Drop the imbalance cache the moment no OB consumer wants it, even if
-        // the book sub stays up for the heatmap.
+        // the book sub stays up for the heatmap / profile.
         let wants_imb = self
             .chart_state
             .as_ref()
@@ -2279,29 +2302,38 @@ impl ContentPanel {
             }
             self.chart_book_imbalance_last_refresh_ms = None;
         }
-        let cur = self.chart_heatmap_sub.as_ref().map(|(s, _)| s.clone());
-        if want == cur {
-            return;
-        }
         let market = cx
             .global::<crate::services::market_data::MarketDataServiceHandle>()
             .0
             .clone();
-        // Drop the old sub + stop its sampler before allocating, so the service
-        // refcount settles to zero and the `Unsubscribe` fires.
-        if let Some((old_symbol, _handle)) = self.chart_heatmap_sub.take() {
-            market.update(cx, |svc, _| {
-                svc.disable_book_sampling(old_symbol.as_ref(), chart::HEATMAP_DEPTH)
-            });
+        // Reconcile the live snapshot sub (independent of the sampler below).
+        let cur = self.chart_heatmap_sub.as_ref().map(|(s, _)| s.clone());
+        if want != cur {
+            // Dropping the held handle releases the old `ensure_book` refcount.
+            self.chart_heatmap_sub = None;
+            self.heatmap_history_last_request_ms = None;
+            if let Some(symbol) = want {
+                let handle = market
+                    .clone()
+                    .update(cx, |svc, cx| svc.ensure_book(symbol.as_ref(), chart::HEATMAP_DEPTH, cx));
+                self.chart_heatmap_sub = Some((symbol, handle));
+            }
         }
-        self.heatmap_history_last_request_ms = None;
-        if let Some(symbol) = want {
-            let handle = market.clone().update(cx, |svc, cx| {
-                let h = svc.ensure_book(symbol.as_ref(), chart::HEATMAP_DEPTH, cx);
-                svc.enable_book_sampling(symbol.as_ref(), chart::HEATMAP_DEPTH);
-                h
-            });
-            self.chart_heatmap_sub = Some((symbol, handle));
+        // Reconcile the 1s sampler refcount independently — it can flip without a
+        // symbol change (e.g. the heatmap is removed but the profile stays, or
+        // an OB-imbalance row is unchecked).
+        if self.chart_book_sampling != want_sampling {
+            if let Some(old) = self.chart_book_sampling.take() {
+                market.update(cx, |svc, _| {
+                    svc.disable_book_sampling(old.as_ref(), chart::HEATMAP_DEPTH)
+                });
+            }
+            if let Some(symbol) = want_sampling {
+                market.update(cx, |svc, _| {
+                    svc.enable_book_sampling(symbol.as_ref(), chart::HEATMAP_DEPTH)
+                });
+                self.chart_book_sampling = Some(symbol);
+            }
         }
     }
 

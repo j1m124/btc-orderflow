@@ -28,6 +28,7 @@ mod footprint_render;
 mod heatmap;
 mod liq_heatmap;
 mod main_chart;
+mod ob_profile;
 mod overlay_indicators;
 mod sub_panes;
 
@@ -38,6 +39,7 @@ pub use heatmap::{
 };
 pub use liq_heatmap::{LIQ_COLOR_RANGE_MAX, LIQ_COLOR_RANGE_MIN, LiqHeatmapLayer};
 pub(super) use main_chart::{MainChartColors, paint_main_chart};
+pub(super) use ob_profile::{ObProfilePaintParams, paint_ob_profile};
 pub(super) use overlay_indicators::{OverlayPaintItem, paint_overlay_indicators};
 pub(super) use sub_panes::{PanePaintItem, paint_sub_pane};
 

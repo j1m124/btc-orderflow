@@ -38,9 +38,9 @@ use super::footprint::{FootprintParams, RenderKind};
 use super::drawings_view;
 use super::footprint_settings::OpenChartRenderSettings;
 use super::paint::{
-    DrawingColors, HeatmapRect, MainChartColors, OverlayPaintItem, PanePaintItem, paint_heatmap,
-    paint_heatmap_profile, paint_main_chart, paint_overlay_indicators, paint_sub_pane,
-    render_drawings_overlay,
+    DrawingColors, HeatmapRect, MainChartColors, ObProfilePaintParams, OverlayPaintItem,
+    PanePaintItem, paint_heatmap, paint_heatmap_profile, paint_main_chart, paint_ob_profile,
+    paint_overlay_indicators, paint_sub_pane, render_drawings_overlay,
 };
 use super::state::{
     CHART_MAX_VIEW, CHART_MIN_VIEW, CanvasDrag, ChartState, SCROLL_ZOOM_RATE, SplitterDrag,
@@ -787,6 +787,12 @@ pub fn render(
     let paint_liq_heatmap_rect: Option<HeatmapRect> = state.liq_heatmap_paint_rect();
     // Profile bar width (fraction of plot width) for the liq-heatmap profile.
     let paint_liq_profile_width_frac: f32 = state.liq_heatmap_profile_width_frac();
+    // Orderbook-profile params (live book → right-anchored horizontal bars).
+    // `None` when no `ob_profile` instance is present or it's hidden. The book
+    // itself is read fresh from the service inside the paint closure (it has
+    // `cx`), so only this cheap snapshot is captured.
+    let paint_ob_profile_params: Option<ObProfilePaintParams> =
+        state.ob_profile_paint_params(theme_chart_bullish, theme_chart_bearish);
     // Pre-filter overlay indicators for the paint closure: skip hidden /
     // pane-placed instances, snapshot color + output so the closure stays
     // 'static. Per-render clone — `Series` is a `Vec<Option<f64>>`, so the
@@ -2473,6 +2479,24 @@ pub fn render(
                                         y_hi,
                                         f32::from(bounds.size.height),
                                         window,
+                                    );
+                                }
+                                // Orderbook profile paints in front of candles (a
+                                // right-edge price summary, like the liq profile)
+                                // but under overlay indicators + drawings. Reads
+                                // the live book fresh from `cx` each frame.
+                                if let Some(params) = &paint_ob_profile_params {
+                                    paint_ob_profile(
+                                        params,
+                                        bounds.origin,
+                                        f32::from(bounds.size.width),
+                                        f32::from(bounds.size.height),
+                                        paint_y_axis_gap,
+                                        y_lo,
+                                        y_hi,
+                                        paint_volume_unit,
+                                        window,
+                                        cx,
                                     );
                                 }
                                 // Overlay indicators paint after candles + grid but

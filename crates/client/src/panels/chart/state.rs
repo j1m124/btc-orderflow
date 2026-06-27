@@ -1534,6 +1534,48 @@ impl ChartState {
         self.heatmap.paint_rect()
     }
 
+    // --- Orderbook profile ---------------------------------------------------
+    //
+    // The orderbook profile is a singleton overlay *indicator* (`ob_profile`)
+    // façade like `ob_heatmap`, but with no render layer / texture: its paint
+    // pass reads the live book snapshot fresh each frame and bins it onto the
+    // visible price band. The instance's `OrderbookProfileParams` is the single
+    // source of truth; `ob_profile_paint_params` snapshots it for the closure.
+
+    /// Whether an orderbook-profile instance exists at all (even if hidden).
+    /// Drives the shared book-subscription gate — the live snapshot it reads
+    /// needs the sub up, and the sub stays while hidden (hiding is paint-only).
+    pub fn has_profile_indicator(&self) -> bool {
+        self.indicators.iter().any(|i| i.kind_id == "ob_profile")
+    }
+
+    /// Captured params for the orderbook-profile paint pass, or `None` when no
+    /// instance is attached or it's hidden. Snapshotted into the chart's paint
+    /// closure; the live book itself is read fresh from the service inside it.
+    /// `theme_bid` / `theme_ask` are the theme's bullish/bearish chart colours,
+    /// used when the instance leaves a bar colour unset (follow-theme default).
+    pub(super) fn ob_profile_paint_params(
+        &self,
+        theme_bid: gpui::Hsla,
+        theme_ask: gpui::Hsla,
+    ) -> Option<super::paint::ObProfilePaintParams> {
+        let inst = self
+            .indicators
+            .iter()
+            .find(|i| i.kind_id == "ob_profile" && !i.hidden)?;
+        let p = inst
+            .kind
+            .as_any()
+            .downcast_ref::<crate::indicators::OrderbookProfileParams>()?;
+        Some(super::paint::ObProfilePaintParams {
+            symbol: self.symbol().clone(),
+            bucket_w: p.bucket_dollars(),
+            width_frac: p.width_frac(),
+            color_bid: p.bid_color(theme_bid),
+            color_ask: p.ask_color(theme_ask),
+        })
+    }
+
     // --- Liquidation heatmap -------------------------------------------------
     //
     // The predictive liquidation heatmap is a singleton overlay *indicator*

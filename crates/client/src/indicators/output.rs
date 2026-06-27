@@ -151,6 +151,15 @@ pub enum IndicatorOutput {
     /// so the instance carries an output like every other kind; the overlay/pane
     /// paint passes skip it, `len()` is 0, and `value_at`/`y_range` are empty.
     Heatmap,
+
+    /// No-op marker for the orderbook-**profile** overlay. Like [`Self::Heatmap`]
+    /// it's a façade: the real render (`paint_ob_profile`) reads the live book
+    /// snapshot fresh each frame and draws right-anchored horizontal bars on the
+    /// price axis, fed from the instance's params — not through this pipeline.
+    /// `compute` returns this so the instance carries an output like every other
+    /// kind; the overlay/pane paint passes skip it and the per-bar helpers are
+    /// no-ops.
+    ObProfile,
 }
 
 impl IndicatorOutput {
@@ -168,8 +177,9 @@ impl IndicatorOutput {
             IndicatorOutput::VolumeProfile { .. } => 0,
             IndicatorOutput::LiquidationBars { long_qty, .. } => long_qty.len(),
             IndicatorOutput::OpenInterest { close, .. } => close.len(),
-            // Façade marker — no per-bar series.
+            // Façade markers — no per-bar series.
             IndicatorOutput::Heatmap => 0,
+            IndicatorOutput::ObProfile => 0,
         }
     }
 

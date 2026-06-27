@@ -19,6 +19,7 @@ pub mod math;
 pub mod net_ls;
 pub mod ob_heatmap;
 pub mod ob_imbalance;
+pub mod ob_profile;
 pub mod open_interest;
 pub mod output;
 pub mod trades;
@@ -34,6 +35,7 @@ pub use liq_heatmap::LiqHeatmapParams;
 pub use net_ls::NetLsParams;
 pub use ob_heatmap::OrderbookHeatmapParams;
 pub use ob_imbalance::ObImbalanceParams;
+pub use ob_profile::OrderbookProfileParams;
 pub use open_interest::{OiRenderMode, OpenInterestParams};
 pub use instance::{
     COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, bump_next_id_past, default_pane_height,
@@ -156,6 +158,13 @@ pub fn kind_entries() -> Vec<KindEntry> {
             spawn: || Box::new(ObImbalanceParams::default()),
         },
         KindEntry {
+            kind_id: "ob_profile",
+            name: "Orderbook Profile".into(),
+            description: "Live resting order book as right-anchored horizontal bars on the price axis (bid/ask in theme colours); each side scaled to its largest visible level. Singleton.".into(),
+            category: Category::Volume,
+            spawn: || Box::new(OrderbookProfileParams::default()),
+        },
+        KindEntry {
             kind_id: "ob_heatmap",
             name: "Orderbook Heatmap".into(),
             description: "Resting order-book liquidity as a colour heatmap behind the candles; brighter = larger resting size. Singleton.".into(),
@@ -177,7 +186,7 @@ pub fn kind_entries() -> Vec<KindEntry> {
 /// refuses a duplicate. The heatmap is singleton because there is one order book
 /// / one texture cache per chart — a second instance would be redundant work.
 pub fn is_singleton_kind(kind_id: &str) -> bool {
-    matches!(kind_id, "ob_heatmap" | "liq_heatmap")
+    matches!(kind_id, "ob_heatmap" | "liq_heatmap" | "ob_profile")
 }
 
 /// Rebuild a boxed `dyn IndicatorKind` from a `kind_id` + serialized params.
@@ -217,6 +226,9 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "ob_imbalance" => serde_json::from_value::<ObImbalanceParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "ob_profile" => serde_json::from_value::<OrderbookProfileParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "ob_heatmap" => serde_json::from_value::<OrderbookHeatmapParams>(params.clone())

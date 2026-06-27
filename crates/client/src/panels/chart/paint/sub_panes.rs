@@ -538,13 +538,14 @@ pub fn paint_sub_pane(
         | IndicatorOutput::Lines(_)
         | IndicatorOutput::BarStat { .. }
         | IndicatorOutput::VolumeProfile { .. }
-        | IndicatorOutput::Heatmap => {
+        | IndicatorOutput::Heatmap
+        | IndicatorOutput::ObProfile => {
             // Bands (BB) and Lines (MA Suite) are overlay-only by kind
             // contract; no-op here for safety. BarStat is handled up
             // front (before the grid pass) since it owns its own layout.
             // VolumeProfile is overlay-only (VRVP is `OverlayOnly`); never
-            // routes to a sub-pane. Heatmap (`OverlayOnly`) renders behind the
-            // candles via `paint_heatmap`, never through a sub-pane.
+            // routes to a sub-pane. Heatmap + ObProfile (`OverlayOnly`) render
+            // in the main pane via their own paint passes, never a sub-pane.
         }
     }
 
