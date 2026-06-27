@@ -65,6 +65,7 @@ pub enum IndicatorOutput {
         show_long_liq: bool,
         show_short_liq: bool,
         show_oi_delta: bool,
+        show_net_ls: bool,
         volume: Series,
         delta: Series,
         long_liq: Series,
@@ -72,11 +73,23 @@ pub enum IndicatorOutput {
         /// Per-bar open-interest change (close − open within the bar), in the
         /// chart's active unit. `None` for bars with no OI sample.
         oi_delta: Series,
+        /// Per-bar net long/short flow (`sign(delta) × |ΔOI|`), in the chart's
+        /// active unit; signed (bull/bear tinted). `None` for bars with no OI
+        /// sample or no taker delta.
+        net_ls: Series,
+        /// Per-bar OB-imbalance ratios, one series per enabled depth preset
+        /// (`ob_depths` carries the matching `OB_DEPTHS_PCT` indices). Values
+        /// are in [−1, +1]; tinted bull/bear by sign and graded like the other
+        /// rows. `daily_max_ob` carries the matching Daily-grade maxima.
+        ob_depths: Vec<usize>,
+        ob_imbalance: Vec<Series>,
+        daily_max_ob: Vec<Series>,
         daily_max_vol: Series,
         daily_max_delta: Series,
         daily_max_long_liq: Series,
         daily_max_short_liq: Series,
         daily_max_oi_delta: Series,
+        daily_max_net_ls: Series,
     },
 
     /// Visible-range volume profile: aggregated bid/ask per price bucket

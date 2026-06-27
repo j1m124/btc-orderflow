@@ -229,6 +229,11 @@ pub struct ChartState {
     /// mark_price_bars` on every `MarkPriceEvent` for the active tf. Empty when
     /// no consumer (OI indicator, bar_stat OI-Δ row, funding indicator) is live.
     pub(super) mark_price_cache: Vec<crate::services::market_data::MarkPriceBar>,
+    /// Pre-reduced per-snapshot order-book imbalance samples (ascending `ts_ms`)
+    /// for this chart's symbol. Refilled by ContentPanel from the shared book
+    /// time-series on a ~1s throttle. Empty when no consumer (the `ob_imbalance`
+    /// indicator or a bar_stat with OB rows) is live.
+    pub(super) book_imbalance_cache: Vec<crate::indicators::ob_imbalance::BookImbalanceSample>,
     /// View-time-range snapshot captured at the last
     /// [`Self::recompute_indicators`] call. Drives the cheap dirty-check in
     /// [`Self::maybe_recompute_view_dependent_indicators`] — pan/zoom that
@@ -489,6 +494,7 @@ impl ChartState {
         liquidation_bars: Option<&'a [crate::services::market_data::LiquidationBar]>,
         open_interest: Option<&'a [crate::services::market_data::OpenInterestBar]>,
         mark_price: Option<&'a [crate::services::market_data::MarkPriceBar]>,
+        book_imbalance: Option<&'a [crate::indicators::ob_imbalance::BookImbalanceSample]>,
     ) -> ComputeCtx<'a> {
         ComputeCtx {
             volume_unit,
@@ -499,6 +505,7 @@ impl ChartState {
             liquidation_bars,
             open_interest,
             mark_price,
+            book_imbalance,
         }
     }
 
@@ -619,6 +626,44 @@ impl ChartState {
     /// `ContentPanel::maybe_request_mark_price_history`.
     pub fn oldest_mark_price_time(&self) -> Option<i64> {
         self.mark_price_cache.first().map(|b| b.open_time)
+    }
+
+    /// Replace the per-snapshot book-imbalance cache wholesale (ascending
+    /// `ts_ms`). Called by ContentPanel on the ~1s book-reduce throttle.
+    pub fn set_book_imbalance_cache(
+        &mut self,
+        samples: Vec<crate::indicators::ob_imbalance::BookImbalanceSample>,
+    ) {
+        self.book_imbalance_cache = samples;
+    }
+
+    pub fn clear_book_imbalance_cache(&mut self) {
+        self.book_imbalance_cache.clear();
+    }
+
+    /// Whether the book-imbalance cache currently holds samples. Lets
+    /// ContentPanel avoid a needless clear + recompute when it's already empty.
+    pub fn has_book_imbalance_cache(&self) -> bool {
+        !self.book_imbalance_cache.is_empty()
+    }
+
+    /// Whether any live indicator consumes order-book imbalance — the
+    /// `ob_imbalance` indicator, or a bar_stat with at least one OB depth row.
+    /// Gates the shared book subscription + the per-snapshot reduce.
+    pub fn wants_book_imbalance(&self) -> bool {
+        self.indicators.iter().any(|i| {
+            if i.kind_id == "ob_imbalance" {
+                return true;
+            }
+            if let Some(bs) = i
+                .kind
+                .as_any()
+                .downcast_ref::<crate::indicators::BarStatParams>()
+            {
+                return !bs.sorted_ob_depths().is_empty();
+            }
+            false
+        })
     }
 
     /// Read-only slice into the per-bucket footprint cache. `None` when no
@@ -851,6 +896,9 @@ impl ChartState {
         let mark_bars: Option<&[crate::services::market_data::MarkPriceBar]> =
             (!self.mark_price_cache.is_empty())
                 .then(|| self.mark_price_cache.as_slice());
+        let book_imb: Option<&[crate::indicators::ob_imbalance::BookImbalanceSample]> =
+            (!self.book_imbalance_cache.is_empty())
+                .then(|| self.book_imbalance_cache.as_slice());
         let ctx = Self::make_compute_ctx(
             self.volume_unit,
             &self.footprint_cache,
@@ -858,6 +906,7 @@ impl ChartState {
             liq_bars,
             oi_bars,
             mark_bars,
+            book_imb,
         );
         let output = instance.kind.compute(&self.candles, ctx);
         self.indicators.push(instance);
@@ -911,6 +960,9 @@ impl ChartState {
         let mark_bars: Option<&[crate::services::market_data::MarkPriceBar]> =
             (!self.mark_price_cache.is_empty())
                 .then(|| self.mark_price_cache.as_slice());
+        let book_imb: Option<&[crate::indicators::ob_imbalance::BookImbalanceSample]> =
+            (!self.book_imbalance_cache.is_empty())
+                .then(|| self.book_imbalance_cache.as_slice());
         let ctx = Self::make_compute_ctx(
             self.volume_unit,
             &self.footprint_cache,
@@ -918,6 +970,7 @@ impl ChartState {
             liq_bars,
             oi_bars,
             mark_bars,
+            book_imb,
         );
         let new_output = self.indicators[idx].kind.compute(&self.candles, ctx);
         self.indicator_outputs[idx] = new_output;
@@ -942,6 +995,9 @@ impl ChartState {
         let mark_bars: Option<&[crate::services::market_data::MarkPriceBar]> =
             (!self.mark_price_cache.is_empty())
                 .then(|| self.mark_price_cache.as_slice());
+        let book_imb: Option<&[crate::indicators::ob_imbalance::BookImbalanceSample]> =
+            (!self.book_imbalance_cache.is_empty())
+                .then(|| self.book_imbalance_cache.as_slice());
         let ctx = Self::make_compute_ctx(
             self.volume_unit,
             &self.footprint_cache,
@@ -949,6 +1005,7 @@ impl ChartState {
             liq_bars,
             oi_bars,
             mark_bars,
+            book_imb,
         );
         let inst = &mut self.indicators[idx];
         inst.kind_id = kind.kind_id();
@@ -1119,6 +1176,9 @@ impl ChartState {
         let mark_bars: Option<&[crate::services::market_data::MarkPriceBar]> =
             (!self.mark_price_cache.is_empty())
                 .then(|| self.mark_price_cache.as_slice());
+        let book_imb: Option<&[crate::indicators::ob_imbalance::BookImbalanceSample]> =
+            (!self.book_imbalance_cache.is_empty())
+                .then(|| self.book_imbalance_cache.as_slice());
         let ctx = Self::make_compute_ctx(
             self.volume_unit,
             &self.footprint_cache,
@@ -1126,6 +1186,7 @@ impl ChartState {
             liq_bars,
             oi_bars,
             mark_bars,
+            book_imb,
         );
         for (i, inst) in self.indicators.iter().enumerate() {
             self.indicator_outputs[i] = inst.kind.compute(&self.candles, ctx);
@@ -1228,6 +1289,7 @@ impl ChartState {
             liquidation_bars_cache: Vec::new(),
             open_interest_cache: Vec::new(),
             mark_price_cache: Vec::new(),
+            book_imbalance_cache: Vec::new(),
             last_recomputed_view_range: None,
             volume_unit: VolumeUnit::default(),
             heatmap: super::paint::HeatmapLayer::default(),

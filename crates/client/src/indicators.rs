@@ -15,6 +15,8 @@ pub mod instance;
 pub mod kind;
 pub mod liq_bars;
 pub mod math;
+pub mod net_ls;
+pub mod ob_imbalance;
 pub mod open_interest;
 pub mod output;
 pub mod trades;
@@ -26,6 +28,8 @@ pub use bar_stat::{BarStatGrade, BarStatParams};
 pub use bb::BbParams;
 pub use funding::{FundingParams, FundingRenderMode};
 pub use liq_bars::{LiqBarsScale, LiquidationBarsParams};
+pub use net_ls::NetLsParams;
+pub use ob_imbalance::ObImbalanceParams;
 pub use open_interest::{OiRenderMode, OpenInterestParams};
 pub use instance::{
     COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, bump_next_id_past, default_pane_height,
@@ -131,6 +135,20 @@ pub fn kind_entries() -> Vec<KindEntry> {
             category: Category::Volume,
             spawn: || Box::new(FundingParams::default()),
         },
+        KindEntry {
+            kind_id: "net_ls",
+            name: "Net L/S".into(),
+            description: "Net long/short flow from taker delta + OI change (signed histogram); long buildup / short covering up, short buildup / long exit down".into(),
+            category: Category::Volume,
+            spawn: || Box::new(NetLsParams::default()),
+        },
+        KindEntry {
+            kind_id: "ob_imbalance",
+            name: "OB Imbalance".into(),
+            description: "Order-book bid/ask imbalance within a depth band (signed histogram in [-1,+1]); bid-heavy up, ask-heavy down".into(),
+            category: Category::Volume,
+            spawn: || Box::new(ObImbalanceParams::default()),
+        },
     ]
 }
 
@@ -165,6 +183,12 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "funding" => serde_json::from_value::<FundingParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "net_ls" => serde_json::from_value::<NetLsParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "ob_imbalance" => serde_json::from_value::<ObImbalanceParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy

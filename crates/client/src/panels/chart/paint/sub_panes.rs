@@ -111,30 +111,38 @@ pub fn paint_sub_pane(
         show_long_liq,
         show_short_liq,
         show_oi_delta,
+        show_net_ls,
         volume,
         delta,
         long_liq,
         short_liq,
         oi_delta,
+        net_ls,
+        ob_depths,
+        ob_imbalance,
+        daily_max_ob,
         daily_max_vol,
         daily_max_delta,
         daily_max_long_liq,
         daily_max_short_liq,
         daily_max_oi_delta,
+        daily_max_net_ls,
     } = &item.output
     {
         let slot_w = (chart_w / view_size.max(1.0)).max(0.5);
         paint_bar_stat_pane(
-            start_idx,
-            visible_end,
-            view_start,
-            view_size,
-            canvas_w,
-            y_axis_gap,
-            chart_w,
-            chart_top,
-            chart_bottom,
-            slot_w,
+            BarStatGeom {
+                start_idx,
+                visible_end,
+                view_start,
+                view_size,
+                canvas_w,
+                y_axis_gap,
+                chart_w,
+                chart_top,
+                chart_bottom,
+                slot_w,
+            },
             *grade,
             BarStatShow {
                 volume: *show_volume,
@@ -142,17 +150,25 @@ pub fn paint_sub_pane(
                 long_liq: *show_long_liq,
                 short_liq: *show_short_liq,
                 oi_delta: *show_oi_delta,
+                net_ls: *show_net_ls,
             },
-            volume,
-            delta,
-            long_liq,
-            short_liq,
-            oi_delta,
-            daily_max_vol,
-            daily_max_delta,
-            daily_max_long_liq,
-            daily_max_short_liq,
-            daily_max_oi_delta,
+            BarStatSeries {
+                volume,
+                delta,
+                long_liq,
+                short_liq,
+                oi_delta,
+                net_ls,
+                ob_depths,
+                ob_imbalance,
+                daily_max_ob,
+                daily_max_vol,
+                daily_max_delta,
+                daily_max_long_liq,
+                daily_max_short_liq,
+                daily_max_oi_delta,
+                daily_max_net_ls,
+            },
             bullish,
             bearish,
             cell_text_color,
@@ -651,28 +667,13 @@ struct BarStatShow {
     long_liq: bool,
     short_liq: bool,
     oi_delta: bool,
+    net_ls: bool,
 }
 
-/// One row of the BarStat pane. `signed` = use bull/bear tint by data
-/// sign (delta only); otherwise the row uses its fixed `base` color.
-/// `daily_max` carries the per-bar rolling-24h maxima for the Daily grade.
-/// `header` is a short row tag painted in the right-edge gutter so the
-/// user can identify which row is which without remembering the order.
-struct BarStatRow<'a> {
-    values: &'a [Option<f64>],
-    daily_max: Option<&'a [Option<f64>]>,
-    base: Hsla,
-    signed: bool,
-    formatter: fn(f64) -> String,
-    header: &'static str,
-}
-
-/// Paint the BarStat pane: one cell per visible bar, dynamic number of
-/// stacked rows (count = `show.visible_row_count()`), optional heatmap
-/// fill keyed by `grade`. Cell width follows the candle gap policy so
-/// cells line up with their candles on the main pane.
-#[allow(clippy::too_many_arguments)]
-fn paint_bar_stat_pane(
+/// Pane geometry handed to [`paint_bar_stat_pane`] — the screen-space layout
+/// shared by every row. Bundled so the function signature stays sane.
+#[derive(Clone, Copy)]
+struct BarStatGeom {
     start_idx: usize,
     visible_end: usize,
     view_start: f32,
@@ -683,18 +684,52 @@ fn paint_bar_stat_pane(
     chart_top: f32,
     chart_bottom: f32,
     slot_w: f32,
+}
+
+/// The per-bar series + their Daily-grade maxima, plus the variable-length
+/// OB-imbalance rows (`ob_depths` carries the matching `OB_DEPTHS_PCT` indices,
+/// parallel to `ob_imbalance`).
+struct BarStatSeries<'a> {
+    volume: &'a [Option<f64>],
+    delta: &'a [Option<f64>],
+    long_liq: &'a [Option<f64>],
+    short_liq: &'a [Option<f64>],
+    oi_delta: &'a [Option<f64>],
+    net_ls: &'a [Option<f64>],
+    ob_depths: &'a [usize],
+    ob_imbalance: &'a [Vec<Option<f64>>],
+    daily_max_ob: &'a [Vec<Option<f64>>],
+    daily_max_vol: &'a [Option<f64>],
+    daily_max_delta: &'a [Option<f64>],
+    daily_max_long_liq: &'a [Option<f64>],
+    daily_max_short_liq: &'a [Option<f64>],
+    daily_max_oi_delta: &'a [Option<f64>],
+    daily_max_net_ls: &'a [Option<f64>],
+}
+
+/// One row of the BarStat pane. `signed` = use bull/bear tint by data
+/// sign (delta, net L/S, OB imbalance); otherwise the row uses its fixed
+/// `base` color. `daily_max` carries the per-bar rolling-24h maxima for the
+/// Daily grade. `header` is a short row tag painted in the right-edge gutter.
+struct BarStatRow<'a> {
+    values: &'a [Option<f64>],
+    daily_max: Option<&'a [Option<f64>]>,
+    base: Hsla,
+    signed: bool,
+    formatter: fn(f64) -> String,
+    header: gpui::SharedString,
+}
+
+/// Paint the BarStat pane: one cell per visible bar, dynamic number of
+/// stacked rows (count = `show.visible_row_count()`), optional heatmap
+/// fill keyed by `grade`. Cell width follows the candle gap policy so
+/// cells line up with their candles on the main pane.
+#[allow(clippy::too_many_arguments)]
+fn paint_bar_stat_pane(
+    geom: BarStatGeom,
     grade: crate::indicators::BarStatGrade,
     show: BarStatShow,
-    volume: &[Option<f64>],
-    delta: &[Option<f64>],
-    long_liq: &[Option<f64>],
-    short_liq: &[Option<f64>],
-    oi_delta: &[Option<f64>],
-    daily_max_vol: &[Option<f64>],
-    daily_max_delta: &[Option<f64>],
-    daily_max_long_liq: &[Option<f64>],
-    daily_max_short_liq: &[Option<f64>],
-    daily_max_oi_delta: &[Option<f64>],
+    series: BarStatSeries<'_>,
     bullish: Hsla,
     bearish: Hsla,
     text_color: Hsla,
@@ -703,6 +738,19 @@ fn paint_bar_stat_pane(
     cx: &mut App,
 ) {
     use crate::indicators::BarStatGrade;
+
+    let BarStatGeom {
+        start_idx,
+        visible_end,
+        view_start,
+        view_size,
+        canvas_w,
+        y_axis_gap,
+        chart_w,
+        chart_top,
+        chart_bottom,
+        slot_w,
+    } = geom;
 
     // Fixed blue base for the volume + OI-Δ rows — keeps them visually
     // distinct from the bull/bear-tinted delta cell so the eye can read each
@@ -713,25 +761,25 @@ fn paint_bar_stat_pane(
 
     // Assemble the row list in fixed display order, skipping any row
     // whose show-flag is off.
-    let mut rows: Vec<BarStatRow<'_>> = Vec::with_capacity(5);
+    let mut rows: Vec<BarStatRow<'_>> = Vec::with_capacity(6 + series.ob_depths.len());
     if show.volume {
         rows.push(BarStatRow {
-            values: volume,
-            daily_max: Some(daily_max_vol),
+            values: series.volume,
+            daily_max: Some(series.daily_max_vol),
             base: volume_base,
             signed: false,
             formatter: format_compact,
-            header: "VOL",
+            header: "VOL".into(),
         });
     }
     if show.delta {
         rows.push(BarStatRow {
-            values: delta,
-            daily_max: Some(daily_max_delta),
+            values: series.delta,
+            daily_max: Some(series.daily_max_delta),
             base: bullish, // overridden per cell when `signed`
             signed: true,
             formatter: format_signed_compact,
-            header: "Δ",
+            header: "Δ".into(),
         });
     }
     if show.oi_delta {
@@ -739,32 +787,64 @@ fn paint_bar_stat_pane(
         // own metric, with the rise/fall direction carried by the signed
         // text value rather than the cell color.
         rows.push(BarStatRow {
-            values: oi_delta,
-            daily_max: Some(daily_max_oi_delta),
+            values: series.oi_delta,
+            daily_max: Some(series.daily_max_oi_delta),
             base: volume_base,
             signed: false,
             formatter: format_signed_compact,
-            header: "OI Δ",
+            header: "OI Δ".into(),
+        });
+    }
+    if show.net_ls {
+        // Net positioning flow: bull/bear by sign like the delta row.
+        rows.push(BarStatRow {
+            values: series.net_ls,
+            daily_max: Some(series.daily_max_net_ls),
+            base: bullish,
+            signed: true,
+            formatter: format_signed_compact,
+            header: "L/S".into(),
+        });
+    }
+    // OB-imbalance rows: one per enabled depth preset. Signed (bid-heavy green /
+    // ask-heavy red), graded like every other row via the active grade mode.
+    for (k, &depth_idx) in series.ob_depths.iter().enumerate() {
+        let Some(values) = series.ob_imbalance.get(k) else {
+            continue;
+        };
+        let label = crate::indicators::ob_imbalance::ob_depth_label(
+            crate::indicators::ob_imbalance::OB_DEPTHS_PCT
+                .get(depth_idx)
+                .copied()
+                .unwrap_or(0.0),
+        );
+        rows.push(BarStatRow {
+            values: values.as_slice(),
+            daily_max: series.daily_max_ob.get(k).map(|s| s.as_slice()),
+            base: bullish,
+            signed: true,
+            formatter: format_ratio,
+            header: gpui::SharedString::from(format!("OBI {label}")),
         });
     }
     if show.long_liq {
         rows.push(BarStatRow {
-            values: long_liq,
-            daily_max: Some(daily_max_long_liq),
+            values: series.long_liq,
+            daily_max: Some(series.daily_max_long_liq),
             base: bearish,
             signed: false,
             formatter: format_compact,
-            header: "L LIQ",
+            header: "L LIQ".into(),
         });
     }
     if show.short_liq {
         rows.push(BarStatRow {
-            values: short_liq,
-            daily_max: Some(daily_max_short_liq),
+            values: series.short_liq,
+            daily_max: Some(series.daily_max_short_liq),
             base: bullish,
             signed: false,
             formatter: format_compact,
-            header: "S LIQ",
+            header: "S LIQ".into(),
         });
     }
 
@@ -930,7 +1010,7 @@ fn paint_bar_stat_pane(
                 y_top,
                 row_h,
                 header_color,
-                row.header,
+                row.header.as_ref(),
             );
         }
     }
@@ -1026,6 +1106,12 @@ fn format_compact(v: f64) -> String {
 fn format_signed_compact(v: f64) -> String {
     let body = format_compact(v.abs());
     if v < 0.0 { format!("-{body}") } else { body }
+}
+
+/// 2-decimal ratio formatter for the OB-imbalance rows (value ∈ [-1, +1]).
+/// Negatives keep their `-`; positives are bare (`0.42` / `-0.30`).
+fn format_ratio(v: f64) -> String {
+    format!("{v:.2}")
 }
 
 /// Y-axis label formatter for sub-panes. Volume gets K/M/B shorthand so

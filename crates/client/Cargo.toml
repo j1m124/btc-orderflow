@@ -4,7 +4,7 @@ name = "client"
 # bottom bar is the only human-facing version surface). Bump this to cut a
 # client release: the bottom bar reads CARGO_PKG_VERSION, and `client.yml`
 # stamps the image `:<version>` + a `client-v<version>` git tag from this field.
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 publish.workspace = true
 

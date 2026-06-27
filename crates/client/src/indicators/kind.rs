@@ -61,6 +61,12 @@ pub struct ComputeCtx<'a> {
     /// close as the USD conversion factor (falling back to the candle close);
     /// the funding indicator reads `funding_rate`.
     pub mark_price: Option<&'a [MarkPriceBar]>,
+    /// Pre-reduced per-snapshot order-book imbalance samples (ascending `ts_ms`)
+    /// for the chart's symbol. `None` when no consumer (the `ob_imbalance`
+    /// indicator or a bar_stat with OB rows) is live — ContentPanel skips
+    /// reducing the book then. The deep book is reduced once in `panels.rs`; the
+    /// OB indicators index per depth via `book_imbalance_series`.
+    pub book_imbalance: Option<&'a [super::ob_imbalance::BookImbalanceSample]>,
 }
 
 impl<'a> Default for ComputeCtx<'a> {
@@ -72,6 +78,7 @@ impl<'a> Default for ComputeCtx<'a> {
             liquidation_bars: None,
             open_interest: None,
             mark_price: None,
+            book_imbalance: None,
         }
     }
 }

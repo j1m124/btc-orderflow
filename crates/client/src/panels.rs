@@ -602,6 +602,10 @@ pub struct ContentPanel {
     /// seconds of slack costs negligible memory) keeps the length — and so the
     /// rebuild gate — stable between batches.
     heatmap_last_evict_ms: Option<i64>,
+    /// Throttle for reducing the deep book time-series into the chart's compact
+    /// per-snapshot OB-imbalance cache (~1s, matching the live book sampler).
+    /// `None` when no OB consumer is live.
+    chart_book_imbalance_last_refresh_ms: Option<i64>,
     /// `(symbol, tf, handle)` for the chart's open-interest subscription.
     /// Allocated lazily when an `open_interest` indicator (or a bar_stat with
     /// the OI-Δ row enabled) is on the chart; dropped when the last consumer
@@ -990,10 +994,14 @@ impl ContentPanel {
                  _window,
                  cx| {
                     use crate::services::market_data::BookEvent::*;
+                    // Repaint for either book consumer: the heatmap overlay or
+                    // the OB-imbalance rows/pane (both lazily refresh in
+                    // `render`). Idle otherwise, so a chart with neither pays
+                    // nothing.
                     let Some(chart_symbol) = this
                         .chart_state
                         .as_ref()
-                        .filter(|s| s.heatmap_enabled())
+                        .filter(|s| s.heatmap_enabled() || s.wants_book_imbalance())
                         .map(|s| s.symbol().clone())
                     else {
                         return;
@@ -1516,6 +1524,7 @@ impl ContentPanel {
             mark_price_history_last_request_ms: None,
             heatmap_history_last_request_ms: None,
             heatmap_last_evict_ms: None,
+            chart_book_imbalance_last_refresh_ms: None,
             chart_footprint_key: None,
             chart_liq_bars_sub: None,
             chart_oi_bars_sub: None,
@@ -1559,7 +1568,7 @@ impl ContentPanel {
             new_self.refresh_chart_mark_price_sub(cx);
             // Open the book sub + sampler if the restored chart had the heatmap
             // overlay on. No-op when it was off.
-            new_self.refresh_chart_heatmap_sub(cx);
+            new_self.refresh_chart_book_sub(cx);
         }
         new_self
     }
@@ -1825,6 +1834,7 @@ impl ContentPanel {
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
             self.refresh_chart_mark_price_sub(cx);
+            self.refresh_chart_book_sub(cx);
         cx.notify();
         request_layout_save(cx);
     }
@@ -1844,7 +1854,7 @@ impl ContentPanel {
             self.refresh_chart_mark_price_sub(cx);
             // Heatmap is symbol-keyed: re-point the book sub + sampler at the
             // new symbol (no-op when the overlay is off).
-            self.refresh_chart_heatmap_sub(cx);
+            self.refresh_chart_book_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -2166,7 +2176,7 @@ impl ContentPanel {
     pub(crate) fn refresh_chart_oi_bars_sub(&mut self, cx: &mut Context<Self>) {
         let want = self.chart_state.as_ref().and_then(|state| {
             let any_live = state.indicators().iter().any(|i| {
-                if i.kind_id == "open_interest" {
+                if i.kind_id == "open_interest" || i.kind_id == "net_ls" {
                     return true;
                 }
                 if let Some(bs) = i
@@ -2174,7 +2184,7 @@ impl ContentPanel {
                     .as_any()
                     .downcast_ref::<crate::indicators::BarStatParams>()
                 {
-                    return bs.show_oi_delta;
+                    return bs.show_oi_delta || bs.show_net_ls;
                 }
                 false
             });
@@ -2220,7 +2230,7 @@ impl ContentPanel {
     pub(crate) fn refresh_chart_mark_price_sub(&mut self, cx: &mut Context<Self>) {
         let want = self.chart_state.as_ref().and_then(|state| {
             let any_live = state.indicators().iter().any(|i| {
-                if i.kind_id == "open_interest" || i.kind_id == "funding" {
+                if i.kind_id == "open_interest" || i.kind_id == "funding" || i.kind_id == "net_ls" {
                     return true;
                 }
                 if let Some(bs) = i
@@ -2228,7 +2238,7 @@ impl ContentPanel {
                     .as_any()
                     .downcast_ref::<crate::indicators::BarStatParams>()
                 {
-                    return bs.show_oi_delta;
+                    return bs.show_oi_delta || bs.show_net_ls;
                 }
                 false
             });
@@ -2265,16 +2275,34 @@ impl ContentPanel {
         }
     }
 
-    /// Reconcile the heatmap's book subscription + 1s sampler against the
-    /// chart's `heatmap_enabled` flag and symbol. Single-slot allocate / drop
-    /// keyed on symbol (depth is the fixed `chart::HEATMAP_DEPTH`). Holding the
-    /// sub also keeps the service sampling the live book into the time-series
-    /// the heatmap replays. Idempotent — same want ⇒ no churn.
-    pub(crate) fn refresh_chart_heatmap_sub(&mut self, cx: &mut Context<Self>) {
-        let want = self
+    /// Reconcile the shared chart book subscription + 1s sampler against the
+    /// chart's book consumers — the heatmap overlay AND the OB-imbalance
+    /// indicators (which read the same book time-series). Single-slot allocate /
+    /// drop keyed on symbol (depth is the fixed `chart::HEATMAP_DEPTH`, deep
+    /// enough for every OB depth preset). Holding the sub also keeps the service
+    /// sampling the live book into the time-series both consumers replay.
+    /// Idempotent — same want ⇒ no churn. Clears the imbalance cache when no OB
+    /// consumer remains so stale rows don't linger.
+    pub(crate) fn refresh_chart_book_sub(&mut self, cx: &mut Context<Self>) {
+        let want = self.chart_state.as_ref().and_then(|s| {
+            (s.heatmap_enabled() || s.wants_book_imbalance()).then(|| s.symbol().clone())
+        });
+        // Drop the imbalance cache the moment no OB consumer wants it, even if
+        // the book sub stays up for the heatmap.
+        let wants_imb = self
             .chart_state
             .as_ref()
-            .and_then(|s| s.heatmap_enabled().then(|| s.symbol().clone()));
+            .map(|s| s.wants_book_imbalance())
+            .unwrap_or(false);
+        if !wants_imb {
+            if let Some(state) = self.chart_state.as_mut() {
+                if state.has_book_imbalance_cache() {
+                    state.clear_book_imbalance_cache();
+                    state.recompute_indicators();
+                }
+            }
+            self.chart_book_imbalance_last_refresh_ms = None;
+        }
         let cur = self.chart_heatmap_sub.as_ref().map(|(s, _)| s.clone());
         if want == cur {
             return;
@@ -2310,7 +2338,7 @@ impl ContentPanel {
         };
         let now_on = !state.heatmap_enabled();
         state.set_heatmap_enabled(now_on, window);
-        self.refresh_chart_heatmap_sub(cx);
+        self.refresh_chart_book_sub(cx);
         cx.notify();
         request_layout_save(cx);
     }
@@ -2320,11 +2348,9 @@ impl ContentPanel {
     /// service-side in-flight guard as a second line of defence. No-op when the
     /// overlay is off or coverage already reaches the left edge.
     fn maybe_request_heatmap_history(&mut self, cx: &mut Context<Self>) {
-        let Some(symbol) = self
-            .chart_state
-            .as_ref()
-            .and_then(|s| s.heatmap_enabled().then(|| s.symbol().clone()))
-        else {
+        let Some(symbol) = self.chart_state.as_ref().and_then(|s| {
+            (s.heatmap_enabled() || s.wants_book_imbalance()).then(|| s.symbol().clone())
+        }) else {
             return;
         };
         let Some(view_lo) = self
@@ -2402,6 +2428,74 @@ impl ContentPanel {
         let series = svc.book_series(symbol.as_ref(), chart::HEATMAP_DEPTH);
         if let Some(chart) = self.chart_state.as_mut() {
             chart.refresh_heatmap(series, now_ms, window);
+        }
+    }
+
+    /// Reduce the shared book time-series into the chart's compact per-snapshot
+    /// OB-imbalance cache (~1s throttle, matching the live book sampler) and
+    /// recompute indicators so the OB rows / pane pick it up. No-op unless an OB
+    /// consumer is live. When the heatmap overlay is off this also drives the
+    /// book-history eviction the texture path would otherwise own (reusing the
+    /// same throttle slot, which is idle in that case).
+    fn maybe_refresh_book_imbalance(&mut self, cx: &mut Context<Self>) {
+        let Some(symbol) = self
+            .chart_state
+            .as_ref()
+            .and_then(|s| s.wants_book_imbalance().then(|| s.symbol().clone()))
+        else {
+            return;
+        };
+        const REFRESH_MS: i64 = 1000;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(last) = self.chart_book_imbalance_last_refresh_ms {
+            if now_ms - last < REFRESH_MS {
+                return;
+            }
+        }
+        self.chart_book_imbalance_last_refresh_ms = Some(now_ms);
+
+        let heatmap_on = self
+            .chart_state
+            .as_ref()
+            .map(|s| s.heatmap_enabled())
+            .unwrap_or(false);
+        let retention_floor = self
+            .chart_state
+            .as_ref()
+            .and_then(|s| s.view_time_range())
+            .map(|(lo, hi)| lo - (hi - lo).max(1));
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        // Heatmap-off case: own the eviction (the texture path is dormant), on
+        // its 2s throttle, so paged book history stays bounded.
+        if !heatmap_on {
+            if let Some(floor) = retention_floor {
+                const EVICT_INTERVAL_MS: i64 = 2000;
+                if self
+                    .heatmap_last_evict_ms
+                    .map_or(true, |last| now_ms - last >= EVICT_INTERVAL_MS)
+                {
+                    self.heatmap_last_evict_ms = Some(now_ms);
+                    market.update(cx, |svc, _| {
+                        svc.evict_book_history_before(
+                            symbol.as_ref(),
+                            chart::HEATMAP_DEPTH,
+                            floor,
+                        )
+                    });
+                }
+            }
+        }
+        let samples = {
+            let svc = market.read(cx);
+            let series = svc.book_series(symbol.as_ref(), chart::HEATMAP_DEPTH);
+            crate::indicators::ob_imbalance::reduce_book_imbalance(series)
+        };
+        if let Some(chart) = self.chart_state.as_mut() {
+            chart.set_book_imbalance_cache(samples);
+            chart.recompute_indicators();
         }
     }
 
@@ -2870,6 +2964,7 @@ impl ContentPanel {
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
             self.refresh_chart_mark_price_sub(cx);
+            self.refresh_chart_book_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -3113,6 +3208,9 @@ impl Render for ContentPanel {
                 // its Arc — needs `&mut Window` for atlas eviction, which the
                 // paint closure (App-only) can't do.
                 self.refresh_chart_heatmap_texture(window, cx);
+                // Reduce the book into the OB-imbalance cache (throttled) so the
+                // OB rows / pane stay fresh from the same book time-series.
+                self.maybe_refresh_book_imbalance(cx);
                 chart::render(
                     self.chart_state
                         .as_ref()

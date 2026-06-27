@@ -91,6 +91,15 @@ pub struct BarStatParams {
     /// below the delta row with a fixed blue base tint (like volume).
     #[serde(default)]
     pub show_oi_delta: bool,
+    /// Per-bar net long/short flow row (`sign(delta) × |ΔOI|`), bull/bear
+    /// tinted by sign like the delta row.
+    #[serde(default)]
+    pub show_net_ls: bool,
+    /// Order-book imbalance rows: one row per enabled depth preset (index into
+    /// `OB_DEPTHS_PCT`). Empty = no OB rows. Each renders signed (bid-heavy
+    /// green / ask-heavy red) on a fixed |ratio| intensity scale.
+    #[serde(default)]
+    pub ob_depths: Vec<usize>,
 }
 
 fn default_true() -> bool {
@@ -106,6 +115,8 @@ impl Default for BarStatParams {
             show_long_liq: false,
             show_short_liq: false,
             show_oi_delta: false,
+            show_net_ls: false,
+            ob_depths: Vec::new(),
         }
     }
 }
@@ -117,12 +128,28 @@ impl BarStatParams {
             self.show_volume,
             self.show_delta,
             self.show_oi_delta,
+            self.show_net_ls,
             self.show_long_liq,
             self.show_short_liq,
         ]
         .into_iter()
         .filter(|b| *b)
         .count()
+            + self.sorted_ob_depths().len()
+    }
+
+    /// Enabled OB depth presets, sorted ascending + de-duplicated + bounds-
+    /// checked. The canonical order for both compute (series) and paint (rows).
+    pub fn sorted_ob_depths(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self
+            .ob_depths
+            .iter()
+            .copied()
+            .filter(|&i| i < super::ob_imbalance::OB_N)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 }
 
@@ -202,6 +229,37 @@ impl IndicatorKind for BarStatParams {
             }
         }
 
+        // Net long/short flow (`sign(delta) × |ΔOI|`) — shares the OI + mark
+        // inputs with the dedicated Net L/S indicator; magnitude follows the
+        // Coin/USD unit. `None` where the bar lacks an OI sample / taker delta.
+        let net_ls =
+            super::net_ls::net_ls_series(candles, ctx.open_interest, ctx.mark_price, unit);
+
+        // OB imbalance: one ratio series per enabled depth preset, read off the
+        // shared book-imbalance samples (last snapshot in each bar).
+        let ob_depths = self.sorted_ob_depths();
+        let ob_imbalance: Vec<Series> = ob_depths
+            .iter()
+            .map(|&idx| {
+                super::ob_imbalance::book_imbalance_series(candles, ctx.book_imbalance, idx)
+            })
+            .collect();
+        // Daily-grade maxima for the OB rows — only needed when that grade is
+        // active (computed below alongside the other rows' maxima).
+        let ob_times: Vec<i64> = if matches!(self.grade, BarStatGrade::Daily) {
+            candles.iter().map(|c| c.open_time).collect()
+        } else {
+            Vec::new()
+        };
+        let daily_max_ob: Vec<Series> = if matches!(self.grade, BarStatGrade::Daily) {
+            ob_imbalance
+                .iter()
+                .map(|s| rolling_daily_max_abs(s, &ob_times))
+                .collect()
+        } else {
+            ob_imbalance.iter().map(|_| vec![None; n]).collect()
+        };
+
         // The rolling 24h maxima are only consumed by the `Daily` grade.
         // Computing them is O(n × window) — skip entirely for the other
         // (incl. default) grades so panning/zooming doesn't pay for series
@@ -213,6 +271,7 @@ impl IndicatorKind for BarStatParams {
             daily_max_long_liq,
             daily_max_short_liq,
             daily_max_oi_delta,
+            daily_max_net_ls,
         ) = if matches!(self.grade, BarStatGrade::Daily) {
             let times: Vec<i64> = candles.iter().map(|c| c.open_time).collect();
             (
@@ -221,9 +280,11 @@ impl IndicatorKind for BarStatParams {
                 rolling_daily_max_abs(&long_liq, &times),
                 rolling_daily_max_abs(&short_liq, &times),
                 rolling_daily_max_abs(&oi_delta, &times),
+                rolling_daily_max_abs(&net_ls, &times),
             )
         } else {
             (
+                vec![None; n],
                 vec![None; n],
                 vec![None; n],
                 vec![None; n],
@@ -239,16 +300,22 @@ impl IndicatorKind for BarStatParams {
             show_long_liq: self.show_long_liq,
             show_short_liq: self.show_short_liq,
             show_oi_delta: self.show_oi_delta,
+            show_net_ls: self.show_net_ls,
             volume,
             delta,
             long_liq,
             short_liq,
             oi_delta,
+            net_ls,
+            ob_depths,
+            ob_imbalance,
+            daily_max_ob,
             daily_max_vol,
             daily_max_delta,
             daily_max_long_liq,
             daily_max_short_liq,
             daily_max_oi_delta,
+            daily_max_net_ls,
         }
     }
 
@@ -294,11 +361,12 @@ impl IndicatorKind for BarStatParams {
         panel: WeakEntity<ContentPanel>,
         id: InstanceId,
     ) -> Option<SettingsForm> {
-        // Toggling long_liq / short_liq drives the shared LiquidationBars
-        // sub and OI Δ drives the shared OpenInterest sub — refresh both on
-        // every mutation (idempotent for grade / other-row toggles).
+        // Toggling long_liq / short_liq drives the shared LiquidationBars sub,
+        // OI Δ + Net L/S drive the shared OpenInterest + MarkPrice subs, and the
+        // OB rows drive the shared book sub — refresh all on every mutation
+        // (idempotent for grade / other-row toggles).
         let target: IndicatorTarget<BarStatParams> =
-            IndicatorTarget::new(panel, id).with_after_change(AfterChange::liq_and_oi_bars());
+            IndicatorTarget::new(panel, id).with_after_change(AfterChange::bar_stat());
 
         let grade_field = Field::dropdown(
             "Color grading",
@@ -333,6 +401,12 @@ impl IndicatorKind for BarStatParams {
             )
             .description("Per-bar change in open interest (close − open)."),
             MultiCheckItem::new(
+                "Net L/S",
+                target.getter(false, |p: &BarStatParams| p.show_net_ls),
+                target.setter(|p: &mut BarStatParams, v: bool| p.show_net_ls = v),
+            )
+            .description("Net positioning flow: sign(delta) × |ΔOI|."),
+            MultiCheckItem::new(
                 "Long Liq",
                 target.getter(false, |p: &BarStatParams| p.show_long_liq),
                 target.setter(|p: &mut BarStatParams, v: bool| p.show_long_liq = v),
@@ -347,10 +421,39 @@ impl IndicatorKind for BarStatParams {
         let rows_field = Field::multi_checkbox("Show rows", items)
             .description("Rows render top-to-bottom in this order.");
 
+        // OB-imbalance depth rows: one checkbox per preset; checking adds the
+        // depth index to `ob_depths` (one bar-stat row per checked depth).
+        use super::ob_imbalance::{OB_DEPTHS_PCT, ob_depth_label};
+        let ob_items: Vec<MultiCheckItem> = OB_DEPTHS_PCT
+            .iter()
+            .enumerate()
+            .map(|(idx, d)| {
+                MultiCheckItem::new(
+                    ob_depth_label(*d),
+                    target.getter(false, move |p: &BarStatParams| p.ob_depths.contains(&idx)),
+                    target.setter(move |p: &mut BarStatParams, v: bool| {
+                        if v {
+                            if !p.ob_depths.contains(&idx) {
+                                p.ob_depths.push(idx);
+                            }
+                        } else {
+                            p.ob_depths.retain(|&i| i != idx);
+                        }
+                    }),
+                )
+            })
+            .collect();
+        let ob_field = Field::multi_checkbox("OB imbalance depths", ob_items)
+            .description("One imbalance row per checked depth (% from mid).");
+
         let form_id = SharedString::from(format!("bar-stat-{}", id));
         Some(
-            SettingsForm::new(form_id)
-                .group(SettingsGroup::new("General").item(grade_field).item(rows_field)),
+            SettingsForm::new(form_id).group(
+                SettingsGroup::new("General")
+                    .item(grade_field)
+                    .item(rows_field)
+                    .item(ob_field),
+            ),
         )
     }
 }

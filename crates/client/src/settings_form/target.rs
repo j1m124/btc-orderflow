@@ -30,6 +30,10 @@ pub struct AfterChange {
     /// the mark price, so toggling it must (de)allocate the mark-price sub
     /// alongside the OI sub.
     pub refresh_mark_price: bool,
+    /// Whether to reconcile the shared chart book subscription. The OB-imbalance
+    /// rows read the book time-series, so toggling a depth must (de)allocate the
+    /// book sub.
+    pub refresh_book: bool,
 }
 
 impl AfterChange {
@@ -39,6 +43,7 @@ impl AfterChange {
             refresh_liq_bars: false,
             refresh_oi_bars: false,
             refresh_mark_price: false,
+            refresh_book: false,
         }
     }
 
@@ -48,6 +53,7 @@ impl AfterChange {
             refresh_liq_bars: false,
             refresh_oi_bars: false,
             refresh_mark_price: false,
+            refresh_book: false,
         }
     }
 
@@ -57,6 +63,7 @@ impl AfterChange {
             refresh_liq_bars: true,
             refresh_oi_bars: false,
             refresh_mark_price: false,
+            refresh_book: false,
         }
     }
 
@@ -66,18 +73,20 @@ impl AfterChange {
             refresh_liq_bars: false,
             refresh_oi_bars: true,
             refresh_mark_price: true,
+            refresh_book: false,
         }
     }
 
-    /// Bar Stats toggles both liquidation rows and the OI-Δ row, each of
-    /// which gates a different shared subscription — refresh all three (the
-    /// OI-Δ USD value reads the mark price).
-    pub const fn liq_and_oi_bars() -> Self {
+    /// Bar Stats toggles liquidation rows, the OI-Δ + Net L/S rows (OI + mark),
+    /// and the OB-imbalance rows (book) — each gates a different shared
+    /// subscription, so refresh them all.
+    pub const fn bar_stat() -> Self {
         Self {
             refresh_footprint: false,
             refresh_liq_bars: true,
             refresh_oi_bars: true,
             refresh_mark_price: true,
+            refresh_book: true,
         }
     }
 }
@@ -176,6 +185,9 @@ where
             }
             if after.refresh_mark_price {
                 p.refresh_chart_mark_price_sub(cx);
+            }
+            if after.refresh_book {
+                p.refresh_chart_book_sub(cx);
             }
             cx.notify();
             crate::panels::request_layout_save(cx);
