@@ -21,8 +21,7 @@ use crate::indicator_picker::{
 };
 use crate::indicator_settings::{IndicatorSettingsView, OpenIndicatorSettings};
 use crate::panels::{
-    self, ChartRenderSettingsView, ContentPanel, HeatmapSettingsView, Kind, LastFocusedChart,
-    OpenChartRenderSettings, OpenHeatmapSettings,
+    self, ChartRenderSettingsView, ContentPanel, Kind, LastFocusedChart, OpenChartRenderSettings,
 };
 use crate::persistence::{self, WorkspaceState};
 use crate::symbol_picker::{OpenSymbolPicker, PickerEvent, PickerIntent, SymbolPickerState};
@@ -46,7 +45,6 @@ pub struct TerminalWorkspace {
     indicator_picker: Entity<IndicatorPickerState>,
     indicator_settings: Option<FloatingIndicatorSettingsSlot>,
     chart_render_settings: Option<FloatingChartRenderSettingsSlot>,
-    heatmap_settings: Option<FloatingHeatmapSettingsSlot>,
     floating_code_editor: Option<FloatingCodeEditorSlot>,
     drawing_settings: Option<FloatingDrawingSettingsSlot>,
     drawing_strip: Entity<FloatingStrip>,
@@ -74,12 +72,6 @@ struct FloatingChartRenderSettingsSlot {
     view: Entity<ChartRenderSettingsView>,
 }
 
-struct FloatingHeatmapSettingsSlot {
-    window: Entity<FloatingWindow>,
-    /// Kept so a re-dispatch of `OpenHeatmapSettings` against another chart
-    /// retargets the existing window instead of opening a second one.
-    view: Entity<HeatmapSettingsView>,
-}
 
 struct FloatingDrawingSettingsSlot {
     window: Entity<FloatingWindow>,
@@ -241,7 +233,6 @@ impl TerminalWorkspace {
             indicator_picker,
             indicator_settings: None,
             chart_render_settings: None,
-            heatmap_settings: None,
             floating_code_editor: None,
             drawing_settings: None,
             drawing_strip,
@@ -606,50 +597,6 @@ impl TerminalWorkspace {
         .detach();
         self.chart_render_settings =
             Some(FloatingChartRenderSettingsSlot { window: win, view });
-    }
-
-    fn on_open_heatmap_settings(
-        &mut self,
-        _action: &OpenHeatmapSettings,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let chart = cx
-            .global::<LastFocusedChart>()
-            .0
-            .borrow()
-            .clone()
-            .and_then(|w| w.upgrade())
-            .filter(|e| e.read(cx).kind() == Kind::Chart);
-        let chart =
-            chart.or_else(|| find_first_chart(&self.dock_area.read(cx).center().clone(), cx));
-        let Some(chart) = chart else {
-            return;
-        };
-        let target = chart.downgrade();
-        if let Some(slot) = self.heatmap_settings.as_ref() {
-            let view = slot.view.clone();
-            view.update(cx, |v, cx| v.retarget(target, window, cx));
-            return;
-        }
-        let view = cx.new(|cx| HeatmapSettingsView::new(target, window, cx));
-        let content: AnyView = view.clone().into();
-        let win = cx.new(|cx| FloatingWindow::new("Heatmap Settings", content, window, cx));
-        cx.subscribe_in(&win, window, |this, _w, _ev: &DismissEvent, _window, cx| {
-            // Defer the drop: see `on_open_indicator_settings` for the
-            // gpui_web RefCell-borrow panic this works around.
-            let weak = cx.weak_entity();
-            cx.defer(move |cx| {
-                if let Some(ws) = weak.upgrade() {
-                    ws.update(cx, |ws, _cx| {
-                        ws.heatmap_settings = None;
-                    });
-                }
-            });
-            let _ = this;
-        })
-        .detach();
-        self.heatmap_settings = Some(FloatingHeatmapSettingsSlot { window: win, view });
     }
 
     fn on_open_drawing_settings(
@@ -1134,7 +1081,6 @@ impl Render for TerminalWorkspace {
             .on_action(cx.listener(Self::on_open_indicator_picker))
             .on_action(cx.listener(Self::on_open_indicator_settings))
             .on_action(cx.listener(Self::on_open_chart_render_settings))
-            .on_action(cx.listener(Self::on_open_heatmap_settings))
             .on_action(cx.listener(Self::on_toggle_floating_code_editor))
             .on_action(cx.listener(Self::on_set_active_tool))
             .on_action(cx.listener(Self::on_select_drawing))
@@ -1179,11 +1125,6 @@ impl Render for TerminalWorkspace {
                     )
                     .children(
                         self.chart_render_settings
-                            .as_ref()
-                            .map(|slot| slot.window.clone()),
-                    )
-                    .children(
-                        self.heatmap_settings
                             .as_ref()
                             .map(|slot| slot.window.clone()),
                     )

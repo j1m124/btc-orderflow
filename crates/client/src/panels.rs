@@ -27,7 +27,7 @@ pub mod watchlist;
 
 pub use chart::{
     ChangeChartRender, ChangeChartTimeframe, ChangeChartVolumeUnit, ChartRenderSettingsView,
-    GoToLatest, HeatmapSettingsView, OpenChartRenderSettings, OpenHeatmapSettings, ResetChartScale,
+    GoToLatest, HeatmapSettingsView, OpenChartRenderSettings, ResetChartScale,
     ToggleChartRenderVisible,
 };
 pub use liquidations::{ChangeLiquidationsSideFilter, ChangeLiquidationsSizeMode};
@@ -183,25 +183,11 @@ struct ChartPrefs {
     /// matches the new "fresh chart starts empty" behaviour.
     #[serde(default)]
     indicators: Vec<IndicatorPrefs>,
-    /// Orderbook-heatmap overlay state. All `serde(default)` so pre-feature
-    /// blobs load with the overlay off. `heatmap_manual_ref` is the colour-range
-    /// peak (book size mapped to the ramp top — name retained for back-compat),
-    /// `heatmap_color_lo` the low cut (cells below aren't drawn); `None` on
-    /// either falls back to the default.
-    #[serde(default)]
-    heatmap_enabled: bool,
-    #[serde(default)]
-    heatmap_manual_ref: Option<f64>,
-    #[serde(default)]
-    heatmap_color_lo: Option<f64>,
-    #[serde(default)]
-    heatmap_opacity: Option<f32>,
-    /// Draw per-cell book-size text (default on). `None` falls back to default.
-    #[serde(default)]
-    heatmap_show_text: Option<bool>,
-    /// Stretch the live candle's column to the right edge (default on).
-    #[serde(default)]
-    heatmap_extend_right: Option<bool>,
+    // The orderbook heatmap is now a singleton indicator (`ob_heatmap`); its
+    // on/off + settings persist within `indicators` above, like every other
+    // kind. The former top-level `heatmap_*` fields are gone — old blobs that
+    // still carry them deserialize fine (serde ignores unknown fields) and the
+    // heatmap simply starts off until re-added from the picker.
 }
 
 /// Serialized form of one `IndicatorInstance`. Kind reconstruction goes
@@ -291,8 +277,6 @@ struct ChartRestored {
     /// May be empty — older blobs without the field deserialize to `[]`,
     /// and that's also the intentional fresh-chart default now.
     indicators: Vec<IndicatorPrefs>,
-    heatmap_enabled: bool,
-    heatmap_settings: chart::HeatmapSettings,
 }
 
 fn parse_volume_unit(s: &str) -> Option<crate::persistence::VolumeUnit> {
@@ -352,16 +336,6 @@ fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
         .as_deref()
         .and_then(parse_volume_unit)
         .unwrap_or_default();
-    let default_heatmap = chart::HeatmapSettings::default();
-    let heatmap_settings = chart::HeatmapSettings {
-        color_lo: prefs.heatmap_color_lo.unwrap_or(default_heatmap.color_lo),
-        color_peak: prefs.heatmap_manual_ref.unwrap_or(default_heatmap.color_peak),
-        max_opacity: prefs.heatmap_opacity.unwrap_or(default_heatmap.max_opacity),
-        show_text: prefs.heatmap_show_text.unwrap_or(default_heatmap.show_text),
-        extend_right: prefs
-            .heatmap_extend_right
-            .unwrap_or(default_heatmap.extend_right),
-    };
     Some(ChartRestored {
         symbol: SharedString::from(prefs.symbol),
         tf,
@@ -370,8 +344,6 @@ fn chart_prefs_from_info(info: &PanelInfo) -> Option<ChartRestored> {
         profile,
         volume_unit,
         indicators: prefs.indicators,
-        heatmap_enabled: prefs.heatmap_enabled,
-        heatmap_settings,
     })
 }
 
@@ -733,9 +705,6 @@ impl ContentPanel {
             if let Some((kind, cluster, profile, volume_unit)) = render_seed {
                 state.seed_render(kind, cluster, profile);
                 state.set_volume_unit(volume_unit);
-            }
-            if let Some(restored) = chart_prefs.as_ref() {
-                state.seed_heatmap(restored.heatmap_enabled, restored.heatmap_settings);
             }
             if !indicator_seed.is_empty() {
                 state.restore_indicators(indicator_seed);
@@ -1823,6 +1792,17 @@ impl ContentPanel {
         kind: Box<dyn crate::indicators::IndicatorKind>,
         cx: &mut Context<Self>,
     ) {
+        // Singleton kinds (the orderbook heatmap) may exist at most once. The
+        // picker hides the entry when present, but guard the add path too.
+        if crate::indicators::is_singleton_kind(kind.kind_id()) {
+            let already = self
+                .chart_state
+                .as_ref()
+                .is_some_and(|s| s.indicators().iter().any(|i| i.kind_id == kind.kind_id()));
+            if already {
+                return;
+            }
+        }
         let Some(state) = self.chart_state.as_mut() else {
             return;
         };
@@ -1947,22 +1927,6 @@ impl ContentPanel {
             request_layout_save(cx);
         }
         ran
-    }
-
-    /// Mutate the chart's heatmap settings through `f`, then repaint + persist.
-    /// The texture rebuilds on the next render (settings are part of its key).
-    pub fn apply_heatmap_settings<F>(&mut self, f: F, cx: &mut Context<Self>)
-    where
-        F: FnOnce(&mut chart::HeatmapSettings),
-    {
-        let Some(state) = self.chart_state.as_mut() else {
-            return;
-        };
-        let mut settings = state.heatmap_settings();
-        f(&mut settings);
-        state.set_heatmap_settings(settings);
-        cx.notify();
-        request_layout_save(cx);
     }
 
     /// Switch the chart's render kind. If the kind actually changed, the
@@ -2284,8 +2248,10 @@ impl ContentPanel {
     /// Idempotent — same want ⇒ no churn. Clears the imbalance cache when no OB
     /// consumer remains so stale rows don't linger.
     pub(crate) fn refresh_chart_book_sub(&mut self, cx: &mut Context<Self>) {
+        // A heatmap *instance* (even hidden — hiding is paint-only) keeps the sub
+        // up, so a re-show and the OB-imbalance consumer both keep their data.
         let want = self.chart_state.as_ref().and_then(|s| {
-            (s.heatmap_enabled() || s.wants_book_imbalance()).then(|| s.symbol().clone())
+            (s.has_heatmap_indicator() || s.wants_book_imbalance()).then(|| s.symbol().clone())
         });
         // Drop the imbalance cache the moment no OB consumer wants it, even if
         // the book sub stays up for the heatmap.
@@ -2327,20 +2293,6 @@ impl ContentPanel {
             });
             self.chart_heatmap_sub = Some((symbol, handle));
         }
-    }
-
-    /// Toggle the chart's orderbook-heatmap overlay. Flips the flag, drops or
-    /// opens the book sub + sampler, and repaints. `window` is needed to evict
-    /// the cached atlas tile on disable.
-    pub fn toggle_chart_heatmap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(state) = self.chart_state.as_mut() else {
-            return;
-        };
-        let now_on = !state.heatmap_enabled();
-        state.set_heatmap_enabled(now_on, window);
-        self.refresh_chart_book_sub(cx);
-        cx.notify();
-        request_layout_save(cx);
     }
 
     /// Heatmap history fill — pages older book snapshots when the visible
@@ -2391,8 +2343,14 @@ impl ContentPanel {
     /// Reads the book time-series straight from the service (no per-frame clone)
     /// and hands it to `ChartState::refresh_heatmap`, which throttles the actual
     /// rebuild on a data/view/settings key. Called from `render` because it
-    /// needs a `&mut Window` (atlas eviction). No-op when the overlay is off.
+    /// needs a `&mut Window` (atlas eviction).
+    ///
+    /// When the heatmap isn't painting (no instance, or the instance is hidden)
+    /// we still call `refresh_heatmap` with an empty series so the layer syncs
+    /// its mirror + drops the cached tile — otherwise a hidden/removed heatmap
+    /// would keep blitting its last texture.
     fn refresh_chart_heatmap_texture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
         // Symbol + retention floor for this frame: keep one extra visible-span
         // of history on the left so a back-scroll has buffer before paging
         // re-fills, and the build's 25% margin always sits inside what's kept.
@@ -2404,6 +2362,10 @@ impl ContentPanel {
             let span = (hi - lo).max(1);
             Some((s.symbol().clone(), lo - span))
         }) else {
+            // Not painting — sync the layer off + drop its tile.
+            if let Some(chart) = self.chart_state.as_mut() {
+                chart.refresh_heatmap(&[], now_ms, window);
+            }
             return;
         };
         let market = cx
@@ -2414,7 +2376,6 @@ impl ContentPanel {
         // throttled so the series length stays stable between batches (see the
         // field doc).
         const EVICT_INTERVAL_MS: i64 = 2000;
-        let now_ms = chrono::Utc::now().timestamp_millis();
         if self
             .heatmap_last_evict_ms
             .map_or(true, |last| now_ms - last >= EVICT_INTERVAL_MS)
@@ -3109,12 +3070,6 @@ impl Panel for ContentPanel {
                 profile: Some(*chart.profile_params()),
                 volume_unit: Some(volume_unit_id(chart.volume_unit()).to_string()),
                 indicators,
-                heatmap_enabled: chart.heatmap_enabled(),
-                heatmap_manual_ref: Some(chart.heatmap_settings().color_peak),
-                heatmap_color_lo: Some(chart.heatmap_settings().color_lo),
-                heatmap_opacity: Some(chart.heatmap_settings().max_opacity),
-                heatmap_show_text: Some(chart.heatmap_settings().show_text),
-                heatmap_extend_right: Some(chart.heatmap_settings().extend_right),
             }) {
                 state.info = PanelInfo::panel(value);
             }

@@ -31,7 +31,7 @@ pub use footprint::{
     ColorScope, FootprintParams, RenderKind, RenderMetric, TextMetric, WireframeVariant,
 };
 pub use footprint_settings::{ChartRenderSettingsView, OpenChartRenderSettings};
-pub use heatmap_settings::{HeatmapSettingsView, OpenHeatmapSettings};
+pub use heatmap_settings::HeatmapSettingsView;
 pub use paint::{COLOR_RANGE_MAX, COLOR_RANGE_MIN, HEATMAP_DEPTH, HeatmapSettings};
 pub use state::ChartState;
 pub use view::render;

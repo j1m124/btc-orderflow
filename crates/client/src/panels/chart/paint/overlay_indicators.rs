@@ -208,6 +208,10 @@ pub fn paint_overlay_indicators(
                 // pane-only; ignore here. Pane render routes them to
                 // `paint_sub_pane`.
             }
+            IndicatorOutput::Heatmap => {
+                // Façade marker — the orderbook heatmap renders behind the
+                // candles via `paint_heatmap`, not through this pipeline.
+            }
             IndicatorOutput::VolumeProfile { output, params } => {
                 // VP renders inside the same price band as the candles
                 // (top = 10px chrome below the top edge, bottom above the

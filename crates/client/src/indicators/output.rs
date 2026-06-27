@@ -143,6 +143,14 @@ pub enum IndicatorOutput {
         params: crate::indicators::OpenInterestParams,
         unit: crate::persistence::VolumeUnit,
     },
+
+    /// No-op marker for the orderbook-heatmap overlay. The heatmap is a façade
+    /// indicator: its real render is a GPU-texture blit behind the candles, run
+    /// separately by `ChartState`/`HeatmapLayer` (fed from the instance's
+    /// params), not through the indicator paint pipeline. `compute` returns this
+    /// so the instance carries an output like every other kind; the overlay/pane
+    /// paint passes skip it, `len()` is 0, and `value_at`/`y_range` are empty.
+    Heatmap,
 }
 
 impl IndicatorOutput {
@@ -160,6 +168,8 @@ impl IndicatorOutput {
             IndicatorOutput::VolumeProfile { .. } => 0,
             IndicatorOutput::LiquidationBars { long_qty, .. } => long_qty.len(),
             IndicatorOutput::OpenInterest { close, .. } => close.len(),
+            // Façade marker — no per-bar series.
+            IndicatorOutput::Heatmap => 0,
         }
     }
 
@@ -174,6 +184,11 @@ impl IndicatorOutput {
 /// readable copy.
 #[derive(Clone, Debug)]
 pub enum ValueReadout {
+    /// No crosshair readout — the chip shows only its name (the stat is read
+    /// off the cells/overlay directly). Bar Stats and the orderbook heatmap use
+    /// this. Renders as a blank (non-breaking space) so the chip keeps its line
+    /// height and the hover-button overlay anchor.
+    Empty,
     /// Single scalar (RSI, Volume).
     One(Option<f64>),
     /// Two scalars (BB → upper / lower; middle is implied by the label).

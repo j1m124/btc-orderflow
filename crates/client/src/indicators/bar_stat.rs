@@ -319,16 +319,11 @@ impl IndicatorKind for BarStatParams {
         }
     }
 
-    fn value_at(&self, output: &IndicatorOutput, index: usize) -> ValueReadout {
-        let IndicatorOutput::BarStat { volume, delta, .. } = output else {
-            return ValueReadout::Two(None, None);
-        };
-        // Crosshair readout still surfaces vol+delta only — the liq rows
-        // are an aggregated stat the user reads off the cell directly.
-        ValueReadout::Two(
-            volume.get(index).copied().flatten(),
-            delta.get(index).copied().flatten(),
-        )
+    fn value_at(&self, _output: &IndicatorOutput, _index: usize) -> ValueReadout {
+        // No crosshair chip readout — every Bar Stats row (vol / delta / liq /
+        // OI Δ / net L/S / OB imbalance) is read directly off its cell, so a
+        // chip readout would be redundant and ambiguous.
+        ValueReadout::Empty
     }
 
     fn y_range(

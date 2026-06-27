@@ -183,7 +183,8 @@ const DEFAULT_COLOR_PEAK: f64 = 100.0;
 pub const COLOR_RANGE_MIN: f64 = 1.0;
 pub const COLOR_RANGE_MAX: f64 = 10_000.0;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct HeatmapSettings {
     /// Cells whose book size (coin units) is below this aren't drawn at all.
     pub color_lo: f64,

@@ -453,14 +453,6 @@ impl ChartState {
         self.profile_params = profile;
     }
 
-    /// Seed persisted heatmap state onto a freshly-constructed `ChartState`
-    /// (`ContentPanel::new_restored`). The caller opens the book subscription +
-    /// sampler afterwards via `refresh_chart_heatmap_sub` when `enabled`.
-    pub fn seed_heatmap(&mut self, enabled: bool, settings: super::paint::HeatmapSettings) {
-        self.heatmap.enabled = enabled;
-        self.heatmap.settings = settings;
-    }
-
     /// Current volume display unit (Coin or USD). Read by `compute_ctx()`
     /// + the paint pipeline so indicators and footprint cells agree on
     /// the same unit at every render.
@@ -1434,32 +1426,44 @@ impl ChartState {
     }
 
     // --- Orderbook heatmap ---------------------------------------------------
+    //
+    // The heatmap is a singleton overlay *indicator* (`ob_heatmap`): its on/off
+    // and settings live on the instance's `OrderbookHeatmapParams`, the single
+    // source of truth. `HeatmapLayer` is just the texture cache; these helpers
+    // read the instance and `refresh_heatmap` syncs it into the layer's mirror
+    // fields before the (unchanged) rebuild path runs.
 
-    /// Whether the heatmap overlay is on. `ContentPanel` reads this to decide
-    /// whether to hold the book subscription + sampling.
+    /// The `ob_heatmap` instance, if one is attached. Singleton (the picker +
+    /// add path enforce at most one), so the first match is the only match.
+    fn heatmap_instance(&self) -> Option<&IndicatorInstance> {
+        self.indicators.iter().find(|i| i.kind_id == "ob_heatmap")
+    }
+
+    /// Whether a heatmap instance exists at all (even if hidden). Drives the
+    /// shared book subscription gate — the sub stays up while hidden (hiding is
+    /// paint-only), so OB-imbalance and a re-show both keep their data.
+    pub fn has_heatmap_indicator(&self) -> bool {
+        self.heatmap_instance().is_some()
+    }
+
+    /// Whether the heatmap should paint this frame: an instance exists and isn't
+    /// hidden. Drives the texture build/paint + history paging (idle when
+    /// hidden), distinct from [`Self::has_heatmap_indicator`].
     pub fn heatmap_enabled(&self) -> bool {
-        self.heatmap.enabled
+        self.heatmap_instance().is_some_and(|i| !i.hidden)
     }
 
-    /// Current heatmap settings (price bucket, colour reference, opacity).
-    pub fn heatmap_settings(&self) -> super::paint::HeatmapSettings {
-        self.heatmap.settings
-    }
-
-    /// Flip the heatmap on/off. On disable, releases the cached atlas tile.
-    /// Returns the new state. The caller wires the book sub + sampling.
-    pub fn set_heatmap_enabled(&mut self, on: bool, window: &mut Window) -> bool {
-        self.heatmap.enabled = on;
-        if !on {
-            self.heatmap.drop_cache(window);
-        }
-        on
-    }
-
-    /// Replace heatmap settings. The texture rebuilds on the next
-    /// [`Self::refresh_heatmap`] (settings are part of the rebuild key).
-    pub fn set_heatmap_settings(&mut self, settings: super::paint::HeatmapSettings) {
-        self.heatmap.settings = settings;
+    /// Current heatmap settings from the instance params, or defaults when no
+    /// instance is attached.
+    fn heatmap_instance_settings(&self) -> super::paint::HeatmapSettings {
+        self.heatmap_instance()
+            .and_then(|i| {
+                i.kind
+                    .as_any()
+                    .downcast_ref::<crate::indicators::OrderbookHeatmapParams>()
+            })
+            .map(|p| p.settings)
+            .unwrap_or_default()
     }
 
     /// Rebuild the heatmap texture for the current view if needed. `series` is
@@ -1473,6 +1477,13 @@ impl ChartState {
         now_ms: i64,
         window: &mut Window,
     ) {
+        // Sync the layer's mirror from the instance (the source of truth) before
+        // the rebuild path reads it. Settings are part of the rebuild key, so an
+        // edit on the instance flows through to a texture rebuild here.
+        let on = self.heatmap_enabled();
+        let settings = self.heatmap_instance_settings();
+        self.heatmap.enabled = on;
+        self.heatmap.settings = settings;
         if !self.heatmap.enabled {
             self.heatmap.drop_cache(window);
             return;

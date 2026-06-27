@@ -7,17 +7,33 @@ A Bookmap-style liquidity heatmap rendered **behind the candles**: x = time, y =
 This document is the locked v1 design from the design interview. It supersedes the
 two exploratory paths in the old "orderbook heatmap deferred" note.
 
-## What it is NOT
+> **Update (2026-06-27): the heatmap is now a singleton overlay _indicator_ façade.**
+> The render pipeline below is unchanged — it's still a GPU-texture blit behind the
+> candles with its own book sub + cache. What changed is the *shell*: instead of a
+> bespoke header toggle + standalone settings window, it's now added from the
+> "+ Indicator" picker and managed via its chip like every other indicator.
+> See `indicators/ob_heatmap.rs` (`OrderbookHeatmapParams`):
+> - State (on/off = instance exists; the 5 settings) lives on the instance and
+>   persists via `IndicatorPrefs`. The former top-level `ChartPrefs.heatmap_*` fields
+>   were dropped (no migration — old layouts just start with the heatmap off).
+> - `compute` returns the no-op `IndicatorOutput::Heatmap` marker (the paint passes
+>   skip it). `ChartState` syncs the instance's params into `HeatmapLayer`'s mirror
+>   `enabled`/`settings` fields in `refresh_heatmap` before the unchanged rebuild path.
+> - The book sub stays up while the *instance exists* (even hidden — hiding is
+>   paint-only); the chip **×** removes it and tears the sub down.
+> - The two-handle log colour slider stays bespoke, reached via the new
+>   `IndicatorKind::custom_settings_view` hook (hosted by `indicator_settings.rs`).
+> The "What it is NOT" section below is **superseded** by this change.
 
-It is **not** an `IndicatorKind`. The indicator trait computes from
-`compute(&[Candle], ComputeCtx)`, and `ComputeCtx` carries only
-`volume_unit / footprint / view_time_range / liquidation_bars / open_interest`
-(`indicators/kind.rs:34-68`) — **no book data, live or historical**. A heatmap needs a
-time-series of book snapshots, which lives outside that context. Forcing it into the
-trait would break all existing indicators.
+## What it WAS NOT (superseded — see the update above)
 
-Instead it follows the **footprint** precedent: a *render layer* that owns its own
-subscription + cache + paint pass over the candle price-axis (`paint/footprint_render.rs`).
+The original v1 deliberately was **not** an `IndicatorKind`, because the indicator
+trait computes from `compute(&[Candle], ComputeCtx)` and `ComputeCtx` carries no book
+data — a heatmap needs a time-series of book snapshots that lives outside that context.
+That reasoning still holds for the *data path*: the façade sidesteps it by keeping the
+book sub + texture cache outside `compute` (which is a no-op marker) and feeding the
+`HeatmapLayer` from the instance params directly. It still follows the **footprint**
+precedent of a render layer owning its own subscription + cache + paint pass.
 
 ## Locked decisions
 

@@ -81,23 +81,25 @@ pub(super) fn index_to_screen(
 /// use the K/M/B abbreviations standard in trading platforms; everything
 /// else gets two decimals.
 pub(super) fn format_readout(r: ValueReadout) -> String {
-    match r {
-        ValueReadout::One(v) => fmt_scalar(v),
-        ValueReadout::Two(a, b) => format!("{} / {}", fmt_scalar(a), fmt_scalar(b)),
-        ValueReadout::Three(a, b, c) => {
-            format!("{} / {} / {}", fmt_scalar(a), fmt_scalar(b), fmt_scalar(c))
-        }
-        ValueReadout::Many(vs) => {
-            if vs.is_empty() {
-                "\u{2014}".to_string()
-            } else {
-                vs.into_iter()
-                    .map(fmt_scalar)
-                    .collect::<Vec<_>>()
-                    .join(" / ")
-            }
-        }
+    // Non-breaking space: a blank readout that still holds the chip's line
+    // height + the hover-button overlay anchor.
+    const BLANK: &str = "\u{00A0}";
+    let parts: Vec<Option<f64>> = match r {
+        ValueReadout::Empty => return BLANK.to_string(),
+        ValueReadout::One(a) => vec![a],
+        ValueReadout::Two(a, b) => vec![a, b],
+        ValueReadout::Three(a, b, c) => vec![a, b, c],
+        ValueReadout::Many(vs) => vs,
+    };
+    // No value at this bar → blank, not a dash.
+    if parts.iter().all(Option::is_none) {
+        return BLANK.to_string();
     }
+    parts
+        .into_iter()
+        .map(fmt_scalar)
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 pub(super) fn fmt_scalar(v: Option<f64>) -> String {

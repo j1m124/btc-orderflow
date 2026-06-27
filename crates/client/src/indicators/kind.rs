@@ -11,7 +11,7 @@
 
 use std::any::Any;
 
-use gpui::{SharedString, WeakEntity};
+use gpui::{AnyView, App, SharedString, WeakEntity, Window};
 use serde::{Deserialize, Serialize};
 
 use super::instance::InstanceId;
@@ -105,6 +105,17 @@ pub fn mark_close_series(candles: &[Candle], mark: Option<&[MarkPriceBar]>) -> V
     }
     out
 }
+
+/// Deferred constructor for a kind's bespoke (stateful) settings view, returned
+/// by [`IndicatorKind::custom_settings_view`]. The declarative `SettingsForm` is
+/// stateless, so kinds whose settings need a stateful widget the form can't
+/// express (the heatmap's two-handle logarithmic colour slider) hand back this
+/// builder instead. `indicator_settings.rs` invokes it once when it targets the
+/// instance — separated from the trait `&self` borrow so the view can be built
+/// with `&mut App` after the panel read-borrow is released — caches the
+/// resulting view, and renders it in place of the form.
+pub type CustomSettingsBuilder =
+    Box<dyn FnOnce(WeakEntity<ContentPanel>, InstanceId, &mut Window, &mut App) -> AnyView>;
 
 /// Where an indicator can render. Drives picker entry placement, default
 /// `Placement` on add, and which chip strip the chip lives in.
@@ -231,6 +242,16 @@ pub trait IndicatorKind: Any + Send + Sync {
         _panel: WeakEntity<ContentPanel>,
         _id: InstanceId,
     ) -> Option<SettingsForm> {
+        None
+    }
+
+    /// Optional bespoke, stateful settings view, for kinds whose settings can't
+    /// be expressed by the declarative [`SettingsForm`] (e.g. the heatmap's
+    /// two-handle logarithmic colour slider). When `Some`, the indicator
+    /// settings panel builds + hosts the returned view instead of the form;
+    /// `settings_form` is ignored. Takes precedence over `settings_form`.
+    /// Default `None` — every form-based kind uses `settings_form`.
+    fn custom_settings_view(&self) -> Option<CustomSettingsBuilder> {
         None
     }
 }

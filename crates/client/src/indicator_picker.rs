@@ -131,7 +131,25 @@ impl IndicatorPickerState {
     fn visible(&self, cx: &Context<Self>) -> VisibleList {
         let query = self.query(cx);
         let trimmed = query.trim();
-        let all = kind_entries();
+        // Hide singleton kinds (the orderbook heatmap) that are already attached
+        // to the target chart, so they can't be added twice.
+        let present: Vec<&'static str> = self
+            .intent
+            .as_ref()
+            .and_then(|i| i.target.upgrade())
+            .and_then(|p| {
+                p.read(cx)
+                    .chart_state
+                    .as_ref()
+                    .map(|c| c.indicators().iter().map(|x| x.kind_id).collect())
+            })
+            .unwrap_or_default();
+        let all: Vec<KindEntry> = kind_entries()
+            .into_iter()
+            .filter(|e| {
+                !(crate::indicators::is_singleton_kind(e.kind_id) && present.contains(&e.kind_id))
+            })
+            .collect();
         if trimmed.is_empty() {
             // Empty query: section by category in display order:
             // Overlays first, then Volume, then Oscillators.
@@ -289,7 +307,7 @@ impl Render for IndicatorPickerState {
 
         let card = v_flex()
             .id("indicator-picker-card")
-            .w(px(560.))
+            .w(px(760.))
             .h(px(520.))
             .bg(theme_bg)
             .border_1()
@@ -392,18 +410,25 @@ fn render_row(
     let name = entry.name.clone();
     let desc = entry.description.clone();
     let row_id = SharedString::from(format!("indicator-row-{}", entry.kind_id));
-    h_flex()
+    v_flex()
         .id(row_id)
         .w_full()
+        .min_w_0()
         .px_2()
-        .py_2()
-        .gap_3()
-        .items_center()
+        .py_1p5()
+        .gap_0p5()
         .rounded(px(4.))
         .hover(move |s| s.bg(accent).text_color(accent_fg))
         .cursor_pointer()
-        .child(div().w(px(110.)).font_semibold().child(name))
-        .child(div().flex_1().text_sm().text_color(muted).child(desc))
+        .child(div().w_full().truncate().font_semibold().child(name))
+        .child(
+            div()
+                .w_full()
+                .truncate()
+                .text_xs()
+                .text_color(muted)
+                .child(desc),
+        )
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _ev, w, cx| {

@@ -16,6 +16,7 @@ pub mod kind;
 pub mod liq_bars;
 pub mod math;
 pub mod net_ls;
+pub mod ob_heatmap;
 pub mod ob_imbalance;
 pub mod open_interest;
 pub mod output;
@@ -29,13 +30,16 @@ pub use bb::BbParams;
 pub use funding::{FundingParams, FundingRenderMode};
 pub use liq_bars::{LiqBarsScale, LiquidationBarsParams};
 pub use net_ls::NetLsParams;
+pub use ob_heatmap::OrderbookHeatmapParams;
 pub use ob_imbalance::ObImbalanceParams;
 pub use open_interest::{OiRenderMode, OpenInterestParams};
 pub use instance::{
     COLOR_PALETTE_SIZE, IndicatorInstance, InstanceId, bump_next_id_past, default_pane_height,
     new_instance_id, palette_color_for,
 };
-pub use kind::{ComputeCtx, IndicatorKind, PaneKind, Placement, Source};
+pub use kind::{
+    ComputeCtx, CustomSettingsBuilder, IndicatorKind, PaneKind, Placement, Source,
+};
 pub use output::{IndicatorOutput, Series, ValueReadout};
 pub use trades::TradesParams;
 pub use volume::VolumeParams;
@@ -149,7 +153,22 @@ pub fn kind_entries() -> Vec<KindEntry> {
             category: Category::Volume,
             spawn: || Box::new(ObImbalanceParams::default()),
         },
+        KindEntry {
+            kind_id: "ob_heatmap",
+            name: "Orderbook Heatmap".into(),
+            description: "Resting order-book liquidity as a colour heatmap behind the candles; brighter = larger resting size. Singleton.".into(),
+            category: Category::Volume,
+            spawn: || Box::new(OrderbookHeatmapParams::default()),
+        },
     ]
+}
+
+/// Kinds that may exist at most once per chart. The picker hides the entry while
+/// one is present and [`crate::panels::ContentPanel::add_indicator_from_picker`]
+/// refuses a duplicate. The heatmap is singleton because there is one order book
+/// / one texture cache per chart — a second instance would be redundant work.
+pub fn is_singleton_kind(kind_id: &str) -> bool {
+    matches!(kind_id, "ob_heatmap")
 }
 
 /// Rebuild a boxed `dyn IndicatorKind` from a `kind_id` + serialized params.
@@ -189,6 +208,9 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "ob_imbalance" => serde_json::from_value::<ObImbalanceParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "ob_heatmap" => serde_json::from_value::<OrderbookHeatmapParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy

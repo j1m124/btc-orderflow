@@ -71,21 +71,19 @@ fn render_indicator_chip(
     let id = inst.id;
     let hidden = inst.hidden;
     let is_pane = inst.placement == Placement::Pane;
-    // Chip label = "Name" when crosshair is off-canvas, or
-    // "Name: v1[ / v2[ / v3]]" when the crosshair is over a bar.
-    // `kind.value_at` returns a typed ValueReadout that's formatted here so
-    // the chip always reads cleanly regardless of how many series the
-    // indicator emits.
-    let base_label = inst.kind.label();
-    let label: SharedString = match cursor_idx {
-        Some(i) => SharedString::from(format!(
-            "{}: {}",
-            base_label,
-            format_readout(inst.kind.value_at(output, i))
-        )),
-        None => base_label,
+    // The chip splits into a fixed name and a separate readout. The name is
+    // always shown; the readout — "v1[ / v2[ / v3]]", formatted from the
+    // typed `ValueReadout` so it reads cleanly regardless of series count —
+    // only appears when the crosshair is over a bar. Off-canvas the readout
+    // box still renders a non-breaking space so it keeps the chip's line
+    // height (the hover button overlay anchors to this box).
+    let name = inst.kind.label();
+    let readout: SharedString = match cursor_idx {
+        Some(i) => SharedString::from(format_readout(inst.kind.value_at(output, i))),
+        None => SharedString::from("\u{00A0}"), // nbsp
     };
     let chip_id = SharedString::from(format!("chip-{}", id));
+    let group_name = SharedString::from(format!("chip-grp-{}", id));
     let eye_id = SharedString::from(format!("chip-eye-{}", id));
     let gear_id = SharedString::from(format!("chip-gear-{}", id));
     let close_id = SharedString::from(format!("chip-close-{}", id));
@@ -113,19 +111,25 @@ fn render_indicator_chip(
     } else {
         SharedString::from("\u{25CF}") // ●
     };
-    let hover_bg = {
-        let muted = cx.theme().muted;
-        Hsla { a: 0.30, ..muted }
+    // Chip chrome (border + fill) shows only on hover — at rest the chip is
+    // fully transparent (just the name + readout text over the chart). The
+    // border stays present-but-transparent at rest so coloring it on hover
+    // doesn't shift the layout by 1px.
+    let hover_bg = cx.theme().background;
+    let rest_border = Hsla {
+        a: 0.0,
+        ..border_color
     };
     h_flex()
         .id(chip_id)
+        .group(group_name.clone())
         .gap_1()
         .px_2()
         .py(px(2.))
         .items_center()
         .rounded(px(4.))
         .border_1()
-        .border_color(border_color)
+        .border_color(rest_border)
         .text_xs()
         .text_color(text_color)
         // Occlude the chart canvas's hitbox underneath: right-clicking
@@ -137,10 +141,10 @@ fn render_indicator_chip(
         // element as not-hovered. Same trick suppresses ghost-hover
         // styling on the canvas while the cursor is over a chip.
         .occlude()
-        // Subtle hover tint so the right-click affordance is discoverable.
+        // On hover: opaque fill + colored border (the resting chip is bare).
         // No cursor_pointer — the body itself is not clickable; only the
         // three buttons (which set their own pointer) are.
-        .hover(move |this| this.bg(hover_bg))
+        .hover(move |this| this.bg(hover_bg).border_color(border_color))
         // Right-click menu: Settings… (always), Hide/Show (always),
         // Move pane up/down (Pane-placed only — overlay indicators have no
         // pane order to reshuffle), Remove (always). Actions are scoped to
@@ -160,48 +164,88 @@ fn render_indicator_chip(
             }
             m.separator().menu("Remove", Box::new(RemoveIndicator(id)))
         })
-        .child(div().child(label))
+        .child(div().child(name))
+        // Readout + buttons share one slot. The *buttons* are in flow, so the
+        // slot — and the hover fill around it — is exactly the (fixed 3-button)
+        // cluster's width (no trailing slack). The readout is layered absolutely
+        // on top: it shows at rest (free to overflow the slot to the right,
+        // since the resting chip has no fill/border) and hides on hover so the
+        // buttons take its place. Both toggle only *visibility* via `group_hover`
+        // — never `display` — so the buttons' hitboxes are registered once at
+        // first paint, not minted mid-hover (which churns gpui_web's hover
+        // regions and trips its "RefCell already borrowed" panic at
+        // register_pointer_leave_hover).
         .child(
-            Button::new(eye_id)
-                .label(eye_label)
-                .xsmall()
-                .ghost()
-                .on_click(cx.listener(move |this, _ev, _w, cx| {
-                    if let Some(chart) = this.chart_state.as_mut() {
-                        let was_hidden = chart
-                            .indicators()
-                            .iter()
-                            .find(|i| i.id == id)
-                            .map(|i| i.hidden)
-                            .unwrap_or(false);
-                        chart.set_indicator_hidden(id, !was_hidden);
-                        cx.notify();
-                    }
-                })),
-        )
-        .child(
-            Button::new(gear_id)
-                .label(SharedString::from("\u{2699}")) // ⚙
-                .xsmall()
-                .ghost()
-                .on_click(move |_ev, window, cx| {
-                    window.dispatch_action(
-                        Box::new(crate::indicator_settings::OpenIndicatorSettings(id)),
-                        cx,
-                    );
-                }),
-        )
-        .child(
-            Button::new(close_id)
-                .label(SharedString::from("\u{00d7}")) // ×
-                .xsmall()
-                .ghost()
-                .on_click(cx.listener(move |this, _ev, _w, cx| {
-                    if let Some(chart) = this.chart_state.as_mut() {
-                        chart.remove_indicator(id);
-                        cx.notify();
-                    }
-                })),
+            div()
+                .relative()
+                .flex()
+                .items_center()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .invisible()
+                        .group_hover(group_name.clone(), |this| this.visible())
+                        .child(
+                            Button::new(eye_id)
+                                .label(eye_label)
+                                .xsmall()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _ev, _w, cx| {
+                                    if let Some(chart) = this.chart_state.as_mut() {
+                                        let was_hidden = chart
+                                            .indicators()
+                                            .iter()
+                                            .find(|i| i.id == id)
+                                            .map(|i| i.hidden)
+                                            .unwrap_or(false);
+                                        chart.set_indicator_hidden(id, !was_hidden);
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new(gear_id)
+                                .label(SharedString::from("\u{2699}")) // ⚙
+                                .xsmall()
+                                .ghost()
+                                .on_click(move |_ev, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::indicator_settings::OpenIndicatorSettings(
+                                            id,
+                                        )),
+                                        cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new(close_id)
+                                .label(SharedString::from("\u{00d7}")) // ×
+                                .xsmall()
+                                .ghost()
+                                // Dispatch the action (not a direct
+                                // `remove_indicator`) so removal runs the full
+                                // `on_remove_indicator` cleanup — reconciling the
+                                // shared subs (footprint / liq / OI / mark / book).
+                                // The heatmap relies on this to tear down its book
+                                // sub + sampler on ×.
+                                .on_click(move |_ev, window, cx| {
+                                    window.dispatch_action(Box::new(RemoveIndicator(id)), cx);
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .flex()
+                        .items_center()
+                        .whitespace_nowrap()
+                        .child(readout)
+                        .group_hover(group_name, |this| this.invisible()),
+                ),
         )
         .into_any_element()
 }
@@ -271,74 +315,96 @@ fn render_synthetic_render_chip(
     } else {
         SharedString::from("\u{25CB}") // ○
     };
-    let hover_bg = {
-        let muted = cx.theme().muted;
-        Hsla { a: 0.30, ..muted }
+    // Chip chrome shows only on hover (matches the indicator chips):
+    // transparent at rest, opaque fill + colored border on hover. The border
+    // stays present-but-transparent at rest so coloring it on hover doesn't
+    // shift the layout by 1px.
+    let hover_bg = cx.theme().background;
+    let rest_border = Hsla {
+        a: 0.0,
+        ..border_color
     };
+    let group_name = SharedString::from("chip-render-grp");
 
-    let mut chip = h_flex()
+    // Eye toggles `render_visible` — suppresses the main render layer
+    // (paint_main_chart honours `render_visible`) without touching subscriptions.
+    let eye = Button::new("chip-render-eye")
+        .label(eye_label)
+        .xsmall()
+        .ghost()
+        .on_click(|_ev, window, cx| {
+            window.dispatch_action(Box::new(ToggleChartRenderVisible), cx);
+        });
+    // Gear: enabled only for footprint kinds (Candlestick has no params).
+    // Dispatches `OpenChartRenderSettings`; the workspace handler resolves the
+    // target chart via `LastFocusedChart` and opens the floating settings window.
+    let gear = Button::new("chip-render-gear")
+        .label(SharedString::from("\u{2699}")) // ⚙
+        .xsmall()
+        .ghost();
+    let gear = if has_settings {
+        gear.on_click(|_ev, window, cx| {
+            window.dispatch_action(Box::new(OpenChartRenderSettings), cx);
+        })
+    } else {
+        gear.disabled(true)
+    };
+    // Trash: visually present but disabled — per locked design the render is
+    // always required; only the header dropdown switches kinds.
+    let trash = div()
+        .px_1()
+        .text_color(disabled_color)
+        .child(SharedString::from("\u{00d7}")); // ×
+
+    // Buttons in flow define the slot width; the readout overlays them
+    // absolutely and hides on hover. Visibility-not-display toggling keeps the
+    // buttons' hitboxes stable (see `render_indicator_chip` for the gpui_web
+    // pointer-hover borrow-panic rationale).
+    let buttons = h_flex()
+        .gap_1()
+        .items_center()
+        .invisible()
+        .group_hover(group_name.clone(), |this| this.visible())
+        .child(eye)
+        .child(gear)
+        .child(trash);
+
+    let mut slot = div().relative().flex().items_center().child(buttons);
+    // OHLC + volume/delta readout (hovered candle, else latest), layered over
+    // the buttons and hidden on hover.
+    if let Some(readout) = ohlc_readout(state, cx) {
+        slot = slot.child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .flex()
+                .items_center()
+                .whitespace_nowrap()
+                .child(readout)
+                .group_hover(group_name.clone(), |this| this.invisible()),
+        );
+    }
+
+    h_flex()
         .id(SharedString::from("chip-render-synthetic"))
+        .group(group_name)
         .gap_1()
         .px_2()
         .py(px(2.))
         .items_center()
         .rounded(px(4.))
         .border_1()
-        .border_color(border_color)
+        .border_color(rest_border)
         .text_xs()
         .text_color(text_color)
-        // Match the indicator chip's occlude + hover bg — keeps the
-        // chip behaving like its siblings in the same vertical stack.
+        // Match the indicator chip's occlude + hover chrome.
         .occlude()
-        .hover(move |this| this.bg(hover_bg))
-        .child(div().child(label));
-
-    // OHLC + volume/delta readout (hovered candle, else latest) lives inside
-    // the render chip, right after the mode label.
-    if let Some(readout) = ohlc_readout(state, cx) {
-        chip = chip.child(readout);
-    }
-
-    // Eye toggles `render_visible` — flipping it suppresses the main
-    // render layer (paint_main_chart honours `render_visible`) without
-    // touching subscriptions. Dispatches an action so chart-scoped
-    // key bindings could trigger the same toggle later.
-    chip = chip.child(
-        Button::new("chip-render-eye")
-            .label(eye_label)
-            .xsmall()
-            .ghost()
-            .on_click(|_ev, window, cx| {
-                window.dispatch_action(Box::new(ToggleChartRenderVisible), cx);
-            }),
-    );
-
-    // Gear: enabled only for footprint kinds (Candlestick has no params).
-    // Dispatches `OpenChartRenderSettings`; the workspace handler resolves
-    // the target chart via `LastFocusedChart` and opens the singleton
-    // floating settings window scoped to whichever render kind is active.
-    let gear_btn = Button::new("chip-render-gear")
-        .label(SharedString::from("\u{2699}")) // ⚙
-        .xsmall()
-        .ghost();
-    chip = if has_settings {
-        chip.child(gear_btn.on_click(|_ev, window, cx| {
-            window.dispatch_action(Box::new(OpenChartRenderSettings), cx);
-        }))
-    } else {
-        chip.child(gear_btn.disabled(true))
-    };
-
-    // Trash: visually present but disabled — per locked design the render
-    // is always required; only the header dropdown switches kinds. Rendered
-    // dimmer than the active glyphs so it reads as "informational only".
-    let trash = div()
-        .px_1()
-        .text_color(disabled_color)
-        .child(SharedString::from("\u{00d7}")); // ×
-    chip = chip.child(trash);
-
-    chip.into_any_element()
+        .hover(move |this| this.bg(hover_bg).border_color(border_color))
+        .child(div().child(label))
+        .child(slot)
+        .into_any_element()
 }
 
 /// OHLC + volume/delta readout embedded inside the render chip (it used to
@@ -681,35 +747,10 @@ pub fn render(
             menu
         });
 
-    // Orderbook-heatmap toggle. Independent boolean overlay, orthogonal to the
-    // render-kind selector — paints resting book liquidity behind whatever the
-    // main render is. First enable opens the book subscription + 1s sampler
-    // lazily (see `ContentPanel::toggle_chart_heatmap`). Right-click opens its
-    // settings (bucket / colour reference / opacity).
-    let heatmap_on = state.heatmap_enabled();
-    let heatmap_btn = {
-        let btn = Button::new("chart-heatmap-toggle")
-            .label(SharedString::from("Heatmap"))
-            .small()
-            .on_click(cx.listener(|this, _ev, window, cx| {
-                this.toggle_chart_heatmap(window, cx);
-            }));
-        if heatmap_on { btn.primary() } else { btn.ghost() }
-    };
-    // Gear opens the heatmap settings floating window — only meaningful (and
-    // only shown) while the overlay is on.
-    let heatmap_gear = heatmap_on.then(|| {
-        Button::new("chart-heatmap-settings")
-            .label(SharedString::from("\u{2699}")) // ⚙
-            .small()
-            .ghost()
-            .on_click(move |_ev, window, cx| {
-                window.dispatch_action(
-                    Box::new(super::heatmap_settings::OpenHeatmapSettings),
-                    cx,
-                );
-            })
-    });
+    // The orderbook heatmap is now a singleton overlay indicator (`ob_heatmap`):
+    // added from the "+ Indicator" picker, toggled/removed via its chip, and
+    // configured from the standard indicator settings panel — no header button.
+    // Its texture still paints behind the candles (see `paint_heatmap_rect`).
 
     // Snapshot the candle slice the paint pass needs. Cloning is fine — at
     // default `view_size = 60` we copy ~60 `Candle`s once per render, the
@@ -2837,8 +2878,6 @@ pub fn render(
                 .child(timeframe_btn)
                 .child(render_btn)
                 .child(volume_unit_btn)
-                .child(heatmap_btn)
-                .children(heatmap_gear)
                 // `+ Indicator` button — dispatches `OpenIndicatorPicker`
                 // which the workspace resolves to this chart via the
                 // `LastFocusedChart` global (already kept fresh by the
