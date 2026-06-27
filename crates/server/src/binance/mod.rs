@@ -27,6 +27,10 @@ pub const AGGTRADES_PAGE_LIMIT: u32 = 1000;
 /// limit). Only the last 30 days are available regardless of `startTime`.
 pub const OPEN_INTEREST_HIST_PAGE_LIMIT: u32 = 500;
 
+/// Max rows per `/fapi/v1/fundingRate` REST page (Binance hard limit). Settled
+/// funding is one row per 8h, so a single page already spans ~330 days.
+pub const FUNDING_RATE_PAGE_LIMIT: u32 = 1000;
+
 /// Bundle of typed broadcast senders threaded into the ingest path. The
 /// connection loop fans inbound events (kline, aggTrade, depth) into the
 /// right channel so each consumer task — DB writers, sub-second aggregator,
@@ -38,4 +42,5 @@ pub struct BroadcastTxs {
     pub depth: tokio::sync::broadcast::Sender<parse::DepthDiff>,
     pub liquidation: tokio::sync::broadcast::Sender<parse::LiquidationTick>,
     pub open_interest: tokio::sync::broadcast::Sender<parse::OpenInterestTick>,
+    pub mark_price: tokio::sync::broadcast::Sender<parse::MarkPriceTick>,
 }

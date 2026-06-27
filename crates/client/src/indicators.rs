@@ -10,6 +10,7 @@
 
 pub mod bar_stat;
 pub mod bb;
+pub mod funding;
 pub mod instance;
 pub mod kind;
 pub mod liq_bars;
@@ -23,6 +24,7 @@ pub mod vrvp;
 
 pub use bar_stat::{BarStatGrade, BarStatParams};
 pub use bb::BbParams;
+pub use funding::{FundingParams, FundingRenderMode};
 pub use liq_bars::{LiqBarsScale, LiquidationBarsParams};
 pub use open_interest::{OiRenderMode, OpenInterestParams};
 pub use instance::{
@@ -122,6 +124,13 @@ pub fn kind_entries() -> Vec<KindEntry> {
             category: Category::Volume,
             spawn: || Box::new(OpenInterestParams::default()),
         },
+        KindEntry {
+            kind_id: "funding",
+            name: "Funding".into(),
+            description: "Perpetual funding rate as a signed histogram (or line); positive = longs pay, shown in percent".into(),
+            category: Category::Volume,
+            spawn: || Box::new(FundingParams::default()),
+        },
     ]
 }
 
@@ -153,6 +162,9 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "open_interest" => serde_json::from_value::<OpenInterestParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "funding" => serde_json::from_value::<FundingParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy

@@ -24,9 +24,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::binance::{
-    AGGTRADES_PAGE_LIMIT, BroadcastTxs, KLINES_PAGE_LIMIT, OPEN_INTEREST_HIST_PAGE_LIMIT,
+    AGGTRADES_PAGE_LIMIT, BroadcastTxs, FUNDING_RATE_PAGE_LIMIT, KLINES_PAGE_LIMIT,
+    OPEN_INTEREST_HIST_PAGE_LIMIT,
     book::Book,
-    parse::{KlineRow, OpenInterestRow, OpenInterestTick, Tick, TradeRow, TradeTick},
+    parse::{
+        KlineRow, MarkPriceRow, MarkPriceTick, OpenInterestRow, OpenInterestTick, Tick, TradeRow,
+        TradeTick,
+    },
     rest::RestClient,
     ws,
 };
@@ -84,6 +88,11 @@ pub const LIQUIDATION_BROADCAST_CAPACITY: usize = 256;
 /// sample per [`OPEN_INTEREST_POLL_INTERVAL`] (5s), so 64 slots is ~5 minutes
 /// of buffering — tiny, like liquidations, because the source rate is glacial.
 pub const OPEN_INTEREST_BROADCAST_CAPACITY: usize = 64;
+
+/// Capacity of the mark-price broadcast channel. The `@markPrice@1s` stream
+/// emits ~1 sample/sec, so 64 slots is ~1 minute of buffering — tiny, like OI,
+/// because the source rate is glacial vs trade/kline channels.
+pub const MARK_PRICE_BROADCAST_CAPACITY: usize = 64;
 
 /// Min/max wait between Binance WS reconnect attempts.
 const RECONNECT_MIN: StdDuration = StdDuration::from_secs(1);
@@ -659,6 +668,260 @@ async fn flush_open_interest_buffer(
         let count = rows.len();
         if let Err(e) = db::upsert_open_interest(pool, &symbol, &rows).await {
             warn!(symbol, count, error = ?e, "open interest upsert failed");
+        }
+    }
+}
+
+// --- Mark price + funding ingest + backfill + writer ------------------------
+
+/// Flush cadence for the mark-price writer's row buffer. Samples arrive at
+/// ~1/sec (the `@markPrice@1s` cadence), so 1s batching keeps writes to one
+/// tiny upsert per second.
+const MARK_PRICE_WRITER_FLUSH: StdDuration = StdDuration::from_secs(1);
+
+/// Binance interval for mark-price cold-start backfill. 1m is the finest
+/// `markPriceKlines` grain that keeps a multi-day backfill to a handful of
+/// pages; sub-1m chart TFs read sparse historical mark price (OI USD falls back
+/// to the candle close there) and fill finely from the live stream forward.
+const MARK_PRICE_BACKFILL_INTERVAL: &str = "1m";
+
+/// Pause between paginated mark-price / funding backfill calls — polite against
+/// the REST budget without noticeably delaying boot.
+const MARK_PRICE_BACKFILL_PAGE_DELAY: StdDuration = StdDuration::from_millis(200);
+
+/// How far back to seed settled funding on a fresh table. Capped at the
+/// hypertable retention (14d) — older rows would be evicted immediately, so
+/// fetching them is wasted work.
+const FUNDING_BACKFILL_MAX_AGE: ChronoDuration = ChronoDuration::days(14);
+
+/// Cadence of the settled-funding refresh loop. Re-pulls `fundingRate` so new
+/// 8h settlements land without waiting for a server restart. One weight-1 call.
+const FUNDING_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(3600);
+
+/// Drive the mark-price feed forever: cold-start backfill (mark-price klines +
+/// settled funding), then two concurrent infinite loops — the `@markPrice@1s`
+/// WS connection (its own reconnect/backoff, mirroring the depth loop) and a
+/// slow funding-history refresh. There is no live gap-heal for mark price (we
+/// don't reconstruct the missed sub-second tail; the per-bar `time_bucket`
+/// query tolerates gaps), but settled funding re-backfills hourly so the 8h
+/// points stay current between restarts.
+pub async fn run_mark_price_ingest(
+    pool: PgPool,
+    rest: RestClient,
+    txs: BroadcastTxs,
+    symbol: String,
+    cold_start: ChronoDuration,
+) {
+    info!(symbol = %symbol, "mark price ingest task started");
+
+    // Cold-start / gap-heal. Non-fatal — the live WS fills forward regardless.
+    if let Err(e) = backfill_mark_price(&pool, &rest, &symbol, cold_start).await {
+        warn!(error = ?e, "mark price backfill failed; continuing with live stream only");
+    }
+    if let Err(e) = backfill_funding_rate(&pool, &rest, &symbol).await {
+        warn!(error = ?e, "funding rate backfill failed; continuing without settled history");
+    }
+
+    let ws_loop = run_mark_price_ws_loop(txs, symbol.clone());
+    let funding_loop = run_funding_refresh_loop(pool, rest, symbol);
+    let (_, _) = tokio::join!(ws_loop, funding_loop);
+}
+
+/// Connect to the mark-price combined-stream → stream → backoff. No REST
+/// gap-heal on reconnect: a missed sub-second tail isn't reconstructed, and the
+/// boot backfill already seeded historical bars.
+async fn run_mark_price_ws_loop(txs: BroadcastTxs, symbol: String) {
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        let url = ws::mark_price_combined_url(&symbol);
+        match ws::connect_and_stream("mark_price", &url, &txs).await {
+            Ok(()) => {
+                info!("binance mark price ws closed cleanly; reconnecting");
+                backoff = RECONNECT_MIN;
+            }
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "binance mark price ws error; reconnecting after backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX);
+            }
+        }
+    }
+}
+
+/// Re-pull settled funding history on a slow timer so newly-settled 8h points
+/// land without a restart. The boot backfill already ran, so the first tick is
+/// consumed immediately and the first real refresh happens one interval later.
+async fn run_funding_refresh_loop(pool: PgPool, rest: RestClient, symbol: String) {
+    let mut timer = tokio::time::interval(FUNDING_REFRESH_INTERVAL);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer.tick().await; // immediate first tick — boot backfill already covered it
+    loop {
+        timer.tick().await;
+        if let Err(e) = backfill_funding_rate(&pool, &rest, &symbol).await {
+            warn!(error = ?e, "periodic funding rate refresh failed; retrying next interval");
+        }
+    }
+}
+
+/// Catch the `mark_price` table up to "now" via `markPriceKlines`. Resume-aware
+/// against `MAX(ts)` (like the kline backfill): start at the last sample+1ms, or
+/// `cold_start` ago for a fresh table. Pages forward at 1m resolution, storing
+/// each bar's close as a sample (index/settle/funding stay `None` — the kline
+/// endpoint has no such figures). Returns rows upserted.
+pub async fn backfill_mark_price(
+    pool: &PgPool,
+    rest: &RestClient,
+    symbol: &str,
+    cold_start: ChronoDuration,
+) -> Result<usize> {
+    let now = Utc::now();
+    let last = db::max_mark_price_ts(pool, symbol)
+        .await
+        .context("query MAX(mark_price.ts)")?;
+    let mut cursor_ms = match last {
+        Some(t) => t.timestamp_millis() + 1,
+        None => (now - cold_start).timestamp_millis(),
+    };
+    let now_ms = now.timestamp_millis();
+    let mut total = 0usize;
+
+    loop {
+        if cursor_ms >= now_ms {
+            break;
+        }
+        let rows = rest
+            .mark_price_klines(symbol, MARK_PRICE_BACKFILL_INTERVAL, cursor_ms, KLINES_PAGE_LIMIT)
+            .await
+            .with_context(|| format!("markPriceKlines page for {symbol} from {cursor_ms}"))?;
+        if rows.is_empty() {
+            break;
+        }
+        let page_size = rows.len();
+        let last_ts_ms = rows.last().map(|r| r.ts.timestamp_millis()).unwrap_or(cursor_ms);
+
+        db::upsert_mark_price(pool, symbol, &rows)
+            .await
+            .with_context(|| format!("upsert mark price for {symbol}"))?;
+
+        total += page_size;
+        cursor_ms = last_ts_ms + 1;
+
+        if (page_size as u32) < KLINES_PAGE_LIMIT {
+            break;
+        }
+        tokio::time::sleep(MARK_PRICE_BACKFILL_PAGE_DELAY).await;
+    }
+
+    if total > 0 {
+        info!(symbol, rows = total, "mark price backfill complete");
+    }
+    Ok(total)
+}
+
+/// Catch the `funding_rate` table up to "now" via `fundingRate`. Resume-aware
+/// against `MAX(ts)`, clamped to the retention window for a fresh table. Settled
+/// funding is one row per 8h, so this is a couple of pages at most. Returns rows
+/// upserted.
+pub async fn backfill_funding_rate(
+    pool: &PgPool,
+    rest: &RestClient,
+    symbol: &str,
+) -> Result<usize> {
+    let now = Utc::now();
+    let last = db::max_funding_rate_ts(pool, symbol)
+        .await
+        .context("query MAX(funding_rate.ts)")?;
+    let earliest_ms = (now - FUNDING_BACKFILL_MAX_AGE).timestamp_millis();
+    let mut cursor_ms = match last {
+        Some(t) => (t.timestamp_millis() + 1).max(earliest_ms),
+        None => earliest_ms,
+    };
+    let now_ms = now.timestamp_millis();
+    let mut total = 0usize;
+
+    loop {
+        if cursor_ms >= now_ms {
+            break;
+        }
+        let rows = rest
+            .funding_rate_hist(symbol, cursor_ms, FUNDING_RATE_PAGE_LIMIT)
+            .await
+            .with_context(|| format!("fundingRate page for {symbol} from {cursor_ms}"))?;
+        if rows.is_empty() {
+            break;
+        }
+        let page_size = rows.len();
+        let last_ts_ms = rows.last().map(|r| r.ts.timestamp_millis()).unwrap_or(cursor_ms);
+
+        db::upsert_funding_rate(pool, symbol, &rows)
+            .await
+            .with_context(|| format!("upsert funding rate for {symbol}"))?;
+
+        total += page_size;
+        cursor_ms = last_ts_ms + 1;
+
+        if (page_size as u32) < FUNDING_RATE_PAGE_LIMIT {
+            break;
+        }
+        tokio::time::sleep(MARK_PRICE_BACKFILL_PAGE_DELAY).await;
+    }
+
+    if total > 0 {
+        info!(symbol, rows = total, "funding rate backfill complete");
+    }
+    Ok(total)
+}
+
+/// Drain the mark-price broadcast, buffer per-symbol, bulk-UPSERT every
+/// [`MARK_PRICE_WRITER_FLUSH`]. Mirrors [`run_open_interest_writer`].
+pub async fn run_mark_price_writer(
+    pool: PgPool,
+    mut rx: broadcast::Receiver<MarkPriceTick>,
+) -> Result<()> {
+    info!("mark price writer task started");
+    let mut buffer: HashMap<String, Vec<MarkPriceRow>> = HashMap::new();
+    let mut flush_timer = tokio::time::interval(MARK_PRICE_WRITER_FLUSH);
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        buffer.entry(tick.symbol).or_default().push(tick.mark);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "mark price writer lagged behind broadcast");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("mark price broadcast closed; flushing and exiting");
+                        flush_mark_price_buffer(&pool, &mut buffer).await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ = flush_timer.tick() => {
+                flush_mark_price_buffer(&pool, &mut buffer).await;
+            }
+        }
+    }
+}
+
+async fn flush_mark_price_buffer(
+    pool: &PgPool,
+    buffer: &mut HashMap<String, Vec<MarkPriceRow>>,
+) {
+    for (symbol, rows) in buffer.drain() {
+        if rows.is_empty() {
+            continue;
+        }
+        let count = rows.len();
+        if let Err(e) = db::upsert_mark_price(pool, &symbol, &rows).await {
+            warn!(symbol, count, error = ?e, "mark price upsert failed");
         }
     }
 }

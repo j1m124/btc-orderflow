@@ -43,7 +43,7 @@ use tracing::{debug, info, warn};
 
 use super::GatewayState;
 use crate::binance::parse::{
-    DepthDiff, KlineRow, LiquidationTick, OpenInterestTick, Tick, TradeTick,
+    DepthDiff, KlineRow, LiquidationTick, MarkPriceTick, OpenInterestTick, Tick, TradeTick,
 };
 use crate::ingest::{BOOK_BAND_USD, BookState};
 use crate::db;
@@ -72,6 +72,10 @@ const LIQ_BARS_SNAPSHOT_BARS: i64 = FOOTPRINT_SNAPSHOT_BARS;
 /// Number of recent bars in an open-interest snapshot. Same depth as the
 /// other per-tf bar aggregations driving indicator paint.
 const OI_SNAPSHOT_BARS: i64 = FOOTPRINT_SNAPSHOT_BARS;
+
+/// Number of recent bars in a mark-price snapshot. Same depth as the other
+/// per-tf bar aggregations driving indicator paint.
+const MARK_PRICE_SNAPSHOT_BARS: i64 = FOOTPRINT_SNAPSHOT_BARS;
 
 /// Server-side batching window for live trade / book / footprint / liquidation
 /// frames.
@@ -110,6 +114,7 @@ enum SubChannel {
     Liquidations,
     LiquidationBars { tf: Timeframe },
     OpenInterest { tf: Timeframe },
+    MarkPrice { tf: Timeframe },
 }
 
 impl Drop for SubMeta {
@@ -334,6 +339,23 @@ async fn handle_text(
                     );
                     (SubChannel::OpenInterest { tf }, h)
                 }
+                Channel::MarkPrice { tf } => {
+                    let rx = state.mark_price_tx.subscribe();
+                    let h = spawn_forwarder(
+                        id,
+                        write_tx.clone(),
+                        "mark_price forwarder",
+                        run_mark_price_subscription(
+                            id,
+                            symbol.clone(),
+                            tf,
+                            rx,
+                            state.pool.clone(),
+                            write_tx.clone(),
+                        ),
+                    );
+                    (SubChannel::MarkPrice { tf }, h)
+                }
             };
 
             subs.insert(
@@ -484,6 +506,12 @@ async fn history_page(
                 db::fetch_open_interest_history_page(&pool, &symbol, tf, before_ms, capped)
                     .await?;
             send_frame(write_tx, &ServerFrame::OpenInterestHistoryPage { id, bars }).await;
+        }
+        SubChannel::MarkPrice { tf } => {
+            let capped = count.min(HISTORY_PAGE_CAP as i64);
+            let bars =
+                db::fetch_mark_price_history_page(&pool, &symbol, tf, before_ms, capped).await?;
+            send_frame(write_tx, &ServerFrame::MarkPriceHistoryPage { id, bars }).await;
         }
     }
     Ok(())
@@ -1393,6 +1421,135 @@ async fn run_open_interest_subscription(
                 }
                 server_v += 1;
                 let frame = ServerFrame::OpenInterestUpdate {
+                    id,
+                    bars,
+                    v: server_v,
+                };
+                if write_tx.send(message_from_frame(&frame)).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn run_mark_price_subscription(
+    id: SubId,
+    symbol: String,
+    tf: Timeframe,
+    mut rx: broadcast::Receiver<MarkPriceTick>,
+    pool: PgPool,
+    write_tx: mpsc::Sender<Message>,
+) -> anyhow::Result<()> {
+    let snapshot =
+        db::fetch_mark_price_snapshot(&pool, &symbol, tf, MARK_PRICE_SNAPSHOT_BARS).await?;
+    let snapshot_tail_open_time = snapshot.iter().map(|b| b.open_time).max();
+    let bar_ms = tf.duration_ms();
+
+    // Per-bar OHLC state. Seed the snapshot tail bar so the first live sample
+    // folds onto its existing open/high/low rather than resetting.
+    let mut bar_ohlc: HashMap<i64, protocol::MarkPriceBar> = HashMap::new();
+    if let Some(tail) = snapshot_tail_open_time {
+        if let Some(tail_bar) = snapshot.iter().find(|b| b.open_time == tail) {
+            bar_ohlc.insert(tail, tail_bar.clone());
+        }
+    }
+
+    debug!(
+        ?id,
+        tf = tf.as_str(),
+        bars = snapshot.len(),
+        "sending mark price snapshot"
+    );
+    let mut server_v: u64 = 0;
+    send_frame(
+        &write_tx,
+        &ServerFrame::MarkPriceSnapshot {
+            id,
+            bars: snapshot,
+            server_v,
+        },
+    )
+    .await;
+
+    let mut touched: HashSet<i64> = HashSet::new();
+    let mut current_bar_open: Option<i64> = snapshot_tail_open_time;
+    let mut batch_timer = tokio::time::interval(LIVE_BATCH_INTERVAL);
+    batch_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    batch_timer.tick().await;
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(tick) => {
+                        if tick.symbol != symbol {
+                            continue;
+                        }
+                        let ts_ms = tick.mark.ts.timestamp_millis();
+                        let bar_open = (ts_ms / bar_ms) * bar_ms;
+                        // Skip strictly-older bars (closed + final in snapshot).
+                        if let Some(tail) = snapshot_tail_open_time {
+                            if bar_open < tail {
+                                continue;
+                            }
+                        }
+                        if let Some(prev) = current_bar_open {
+                            if bar_open > prev {
+                                bar_ohlc.retain(|k, _| *k >= prev);
+                            }
+                        }
+                        current_bar_open = Some(bar_open);
+
+                        let mark = tick.mark.mark_price;
+                        // Live funding is the predicted rate carried on the
+                        // sample; settled history is merged in only on the
+                        // snapshot/history queries.
+                        let funding = tick.mark.funding_rate;
+                        bar_ohlc
+                            .entry(bar_open)
+                            .and_modify(|b| {
+                                b.high = b.high.max(mark);
+                                b.low = b.low.min(mark);
+                                b.close = mark;
+                                if funding.is_some() {
+                                    b.funding_rate = funding;
+                                }
+                            })
+                            .or_insert(protocol::MarkPriceBar {
+                                open_time: bar_open,
+                                open: mark,
+                                high: mark,
+                                low: mark,
+                                close: mark,
+                                funding_rate: funding,
+                            });
+                        touched.insert(bar_open);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(?id, skipped = n, "mark price sub lagged; sending resnap");
+                        send_frame(&write_tx, &ServerFrame::Resnap { id }).await;
+                        return Ok(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!(?id, "mark price broadcast closed; sub exiting");
+                        return Ok(());
+                    }
+                }
+            }
+            _ = batch_timer.tick() => {
+                if touched.is_empty() {
+                    continue;
+                }
+                let bars: Vec<protocol::MarkPriceBar> = touched
+                    .drain()
+                    .filter_map(|k| bar_ohlc.get(&k).cloned())
+                    .collect();
+                if bars.is_empty() {
+                    continue;
+                }
+                server_v += 1;
+                let frame = ServerFrame::MarkPriceUpdate {
                     id,
                     bars,
                     v: server_v,

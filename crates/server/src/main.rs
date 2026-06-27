@@ -64,6 +64,10 @@ async fn main() -> Result<()> {
         broadcast::channel::<binance::parse::OpenInterestTick>(
             ingest::OPEN_INTEREST_BROADCAST_CAPACITY,
         );
+    let (mark_price_tx, _mark_price_bootstrap_rx) =
+        broadcast::channel::<binance::parse::MarkPriceTick>(
+            ingest::MARK_PRICE_BROADCAST_CAPACITY,
+        );
 
     // Shared live book state. Maintainer writes; gateway readers borrow
     // briefly to populate initial BookSnapshot frames.
@@ -108,6 +112,15 @@ async fn main() -> Result<()> {
             }
         })
     };
+    let mark_price_writer = {
+        let rx = mark_price_tx.subscribe();
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ingest::run_mark_price_writer(pool, rx).await {
+                warn!(error = ?e, "mark price writer task exited with error");
+            }
+        })
+    };
 
     // Sub-second aggregator: subscribes to trades, emits synthesized S1/S5
     // bars on the kline broadcast so the gateway treats live sub-second
@@ -140,6 +153,7 @@ async fn main() -> Result<()> {
             depth: depth_tx.clone(),
             liquidation: liquidation_tx.clone(),
             open_interest: open_interest_tx.clone(),
+            mark_price: mark_price_tx.clone(),
         };
         let book_state = book_state.clone();
         tokio::spawn(async move {
@@ -164,6 +178,7 @@ async fn main() -> Result<()> {
     drop(_depth_bootstrap_rx);
     drop(_liquidation_bootstrap_rx);
     drop(_open_interest_bootstrap_rx);
+    drop(_mark_price_bootstrap_rx);
 
     let ingest_handle = {
         let pool = pool.clone();
@@ -174,6 +189,7 @@ async fn main() -> Result<()> {
             depth: depth_tx.clone(),
             liquidation: liquidation_tx.clone(),
             open_interest: open_interest_tx.clone(),
+            mark_price: mark_price_tx.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = ingest::run_binance_ingest(
@@ -201,9 +217,36 @@ async fn main() -> Result<()> {
             depth: depth_tx.clone(),
             liquidation: liquidation_tx.clone(),
             open_interest: open_interest_tx.clone(),
+            mark_price: mark_price_tx.clone(),
         };
         tokio::spawn(async move {
             ingest::run_open_interest_poller(
+                pool,
+                rest,
+                txs,
+                SYMBOL.to_string(),
+                ChronoDuration::days(COLD_START_DAYS),
+            )
+            .await;
+        })
+    };
+
+    // Mark-price ingest: own `@markPrice@1s` WS connection (mark price + live
+    // predicted funding) + settled-funding backfill/refresh. Feeds accurate USD
+    // OI notional and the funding indicator.
+    let mark_price_handle = {
+        let pool = pool.clone();
+        let rest = binance::rest::RestClient::default();
+        let txs = BroadcastTxs {
+            kline: kline_tx.clone(),
+            trade: trade_tx.clone(),
+            depth: depth_tx.clone(),
+            liquidation: liquidation_tx.clone(),
+            open_interest: open_interest_tx.clone(),
+            mark_price: mark_price_tx.clone(),
+        };
+        tokio::spawn(async move {
+            ingest::run_mark_price_ingest(
                 pool,
                 rest,
                 txs,
@@ -241,6 +284,7 @@ async fn main() -> Result<()> {
         depth_tx: depth_tx.clone(),
         liquidation_tx: liquidation_tx.clone(),
         open_interest_tx: open_interest_tx.clone(),
+        mark_price_tx: mark_price_tx.clone(),
         book_state: book_state.clone(),
         allowed_origins,
     };
@@ -257,10 +301,12 @@ async fn main() -> Result<()> {
 
     info!("shutdown requested");
     gateway_handle.abort();
+    mark_price_handle.abort();
     open_interest_handle.abort();
     ingest_handle.abort();
     book_maintainer.abort();
     subsec_aggregator.abort();
+    mark_price_writer.abort();
     open_interest_writer.abort();
     liquidation_writer.abort();
     trade_writer.abort();

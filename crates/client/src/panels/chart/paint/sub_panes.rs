@@ -247,30 +247,42 @@ pub fn paint_sub_pane(
             );
         }
         IndicatorOutput::Histogram { values, up } => {
-            // Volume-as-pane: full-pane histogram anchored at zero. Fully
-            // opaque in pane mode — there are no candles to share the band
-            // with, so transparency would only wash the bars out.
+            // Full-pane histogram anchored at zero. Fully opaque in pane mode —
+            // there are no candles to share the band with, so transparency would
+            // only wash the bars out. Signed-capable: positive bars draw upward
+            // from zero, negative bars downward (funding). For volume (y_lo == 0)
+            // every bar is positive, so this matches the prior upward-only draw.
             let up_color = Hsla { a: 1.0, ..bullish };
             let down_color = Hsla { a: 1.0, ..bearish };
             let zero_y = band_y(y_lo, y_hi, 0.0, chart_top, chart_bottom);
             for i in start_idx..visible_end.min(values.len()) {
                 let Some(v) = values[i] else { continue };
-                if v <= 0.0 {
+                if v == 0.0 {
                     continue;
                 }
                 let cx_px = index_to_screen(view_start, view_size, i as f32, canvas_w, y_axis_gap);
                 if cx_px < -bar_w || cx_px > chart_w + bar_w {
                     continue;
                 }
-                let y_top = band_y(y_lo, y_hi, v, chart_top, chart_bottom);
-                let h = (zero_y - y_top).max(1.0);
+                let y_val = band_y(y_lo, y_hi, v, chart_top, chart_bottom);
+                let (top, h) = if y_val <= zero_y {
+                    (y_val, (zero_y - y_val).max(1.0))
+                } else {
+                    (zero_y, (y_val - zero_y).max(1.0))
+                };
                 let bar_x = cx_px - bar_w * 0.5;
-                let color = if up.get(i).copied().unwrap_or(true) {
+                let color = if up.get(i).copied().unwrap_or(v >= 0.0) {
                     up_color
                 } else {
                     down_color
                 };
-                fill_rect(window, origin, bar_x, bar_w, y_top, h, color);
+                fill_rect(window, origin, bar_x, bar_w, top, h, color);
+            }
+            // Zero baseline only when the range straddles zero (e.g. funding).
+            // For volume (y_lo == 0) the baseline is the bottom edge; skip it to
+            // keep the look identical.
+            if y_lo < 0.0 {
+                fill_rect(window, origin, 0.0, chart_w, zero_y, 1.0, grid);
             }
         }
         IndicatorOutput::Macd {

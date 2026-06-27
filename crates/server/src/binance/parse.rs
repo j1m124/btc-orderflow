@@ -96,6 +96,7 @@ pub enum InboundEvent {
     AggTrade(TradeTick),
     Depth(DepthDiff),
     Liquidation(LiquidationTick),
+    MarkPrice(MarkPriceTick),
 }
 
 // --- Liquidation event ------------------------------------------------------
@@ -174,6 +175,39 @@ pub struct OpenInterestRow {
 pub struct OpenInterestTick {
     pub symbol: String,
     pub oi: OpenInterestRow,
+}
+
+// --- Mark price sample ------------------------------------------------------
+
+/// One mark-price sample: the symbol's fair-price mark plus index / estimated-
+/// settle prices and the live *predicted* funding rate, at instant `ts`.
+/// Sourced from the `<symbol>@markPrice@1s` WS stream (all fields populated)
+/// and from `/fapi/v1/markPriceKlines` cold-start backfill (only `mark_price`;
+/// the rest `None`, since the kline endpoint carries no index / settle /
+/// funding figures).
+#[derive(Clone, Debug)]
+pub struct MarkPriceRow {
+    pub ts: DateTime<Utc>,
+    pub mark_price: f64,
+    pub index_price: Option<f64>,
+    pub est_settle_price: Option<f64>,
+    pub funding_rate: Option<f64>,
+}
+
+/// A mark-price sample traveling on the internal broadcast. Mirrors
+/// [`OpenInterestTick`] in shape.
+#[derive(Clone, Debug)]
+pub struct MarkPriceTick {
+    pub symbol: String,
+    pub mark: MarkPriceRow,
+}
+
+/// One settled funding row from `/fapi/v1/fundingRate`. `ts` is the settlement
+/// time (Binance `fundingTime`); `rate` is the realized 8h funding rate.
+#[derive(Clone, Debug)]
+pub struct FundingRateRow {
+    pub ts: DateTime<Utc>,
+    pub rate: f64,
 }
 
 // --- Depth diff event -------------------------------------------------------
@@ -372,6 +406,31 @@ struct ForceOrderInner {
     ts_ms: i64,
 }
 
+/// `data` shape for `<symbol>@markPrice` WS events. Binance ships decimal
+/// strings for the price/rate fields and ms ints for the timestamps. Only the
+/// fields we persist are decoded.
+#[derive(Debug, Deserialize)]
+struct MarkPriceEventRaw {
+    #[serde(rename = "e")]
+    event: String,
+    #[serde(rename = "E")]
+    event_time_ms: i64,
+    #[serde(rename = "s")]
+    symbol: String,
+    /// Mark price.
+    #[serde(rename = "p")]
+    mark_price: String,
+    /// Index price.
+    #[serde(rename = "i")]
+    index_price: String,
+    /// Estimated settle price (only meaningful in the last hour pre-settlement).
+    #[serde(rename = "P")]
+    est_settle_price: String,
+    /// Predicted funding rate for the next settlement.
+    #[serde(rename = "r")]
+    funding_rate: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct KlineInner {
     #[serde(rename = "t")]
@@ -427,8 +486,27 @@ impl CombinedStreamMsg {
             "aggTrade" => Ok(self.parse_agg_trade_event()?.map(InboundEvent::AggTrade)),
             "depthUpdate" => Ok(self.parse_depth_event()?.map(InboundEvent::Depth)),
             "forceOrder" => Ok(self.parse_force_order_event()?.map(InboundEvent::Liquidation)),
+            "markPriceUpdate" => Ok(self.parse_mark_price_event()?.map(InboundEvent::MarkPrice)),
             _ => Ok(None),
         }
+    }
+
+    fn parse_mark_price_event(&self) -> Result<Option<MarkPriceTick>> {
+        let raw: MarkPriceEventRaw =
+            serde_json::from_value(self.data.clone()).context("decode markPrice payload")?;
+        if raw.event != "markPriceUpdate" {
+            return Ok(None);
+        }
+        Ok(Some(MarkPriceTick {
+            symbol: raw.symbol,
+            mark: MarkPriceRow {
+                ts: ms_to_utc(raw.event_time_ms),
+                mark_price: parse_decimal_str(&raw.mark_price, "markPrice.p")?,
+                index_price: Some(parse_decimal_str(&raw.index_price, "markPrice.i")?),
+                est_settle_price: Some(parse_decimal_str(&raw.est_settle_price, "markPrice.P")?),
+                funding_rate: Some(parse_decimal_str(&raw.funding_rate, "markPrice.r")?),
+            },
+        }))
     }
 
     fn parse_force_order_event(&self) -> Result<Option<LiquidationTick>> {
@@ -796,6 +874,35 @@ mod tests {
         });
         let env: CombinedStreamMsg = serde_json::from_value(raw).unwrap();
         assert!(env.parse_event().is_err());
+    }
+
+    #[test]
+    fn parses_a_combined_stream_mark_price() {
+        let raw = serde_json::json!({
+            "stream": "btcusdt@markPrice@1s",
+            "data": {
+                "e": "markPriceUpdate",
+                "E": 1562305380000_i64,
+                "s": "BTCUSDT",
+                "p": "11794.15000000",
+                "i": "11784.62659091",
+                "P": "11784.25641265",
+                "r": "0.00038167",
+                "T": 1562306400000_i64
+            }
+        });
+        let env: CombinedStreamMsg = serde_json::from_value(raw).unwrap();
+        let evt = env.parse_event().unwrap().expect("mark price decoded");
+        match evt {
+            InboundEvent::MarkPrice(tick) => {
+                assert_eq!(tick.symbol, "BTCUSDT");
+                assert!((tick.mark.mark_price - 11794.15).abs() < 1e-6);
+                assert!((tick.mark.index_price.unwrap() - 11784.62659091).abs() < 1e-6);
+                assert!((tick.mark.funding_rate.unwrap() - 0.00038167).abs() < 1e-9);
+                assert_eq!(tick.mark.ts.timestamp_millis(), 1562305380000);
+            }
+            _ => panic!("expected MarkPrice variant"),
+        }
     }
 
     #[test]

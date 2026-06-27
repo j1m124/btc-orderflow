@@ -224,6 +224,11 @@ pub struct ChartState {
     /// Empty when no `open_interest` indicator (and no bar_stat OI-Δ row) is
     /// live — the sub stays unallocated and the cache never grows.
     pub(super) open_interest_cache: Vec<crate::services::market_data::OpenInterestBar>,
+    /// Per-bar mark-price OHLC + funding for this chart's `(symbol, tf)`, sorted
+    /// oldest-first. Refilled by ContentPanel from `MarketDataService::
+    /// mark_price_bars` on every `MarkPriceEvent` for the active tf. Empty when
+    /// no consumer (OI indicator, bar_stat OI-Δ row, funding indicator) is live.
+    pub(super) mark_price_cache: Vec<crate::services::market_data::MarkPriceBar>,
     /// View-time-range snapshot captured at the last
     /// [`Self::recompute_indicators`] call. Drives the cheap dirty-check in
     /// [`Self::maybe_recompute_view_dependent_indicators`] — pan/zoom that
@@ -483,6 +488,7 @@ impl ChartState {
         view_time_range: Option<(i64, i64)>,
         liquidation_bars: Option<&'a [crate::services::market_data::LiquidationBar]>,
         open_interest: Option<&'a [crate::services::market_data::OpenInterestBar]>,
+        mark_price: Option<&'a [crate::services::market_data::MarkPriceBar]>,
     ) -> ComputeCtx<'a> {
         ComputeCtx {
             volume_unit,
@@ -492,6 +498,7 @@ impl ChartState {
             view_time_range,
             liquidation_bars,
             open_interest,
+            mark_price,
         }
     }
 
@@ -592,6 +599,26 @@ impl ChartState {
     /// visible view extends past loaded coverage.
     pub fn oldest_open_interest_time(&self) -> Option<i64> {
         self.open_interest_cache.first().map(|b| b.open_time)
+    }
+
+    /// Replace the per-bar mark-price cache wholesale. Caller passes a vector
+    /// already sorted ascending by `open_time`. Called whenever the service
+    /// emits a `MarkPriceEvent` for the chart's `(symbol, tf)`.
+    pub fn set_mark_price_cache(
+        &mut self,
+        bars: Vec<crate::services::market_data::MarkPriceBar>,
+    ) {
+        self.mark_price_cache = bars;
+    }
+
+    pub fn clear_mark_price_cache(&mut self) {
+        self.mark_price_cache.clear();
+    }
+
+    /// Oldest `open_time` (ms) in the mark-price cache, if any. Used by
+    /// `ContentPanel::maybe_request_mark_price_history`.
+    pub fn oldest_mark_price_time(&self) -> Option<i64> {
+        self.mark_price_cache.first().map(|b| b.open_time)
     }
 
     /// Read-only slice into the per-bucket footprint cache. `None` when no
@@ -821,12 +848,16 @@ impl ChartState {
         let oi_bars: Option<&[crate::services::market_data::OpenInterestBar]> =
             (!self.open_interest_cache.is_empty())
                 .then(|| self.open_interest_cache.as_slice());
+        let mark_bars: Option<&[crate::services::market_data::MarkPriceBar]> =
+            (!self.mark_price_cache.is_empty())
+                .then(|| self.mark_price_cache.as_slice());
         let ctx = Self::make_compute_ctx(
             self.volume_unit,
             &self.footprint_cache,
             view_range,
             liq_bars,
             oi_bars,
+            mark_bars,
         );
         let output = instance.kind.compute(&self.candles, ctx);
         self.indicators.push(instance);
@@ -877,12 +908,16 @@ impl ChartState {
         let oi_bars: Option<&[crate::services::market_data::OpenInterestBar]> =
             (!self.open_interest_cache.is_empty())
                 .then(|| self.open_interest_cache.as_slice());
+        let mark_bars: Option<&[crate::services::market_data::MarkPriceBar]> =
+            (!self.mark_price_cache.is_empty())
+                .then(|| self.mark_price_cache.as_slice());
         let ctx = Self::make_compute_ctx(
             self.volume_unit,
             &self.footprint_cache,
             view_range,
             liq_bars,
             oi_bars,
+            mark_bars,
         );
         let new_output = self.indicators[idx].kind.compute(&self.candles, ctx);
         self.indicator_outputs[idx] = new_output;
@@ -904,12 +939,16 @@ impl ChartState {
         let oi_bars: Option<&[crate::services::market_data::OpenInterestBar]> =
             (!self.open_interest_cache.is_empty())
                 .then(|| self.open_interest_cache.as_slice());
+        let mark_bars: Option<&[crate::services::market_data::MarkPriceBar]> =
+            (!self.mark_price_cache.is_empty())
+                .then(|| self.mark_price_cache.as_slice());
         let ctx = Self::make_compute_ctx(
             self.volume_unit,
             &self.footprint_cache,
             view_range,
             liq_bars,
             oi_bars,
+            mark_bars,
         );
         let inst = &mut self.indicators[idx];
         inst.kind_id = kind.kind_id();
@@ -1077,12 +1116,16 @@ impl ChartState {
         let oi_bars: Option<&[crate::services::market_data::OpenInterestBar]> =
             (!self.open_interest_cache.is_empty())
                 .then(|| self.open_interest_cache.as_slice());
+        let mark_bars: Option<&[crate::services::market_data::MarkPriceBar]> =
+            (!self.mark_price_cache.is_empty())
+                .then(|| self.mark_price_cache.as_slice());
         let ctx = Self::make_compute_ctx(
             self.volume_unit,
             &self.footprint_cache,
             view_range,
             liq_bars,
             oi_bars,
+            mark_bars,
         );
         for (i, inst) in self.indicators.iter().enumerate() {
             self.indicator_outputs[i] = inst.kind.compute(&self.candles, ctx);
@@ -1184,6 +1227,7 @@ impl ChartState {
             footprint_cache: std::collections::HashMap::new(),
             liquidation_bars_cache: Vec::new(),
             open_interest_cache: Vec::new(),
+            mark_price_cache: Vec::new(),
             last_recomputed_view_range: None,
             volume_unit: VolumeUnit::default(),
             heatmap: super::paint::HeatmapLayer::default(),

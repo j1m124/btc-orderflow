@@ -2,9 +2,9 @@
 //! total open interest. The line is a single color (color slot 0, like the
 //! CVD line); candle mode draws per-bar OHLC tinted by the up/down colors.
 //! The axis unit follows the chart's `VolumeUnit` toggle — Coin shows contracts,
-//! USD shows `OI × candle close` (Binance's live OI endpoint has no USD
-//! figure, so this is an approximation, consistent with the rest of the
-//! chart's USD rendering).
+//! USD shows `OI × mark price` (the canonical reference notional, matching
+//! Binance's `sumOpenInterestValue`), falling back to the candle close for bars
+//! where the mark-price sub hasn't loaded yet.
 //!
 //! Data source: per-bar OHLC cells from the gateway's `OpenInterest { tf }`
 //! subscription, threaded through `ComputeCtx`. The indicator carries no
@@ -18,7 +18,7 @@ use gpui_component::ActiveTheme as _;
 use serde::{Deserialize, Serialize};
 
 use super::instance::InstanceId;
-use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
+use super::kind::{ComputeCtx, IndicatorKind, PaneKind, mark_close_series};
 use super::output::{IndicatorOutput, Series, ValueReadout};
 use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
@@ -86,9 +86,11 @@ impl IndicatorKind for OpenInterestParams {
         let mut high: Series = vec![None; n];
         let mut low: Series = vec![None; n];
         let mut close: Series = vec![None; n];
-        // Per-bar candle close, used to convert contracts → USD at paint time
-        // without re-threading the candle slice into the paint pass.
+        // Per-bar USD conversion factor: the mark price (canonical OI notional),
+        // falling back to the candle close where the mark-price sub hasn't
+        // loaded that bar. Precomputed here so paint stays candle-slice-free.
         let mut price: Series = vec![None; n];
+        let mark_close = mark_close_series(candles, ctx.mark_price);
 
         // Two-pointer join of the sorted OI-bar slice against candle
         // open_times — same shape as `liq_bars.rs::compute`.
@@ -104,7 +106,7 @@ impl IndicatorKind for OpenInterestParams {
                     high[i] = Some(b.high);
                     low[i] = Some(b.low);
                     close[i] = Some(b.close);
-                    price[i] = Some(c.close);
+                    price[i] = Some(mark_close[i].unwrap_or(c.close));
                     j += 1;
                 }
             }

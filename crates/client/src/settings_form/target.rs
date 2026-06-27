@@ -26,6 +26,10 @@ pub struct AfterChange {
     pub refresh_footprint: bool,
     pub refresh_liq_bars: bool,
     pub refresh_oi_bars: bool,
+    /// Whether to reconcile the mark-price sub. The OI-Δ row's USD value reads
+    /// the mark price, so toggling it must (de)allocate the mark-price sub
+    /// alongside the OI sub.
+    pub refresh_mark_price: bool,
 }
 
 impl AfterChange {
@@ -34,6 +38,7 @@ impl AfterChange {
             refresh_footprint: false,
             refresh_liq_bars: false,
             refresh_oi_bars: false,
+            refresh_mark_price: false,
         }
     }
 
@@ -42,6 +47,7 @@ impl AfterChange {
             refresh_footprint: true,
             refresh_liq_bars: false,
             refresh_oi_bars: false,
+            refresh_mark_price: false,
         }
     }
 
@@ -50,6 +56,7 @@ impl AfterChange {
             refresh_footprint: false,
             refresh_liq_bars: true,
             refresh_oi_bars: false,
+            refresh_mark_price: false,
         }
     }
 
@@ -58,16 +65,19 @@ impl AfterChange {
             refresh_footprint: false,
             refresh_liq_bars: false,
             refresh_oi_bars: true,
+            refresh_mark_price: true,
         }
     }
 
     /// Bar Stats toggles both liquidation rows and the OI-Δ row, each of
-    /// which gates a different shared subscription — refresh both.
+    /// which gates a different shared subscription — refresh all three (the
+    /// OI-Δ USD value reads the mark price).
     pub const fn liq_and_oi_bars() -> Self {
         Self {
             refresh_footprint: false,
             refresh_liq_bars: true,
             refresh_oi_bars: true,
+            refresh_mark_price: true,
         }
     }
 }
@@ -163,6 +173,9 @@ where
             }
             if after.refresh_oi_bars {
                 p.refresh_chart_oi_bars_sub(cx);
+            }
+            if after.refresh_mark_price {
+                p.refresh_chart_mark_price_sub(cx);
             }
             cx.notify();
             crate::panels::request_layout_save(cx);

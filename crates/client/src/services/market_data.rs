@@ -372,7 +372,8 @@ pub struct LiquidationBar {
 }
 
 /// One per-bar open-interest OHLC cell. Values are in contracts (base asset);
-/// the chart derives USD as `close * candle.close` for the Coin/USD toggle.
+/// the chart derives USD as `close * mark_price` (falling back to candle close)
+/// for the Coin/USD toggle.
 #[derive(Clone, Debug)]
 pub struct OpenInterestBar {
     pub open_time: i64,
@@ -380,6 +381,20 @@ pub struct OpenInterestBar {
     pub high: f64,
     pub low: f64,
     pub close: f64,
+}
+
+/// One per-bar mark-price OHLC cell + the bar's funding rate. Mark price is the
+/// canonical USD conversion factor for open interest; `funding_rate` (predicted
+/// where the live curve exists, else the settled 8h rate) drives the funding
+/// indicator. `funding_rate` is `None` for historical bars between settlements.
+#[derive(Clone, Debug)]
+pub struct MarkPriceBar {
+    pub open_time: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub funding_rate: Option<f64>,
 }
 
 /// One book price level.
@@ -564,6 +579,36 @@ pub enum OpenInterestEvent {
     },
 }
 
+#[derive(Clone, Debug)]
+pub enum MarkPriceEvent {
+    /// Initial per-bar mark-price OHLC + funding for the recent N bars.
+    Snapshot {
+        symbol: SharedString,
+        tf: Timeframe,
+        bars: Vec<MarkPriceBar>,
+    },
+    /// Live per-bar update (compose by `open_time`).
+    Update {
+        symbol: SharedString,
+        tf: Timeframe,
+        bars: Vec<MarkPriceBar>,
+    },
+    /// Older bars prepended.
+    Prepended {
+        symbol: SharedString,
+        tf: Timeframe,
+        added: usize,
+    },
+    HistoryCapped {
+        symbol: SharedString,
+        tf: Timeframe,
+    },
+    Resnap {
+        symbol: SharedString,
+        tf: Timeframe,
+    },
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SubKey {
     pub(crate) symbol: String,
@@ -672,6 +717,21 @@ impl OpenInterestSubKey {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MarkPriceSubKey {
+    pub(crate) symbol: String,
+    pub(crate) tf: Timeframe,
+}
+
+impl MarkPriceSubKey {
+    fn new(symbol: &str, tf: Timeframe) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            tf,
+        }
+    }
+}
+
 /// Discriminator on `by_id` so an incoming server frame can route to the
 /// right per-channel handler from just its `SubId`.
 #[derive(Clone)]
@@ -683,6 +743,7 @@ enum AnySubKey {
     Liquidations(LiquidationsSubKey),
     LiquidationBars(LiquidationBarsSubKey),
     OpenInterest(OpenInterestSubKey),
+    MarkPrice(MarkPriceSubKey),
 }
 
 /// Used by the release pump to know which kind of refcount to decrement
@@ -696,6 +757,7 @@ enum ReleaseKey {
     Liquidations(LiquidationsSubKey),
     LiquidationBars(LiquidationBarsSubKey),
     OpenInterest(OpenInterestSubKey),
+    MarkPrice(MarkPriceSubKey),
 }
 
 pub struct MarketDataService {
@@ -762,6 +824,13 @@ pub struct MarketDataService {
     open_interest_refcounts: HashMap<OpenInterestSubKey, usize>,
     open_interest_history_in_flight: HashSet<OpenInterestSubKey>,
 
+    // --- MarkPrice (per-bar OHLC + funding) channel state ---
+    /// Bars keyed by `open_time` so live updates compose by overwriting.
+    mark_price: HashMap<MarkPriceSubKey, HashMap<i64, MarkPriceBar>>,
+    mark_price_sub_ids: HashMap<MarkPriceSubKey, proto::SubId>,
+    mark_price_refcounts: HashMap<MarkPriceSubKey, usize>,
+    mark_price_history_in_flight: HashSet<MarkPriceSubKey>,
+
     // --- Shared routing / connection state ---
 
     /// Maps wire `SubId` → channel-tagged key. One counter is shared across
@@ -805,6 +874,7 @@ impl EventEmitter<BookEvent> for MarketDataService {}
 impl EventEmitter<LiquidationEvent> for MarketDataService {}
 impl EventEmitter<LiquidationBarEvent> for MarketDataService {}
 impl EventEmitter<OpenInterestEvent> for MarketDataService {}
+impl EventEmitter<MarkPriceEvent> for MarketDataService {}
 
 impl MarketDataService {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -825,6 +895,7 @@ impl MarketDataService {
                         ReleaseKey::Liquidations(k) => s.release_one_liquidations(k, cx),
                         ReleaseKey::LiquidationBars(k) => s.release_one_liquidation_bars(k, cx),
                         ReleaseKey::OpenInterest(k) => s.release_one_open_interest(k, cx),
+                        ReleaseKey::MarkPrice(k) => s.release_one_mark_price(k, cx),
                     })
                     .is_err()
                 {
@@ -883,6 +954,10 @@ impl MarketDataService {
             open_interest_sub_ids: HashMap::new(),
             open_interest_refcounts: HashMap::new(),
             open_interest_history_in_flight: HashSet::new(),
+            mark_price: HashMap::new(),
+            mark_price_sub_ids: HashMap::new(),
+            mark_price_refcounts: HashMap::new(),
+            mark_price_history_in_flight: HashSet::new(),
             by_id: HashMap::new(),
             next_sub_id: 0,
             to_ws,
@@ -1220,6 +1295,49 @@ impl MarketDataService {
         }
     }
 
+    /// Ensure a refcounted mark-price subscription for `(symbol, tf)`. Shared
+    /// by the OI indicators (mark close → USD notional) and the funding
+    /// indicator (per-bar funding). First ensure sends `Subscribe`; the last
+    /// handle drop sends `Unsubscribe`.
+    pub fn ensure_mark_price(
+        &mut self,
+        symbol: &str,
+        tf: Timeframe,
+        _cx: &mut Context<Self>,
+    ) -> SubscriptionHandle {
+        let key = MarkPriceSubKey::new(symbol, tf);
+        let count = self.mark_price_refcounts.entry(key.clone()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            let sub_id = self.alloc_sub_id();
+            self.mark_price_sub_ids.insert(key.clone(), sub_id);
+            self.by_id.insert(sub_id, AnySubKey::MarkPrice(key.clone()));
+            self.mark_price.insert(key.clone(), HashMap::new());
+            let frame = proto::ClientFrame::Subscribe {
+                id: sub_id,
+                symbol: symbol.to_string(),
+                channel: proto::Channel::MarkPrice { tf: proto_tf(tf) },
+            };
+            let _ = self.to_ws.unbounded_send(frame);
+        }
+        SubscriptionHandle {
+            key: ReleaseKey::MarkPrice(key),
+            release_tx: self.release_tx.clone(),
+        }
+    }
+
+    pub fn mark_price_bars(&self, symbol: &str, tf: Timeframe) -> Vec<MarkPriceBar> {
+        let key = MarkPriceSubKey::new(symbol, tf);
+        match self.mark_price.get(&key) {
+            Some(map) => {
+                let mut bars: Vec<MarkPriceBar> = map.values().cloned().collect();
+                bars.sort_by_key(|b| b.open_time);
+                bars
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub fn trades_snapshot(&self, symbol: &str) -> Option<&[Trade]> {
         self.trades.get(&TradeSubKey::new(symbol)).map(|v| v.as_slice())
     }
@@ -1502,6 +1620,32 @@ impl MarketDataService {
         let _ = self.to_ws.unbounded_send(frame);
     }
 
+    pub fn load_older_mark_price(
+        &mut self,
+        symbol: &str,
+        tf: Timeframe,
+        _cx: &mut Context<Self>,
+    ) {
+        let key = MarkPriceSubKey::new(symbol, tf);
+        let Some(sub_id) = self.mark_price_sub_ids.get(&key).copied() else {
+            return;
+        };
+        if !self.mark_price_history_in_flight.insert(key.clone()) {
+            return;
+        }
+        let before_ms = self
+            .mark_price
+            .get(&key)
+            .and_then(|bars| bars.keys().min().copied())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let frame = proto::ClientFrame::HistoryPage {
+            id: sub_id,
+            before_ms,
+            count: HISTORY_PAGE_SIZE,
+        };
+        let _ = self.to_ws.unbounded_send(frame);
+    }
+
     // --- Internal: driven by the connection task ---------------------------
 
     /// Route an incoming server frame into per-subscription state.
@@ -1578,6 +1722,15 @@ impl MarketDataService {
             }
             proto::ServerFrame::OpenInterestHistoryPage { id, bars } => {
                 self.on_open_interest_history_page(id, bars, cx);
+            }
+            proto::ServerFrame::MarkPriceSnapshot { id, bars, server_v: _ } => {
+                self.on_mark_price_snapshot(id, bars, cx);
+            }
+            proto::ServerFrame::MarkPriceUpdate { id, bars, v: _ } => {
+                self.on_mark_price_update(id, bars, cx);
+            }
+            proto::ServerFrame::MarkPriceHistoryPage { id, bars } => {
+                self.on_mark_price_history_page(id, bars, cx);
             }
             proto::ServerFrame::Resnap { id } => {
                 self.on_resnap(id, cx);
@@ -1775,6 +1928,20 @@ impl MarketDataService {
                     id,
                     symbol: key.symbol.clone(),
                     channel: proto::Channel::OpenInterest { tf: proto_tf(tf) },
+                });
+            }
+            AnySubKey::MarkPrice(key) => {
+                let tf = key.tf;
+                self.mark_price.insert(key.clone(), HashMap::new());
+                self.mark_price_history_in_flight.remove(&key);
+                cx.emit(MarkPriceEvent::Resnap {
+                    symbol: key.symbol.clone().into(),
+                    tf,
+                });
+                let _ = self.to_ws.unbounded_send(proto::ClientFrame::Subscribe {
+                    id,
+                    symbol: key.symbol.clone(),
+                    channel: proto::Channel::MarkPrice { tf: proto_tf(tf) },
                 });
             }
         }
@@ -2289,6 +2456,91 @@ impl MarketDataService {
         });
     }
 
+    fn on_mark_price_snapshot(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::MarkPriceBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::MarkPrice(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        let domain: Vec<MarkPriceBar> =
+            bars.into_iter().map(mark_price_bar_from_proto).collect();
+        let mut map: HashMap<i64, MarkPriceBar> = HashMap::new();
+        for b in &domain {
+            map.insert(b.open_time, b.clone());
+        }
+        self.mark_price.insert(key.clone(), map);
+        self.mark_price_history_in_flight.remove(&key);
+        cx.emit(MarkPriceEvent::Snapshot {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            bars: domain,
+        });
+    }
+
+    fn on_mark_price_update(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::MarkPriceBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::MarkPrice(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        let domain: Vec<MarkPriceBar> =
+            bars.into_iter().map(mark_price_bar_from_proto).collect();
+        let map = self.mark_price.entry(key.clone()).or_default();
+        for b in &domain {
+            map.insert(b.open_time, b.clone());
+        }
+        cx.emit(MarkPriceEvent::Update {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            bars: domain,
+        });
+    }
+
+    fn on_mark_price_history_page(
+        &mut self,
+        id: proto::SubId,
+        bars: Vec<proto::MarkPriceBar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(AnySubKey::MarkPrice(key)) = self.by_id.get(&id).cloned() else {
+            return;
+        };
+        self.mark_price_history_in_flight.remove(&key);
+        if bars.is_empty() {
+            cx.emit(MarkPriceEvent::HistoryCapped {
+                symbol: key.symbol.clone().into(),
+                tf: key.tf,
+            });
+            return;
+        }
+        let domain: Vec<MarkPriceBar> =
+            bars.into_iter().map(mark_price_bar_from_proto).collect();
+        let map = self.mark_price.entry(key.clone()).or_default();
+        let mut added = 0;
+        for b in &domain {
+            // Only insert open_times we don't already hold, so a history page
+            // can't clobber the live OHLC/funding with a stale value.
+            if !map.contains_key(&b.open_time) {
+                map.insert(b.open_time, b.clone());
+                added += 1;
+            }
+        }
+        if added == 0 {
+            return;
+        }
+        cx.emit(MarkPriceEvent::Prepended {
+            symbol: key.symbol.clone().into(),
+            tf: key.tf,
+            added,
+        });
+    }
+
     /// Fold a fresh RTT sample into the EMA, seeding with the first sample on
     /// a connection. Called from `pump` on every `Pong`. The bottom bar
     /// repaints every frame (it self-drives via `request_animation_frame`), so
@@ -2414,6 +2666,20 @@ impl MarketDataService {
                 id: sub_id,
                 symbol: key.symbol.clone(),
                 channel: proto::Channel::OpenInterest {
+                    tf: proto_tf(key.tf),
+                },
+            });
+        }
+        let mark_price_subs: Vec<(MarkPriceSubKey, proto::SubId)> = self
+            .mark_price_sub_ids
+            .iter()
+            .map(|(k, id)| (k.clone(), *id))
+            .collect();
+        for (key, sub_id) in mark_price_subs {
+            let _ = self.to_ws.unbounded_send(proto::ClientFrame::Subscribe {
+                id: sub_id,
+                symbol: key.symbol.clone(),
+                channel: proto::Channel::MarkPrice {
                     tf: proto_tf(key.tf),
                 },
             });
@@ -2581,6 +2847,27 @@ impl MarketDataService {
             }
             self.open_interest.remove(&key);
             self.open_interest_history_in_flight.remove(&key);
+        }
+    }
+
+    fn release_one_mark_price(&mut self, key: MarkPriceSubKey, _cx: &mut Context<Self>) {
+        let zero = match self.mark_price_refcounts.get_mut(&key) {
+            Some(c) => {
+                *c = c.saturating_sub(1);
+                *c == 0
+            }
+            None => return,
+        };
+        if zero {
+            self.mark_price_refcounts.remove(&key);
+            if let Some(sub_id) = self.mark_price_sub_ids.remove(&key) {
+                self.by_id.remove(&sub_id);
+                let _ = self
+                    .to_ws
+                    .unbounded_send(proto::ClientFrame::Unsubscribe { id: sub_id });
+            }
+            self.mark_price.remove(&key);
+            self.mark_price_history_in_flight.remove(&key);
         }
     }
 }
@@ -2924,6 +3211,17 @@ fn open_interest_bar_from_proto(b: proto::OpenInterestBar) -> OpenInterestBar {
         high: b.high,
         low: b.low,
         close: b.close,
+    }
+}
+
+fn mark_price_bar_from_proto(b: proto::MarkPriceBar) -> MarkPriceBar {
+    MarkPriceBar {
+        open_time: b.open_time,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        funding_rate: b.funding_rate,
     }
 }
 

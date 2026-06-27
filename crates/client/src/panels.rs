@@ -590,6 +590,9 @@ pub struct ContentPanel {
     /// Throttle for the open-interest history-fill loop. Single slot like the
     /// liquidation-bars variant — the OI sub is keyed only on `(symbol, tf)`.
     oi_bars_history_last_request_ms: Option<i64>,
+    /// Throttle for the mark-price history-fill loop. Single slot — the
+    /// mark-price sub is keyed only on `(symbol, tf)`.
+    mark_price_history_last_request_ms: Option<i64>,
     /// Throttle for the heatmap book-history paging loop. Single slot — the
     /// heatmap sub is keyed only on symbol.
     heatmap_history_last_request_ms: Option<i64>,
@@ -604,6 +607,16 @@ pub struct ContentPanel {
     /// the OI-Δ row enabled) is on the chart; dropped when the last consumer
     /// is removed or (symbol, tf) changes. `ensure_open_interest` refcounts.
     chart_oi_bars_sub: Option<(
+        SharedString,
+        crate::services::market_data::Timeframe,
+        crate::services::market_data::SubscriptionHandle,
+    )>,
+    /// `(symbol, tf, handle)` for the chart's mark-price subscription. Allocated
+    /// lazily when an OI consumer (the `open_interest` indicator or a bar_stat
+    /// with the OI-Δ row — both need the mark close for USD) or a `funding`
+    /// indicator is on the chart; dropped when the last consumer is removed or
+    /// (symbol, tf) changes. `ensure_mark_price` refcounts.
+    chart_mark_price_sub: Option<(
         SharedString,
         crate::services::market_data::Timeframe,
         crate::services::market_data::SubscriptionHandle,
@@ -1109,6 +1122,61 @@ impl ContentPanel {
                 },
             )
             .detach();
+            // MarkPriceEvent → copy the per-bar mark/funding into ChartState's
+            // mark_price_cache. Same gating as the OpenInterestEvent
+            // subscription.
+            cx.subscribe_in(
+                &service,
+                window,
+                |this,
+                 _service,
+                 event: &crate::services::market_data::MarkPriceEvent,
+                 _window,
+                 cx| {
+                    use crate::services::market_data::MarkPriceEvent::*;
+                    let Some((chart_symbol, chart_tf)) = this
+                        .chart_state
+                        .as_ref()
+                        .map(|s| (s.symbol().clone(), s.timeframe()))
+                    else {
+                        return;
+                    };
+                    let matches = match event {
+                        Snapshot { symbol, tf, .. }
+                        | Update { symbol, tf, .. }
+                        | Prepended { symbol, tf, .. }
+                        | HistoryCapped { symbol, tf }
+                        | Resnap { symbol, tf } => {
+                            symbol.as_ref() == chart_symbol.as_ref() && *tf == chart_tf
+                        }
+                    };
+                    if !matches {
+                        return;
+                    }
+                    match event {
+                        Snapshot { .. } | Update { .. } | Prepended { .. } | Resnap { .. } => {
+                            let market = cx
+                                .global::<
+                                    crate::services::market_data::MarketDataServiceHandle,
+                                >()
+                                .0
+                                .clone();
+                            let bars = market
+                                .read(cx)
+                                .mark_price_bars(chart_symbol.as_ref(), chart_tf);
+                            if let Some(state) = this.chart_state.as_mut() {
+                                state.set_mark_price_cache(bars);
+                                state.recompute_indicators();
+                            }
+                            cx.notify();
+                        }
+                        HistoryCapped { .. } => {
+                            cx.notify();
+                        }
+                    }
+                },
+            )
+            .detach();
             let pending = chart_tick_pending.clone();
             let last_ms = chart_tick_last_ms.clone();
             chart_tick_flush = Some(cx.spawn(async move |this, cx| {
@@ -1445,11 +1513,13 @@ impl ContentPanel {
             vp_history_last_request_ms: HashMap::new(),
             liq_bars_history_last_request_ms: None,
             oi_bars_history_last_request_ms: None,
+            mark_price_history_last_request_ms: None,
             heatmap_history_last_request_ms: None,
             heatmap_last_evict_ms: None,
             chart_footprint_key: None,
             chart_liq_bars_sub: None,
             chart_oi_bars_sub: None,
+            chart_mark_price_sub: None,
             chart_heatmap_sub: None,
             watchlist_sub_handles: watchlist_handles,
             trades_symbol,
@@ -1486,6 +1556,7 @@ impl ContentPanel {
             new_self.refresh_chart_footprint_sub(cx);
             new_self.refresh_chart_liq_bars_sub(cx);
             new_self.refresh_chart_oi_bars_sub(cx);
+            new_self.refresh_chart_mark_price_sub(cx);
             // Open the book sub + sampler if the restored chart had the heatmap
             // overlay on. No-op when it was off.
             new_self.refresh_chart_heatmap_sub(cx);
@@ -1753,6 +1824,7 @@ impl ContentPanel {
         self.refresh_chart_footprint_sub(cx);
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
+            self.refresh_chart_mark_price_sub(cx);
         cx.notify();
         request_layout_save(cx);
     }
@@ -1769,6 +1841,7 @@ impl ContentPanel {
             self.refresh_chart_footprint_sub(cx);
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
+            self.refresh_chart_mark_price_sub(cx);
             // Heatmap is symbol-keyed: re-point the book sub + sampler at the
             // new symbol (no-op when the overlay is off).
             self.refresh_chart_heatmap_sub(cx);
@@ -1812,6 +1885,7 @@ impl ContentPanel {
             self.refresh_chart_footprint_sub(cx);
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
+            self.refresh_chart_mark_price_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1858,6 +1932,7 @@ impl ContentPanel {
             self.refresh_chart_footprint_sub(cx);
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
+            self.refresh_chart_mark_price_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -1895,6 +1970,7 @@ impl ContentPanel {
             self.refresh_chart_footprint_sub(cx);
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
+            self.refresh_chart_mark_price_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -2132,6 +2208,60 @@ impl ContentPanel {
                 state.recompute_indicators();
             }
             self.chart_oi_bars_sub = Some((symbol, tf, handle));
+        }
+    }
+
+    /// Reconcile the chart's mark-price subscription against indicator state.
+    /// Mirrors `refresh_chart_oi_bars_sub`: single-slot allocate / drop keyed
+    /// on `(symbol, tf)`. Active when an `open_interest` instance, a `funding`
+    /// instance, OR a bar_stat with the OI-Δ row is present — the OI consumers
+    /// read the mark close for USD, the funding indicator reads the per-bar
+    /// funding, all via `ComputeCtx.mark_price`.
+    pub(crate) fn refresh_chart_mark_price_sub(&mut self, cx: &mut Context<Self>) {
+        let want = self.chart_state.as_ref().and_then(|state| {
+            let any_live = state.indicators().iter().any(|i| {
+                if i.kind_id == "open_interest" || i.kind_id == "funding" {
+                    return true;
+                }
+                if let Some(bs) = i
+                    .kind
+                    .as_any()
+                    .downcast_ref::<crate::indicators::BarStatParams>()
+                {
+                    return bs.show_oi_delta;
+                }
+                false
+            });
+            any_live.then(|| (state.symbol().clone(), state.timeframe()))
+        });
+        let cur = self
+            .chart_mark_price_sub
+            .as_ref()
+            .map(|(s, t, _)| (s.clone(), *t));
+        if want == cur {
+            return;
+        }
+        if cur.is_some() {
+            self.chart_mark_price_sub = None;
+            if let Some(state) = self.chart_state.as_mut() {
+                state.clear_mark_price_cache();
+                state.recompute_indicators();
+            }
+        }
+        if let Some((symbol, tf)) = want {
+            let market = cx
+                .global::<crate::services::market_data::MarketDataServiceHandle>()
+                .0
+                .clone();
+            let handle = market.clone().update(cx, |svc, cx| {
+                svc.ensure_mark_price(symbol.as_ref(), tf, cx)
+            });
+            let seeded = market.read(cx).mark_price_bars(symbol.as_ref(), tf);
+            if let Some(state) = self.chart_state.as_mut() {
+                state.set_mark_price_cache(seeded);
+                state.recompute_indicators();
+            }
+            self.chart_mark_price_sub = Some((symbol, tf, handle));
         }
     }
 
@@ -2471,6 +2601,50 @@ impl ContentPanel {
         });
     }
 
+    /// Mark-price history fill — mirrors `maybe_request_oi_bars_history`. Fires
+    /// `load_older_mark_price` when the visible view extends past the oldest
+    /// loaded mark-price bar (keeps the funding pane + USD OI factor populated
+    /// on scroll-back). Single 200ms throttle; no-op when no mark-price sub is
+    /// live or coverage already reaches the view.
+    fn maybe_request_mark_price_history(&mut self, cx: &mut Context<Self>) {
+        let Some((symbol, tf)) = self
+            .chart_state
+            .as_ref()
+            .map(|s| (s.symbol().clone(), s.timeframe()))
+        else {
+            return;
+        };
+        if self.chart_mark_price_sub.is_none() {
+            return;
+        }
+        let view_lo = match self.chart_state.as_ref().and_then(|s| s.view_time_range()) {
+            Some((lo, _)) => lo,
+            None => return,
+        };
+        if let Some(state) = self.chart_state.as_ref() {
+            if let Some(oldest) = state.oldest_mark_price_time() {
+                if oldest <= view_lo {
+                    return;
+                }
+            }
+        }
+        const THROTTLE_MS: i64 = 200;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(last) = self.mark_price_history_last_request_ms {
+            if now_ms - last < THROTTLE_MS {
+                return;
+            }
+        }
+        self.mark_price_history_last_request_ms = Some(now_ms);
+        let market = cx
+            .global::<crate::services::market_data::MarketDataServiceHandle>()
+            .0
+            .clone();
+        market.update(cx, |svc, cx| {
+            svc.load_older_mark_price(symbol.as_ref(), tf, cx)
+        });
+    }
+
     pub fn chart_timeframe(&self) -> Option<crate::services::market_data::Timeframe> {
         self.chart_state.as_ref().map(|s| s.timeframe())
     }
@@ -2695,6 +2869,7 @@ impl ContentPanel {
             self.refresh_chart_footprint_sub(cx);
             self.refresh_chart_liq_bars_sub(cx);
             self.refresh_chart_oi_bars_sub(cx);
+            self.refresh_chart_mark_price_sub(cx);
             cx.notify();
             request_layout_save(cx);
         }
@@ -2932,6 +3107,7 @@ impl Render for ContentPanel {
                 self.maybe_request_vp_history(cx);
                 self.maybe_request_liq_bars_history(cx);
                 self.maybe_request_oi_bars_history(cx);
+                self.maybe_request_mark_price_history(cx);
                 self.maybe_request_heatmap_history(cx);
                 // Rebuild the heatmap texture (if dirty) before render captures
                 // its Arc — needs `&mut Window` for atlas eviction, which the

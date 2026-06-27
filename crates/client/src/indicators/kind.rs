@@ -18,7 +18,9 @@ use super::instance::InstanceId;
 use super::output::{IndicatorOutput, ValueReadout};
 use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
-use crate::services::market_data::{Candle, FootprintCellLookup, LiquidationBar, OpenInterestBar};
+use crate::services::market_data::{
+    Candle, FootprintCellLookup, LiquidationBar, MarkPriceBar, OpenInterestBar,
+};
 use crate::settings_form::SettingsForm;
 
 /// Cross-cutting per-compute context, threaded from `ChartState` into each
@@ -53,6 +55,12 @@ pub struct ComputeCtx<'a> {
     /// current `(symbol, tf)`. `None` when no `open_interest` indicator (and
     /// no bar_stat OI-Δ row) is live — ChartState skips the cache then.
     pub open_interest: Option<&'a [OpenInterestBar]>,
+    /// Pre-sorted (oldest-first) mark-price OHLC + funding bars for the chart's
+    /// current `(symbol, tf)`. `None` when no consumer (OI indicator, bar_stat
+    /// OI-Δ row, or funding indicator) is live. The OI indicators read the mark
+    /// close as the USD conversion factor (falling back to the candle close);
+    /// the funding indicator reads `funding_rate`.
+    pub mark_price: Option<&'a [MarkPriceBar]>,
 }
 
 impl<'a> Default for ComputeCtx<'a> {
@@ -63,8 +71,32 @@ impl<'a> Default for ComputeCtx<'a> {
             view_time_range: None,
             liquidation_bars: None,
             open_interest: None,
+            mark_price: None,
         }
     }
+}
+
+/// Per-bar mark-price close aligned to `candles` (oldest-first), via a
+/// two-pointer join on `open_time`. `None` where no mark-price bar matches —
+/// callers fall back to the candle close for USD conversion. Shared by the OI
+/// indicators so they convert open interest to USD against the mark price
+/// rather than the last-trade close.
+pub fn mark_close_series(candles: &[Candle], mark: Option<&[MarkPriceBar]>) -> Vec<Option<f64>> {
+    let n = candles.len();
+    let mut out = vec![None; n];
+    if let Some(bars) = mark {
+        let mut j = 0usize;
+        for (i, c) in candles.iter().enumerate() {
+            while j < bars.len() && bars[j].open_time < c.open_time {
+                j += 1;
+            }
+            if j < bars.len() && bars[j].open_time == c.open_time {
+                out[i] = Some(bars[j].close);
+                j += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Where an indicator can render. Drives picker entry placement, default

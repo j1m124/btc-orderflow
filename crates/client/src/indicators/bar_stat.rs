@@ -28,7 +28,7 @@ use gpui::{SharedString, WeakEntity};
 use serde::{Deserialize, Serialize};
 
 use super::instance::InstanceId;
-use super::kind::{ComputeCtx, IndicatorKind, PaneKind};
+use super::kind::{ComputeCtx, IndicatorKind, PaneKind, mark_close_series};
 use super::output::{IndicatorOutput, Series, ValueReadout};
 use crate::panels::ContentPanel;
 use crate::persistence::VolumeUnit;
@@ -179,8 +179,11 @@ impl IndicatorKind for BarStatParams {
         }
 
         // OI Δ: per-bar change in open interest (close − open within the bar),
-        // scaled to the active unit. Same two-pointer join against candle
-        // open_times as the liquidation rows above.
+        // scaled to the active unit. USD uses the mark price (canonical OI
+        // notional, like the OI indicator), falling back to the candle close
+        // where the mark-price sub hasn't loaded. Same two-pointer join against
+        // candle open_times as the liquidation rows above.
+        let mark_close = mark_close_series(candles, ctx.mark_price);
         if let Some(bars) = ctx.open_interest {
             let mut j = 0usize;
             for (i, c) in candles.iter().enumerate() {
@@ -189,7 +192,11 @@ impl IndicatorKind for BarStatParams {
                 }
                 if j < bars.len() && bars[j].open_time == c.open_time {
                     let b = &bars[j];
-                    oi_delta[i] = Some(scale_vol(b.close - b.open, c, unit));
+                    let d = b.close - b.open;
+                    oi_delta[i] = Some(match unit {
+                        VolumeUnit::Coin => d,
+                        VolumeUnit::Usd => d * mark_close[i].unwrap_or(c.close),
+                    });
                     j += 1;
                 }
             }

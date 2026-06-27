@@ -200,6 +200,13 @@ pub enum Channel {
     /// close to render the USD axis (approximate vs Binance's mark-price
     /// figure, but consistent with how the chart's Coin/USD toggle works).
     OpenInterest { tf: Timeframe },
+    /// Per-bar mark-price OHLC + funding rate, computed server-side from the
+    /// `<symbol>@markPrice` stream samples via `time_bucket`. Mark price is the
+    /// canonical reference for accurate USD open-interest notional (the OI
+    /// indicators read it instead of the candle close); `funding_rate` carries
+    /// the per-bar funding for the funding indicator pane. Snapshot returns the
+    /// most-recent-N bars; pagination via `HistoryPage`.
+    MarkPrice { tf: Timeframe },
 }
 
 // --- Trade payload ----------------------------------------------------------
@@ -311,6 +318,35 @@ pub struct OpenInterestBar {
     pub high: f64,
     pub low: f64,
     pub close: f64,
+}
+
+// --- Mark price payload -----------------------------------------------------
+
+/// One per-bar mark-price cell: OHLC of the symbol's mark price within the bar
+/// at `open_time` for the subscription's tf, plus the bar's funding rate.
+///
+/// `open`/`high`/`low`/`close` are the mark price (Binance's fair-price mark —
+/// the canonical reference for USD notional, vs the last-trade `candle.close`).
+/// `funding_rate` is the per-bar funding as a fraction (e.g. `0.0001` = 0.01%):
+/// the last *predicted* funding sampled in the bucket where the live curve
+/// exists, falling back to the *settled* 8h rate for historical buckets that
+/// predate the live capture. `None` for historical buckets between settlements
+/// (no predicted sample, no settlement) — the client connects what it receives.
+///
+/// Computed server-side from the markPrice samples via `time_bucket`. Mark
+/// price backfills continuously (`markPriceKlines`) so every bar in range
+/// carries OHLC; funding history is sparse (8h settled points) until the live
+/// predicted curve accumulates forward. `#[serde(default)]` keeps an old
+/// server's frame readable by a new client.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MarkPriceBar {
+    pub open_time: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    #[serde(default)]
+    pub funding_rate: Option<f64>,
 }
 
 // --- Book payload -----------------------------------------------------------
@@ -523,6 +559,28 @@ pub enum ServerFrame {
     OpenInterestHistoryPage {
         id: SubId,
         bars: Vec<OpenInterestBar>,
+    },
+
+    // --- MarkPrice channel (per-bar OHLC + funding) ---
+    /// Initial mark-price bars: OHLC + funding for the most recent N bars at
+    /// the subscription's tf.
+    MarkPriceSnapshot {
+        id: SubId,
+        bars: Vec<MarkPriceBar>,
+        server_v: u64,
+    },
+    /// Incremental per-bar mark-price updates as new samples land in the active
+    /// bar. Bars share `open_time` keys with the snapshot; clients overwrite.
+    MarkPriceUpdate {
+        id: SubId,
+        bars: Vec<MarkPriceBar>,
+        v: u64,
+    },
+    /// Reply to a `HistoryPage` request on a mark-price subscription.
+    /// Chronological (oldest first), strictly older than the cursor.
+    MarkPriceHistoryPage {
+        id: SubId,
+        bars: Vec<MarkPriceBar>,
     },
 
     // --- Cross-channel control frames ---
@@ -796,6 +854,62 @@ mod tests {
         assert_eq!(back.open_time, b.open_time);
         assert!((back.high - b.high).abs() < 1e-9);
         assert!((back.low - b.low).abs() < 1e-9);
+    }
+
+    #[test]
+    fn channel_mark_price_with_tf() {
+        let s = serde_json::to_string(&Channel::MarkPrice {
+            tf: Timeframe::M5,
+        })
+        .unwrap();
+        assert!(s.contains("\"kind\":\"mark_price\""));
+        assert!(s.contains("\"tf\":\"5m\""));
+    }
+
+    #[test]
+    fn mark_price_bar_roundtrip() {
+        let b = MarkPriceBar {
+            open_time: 1_700_000_001_234,
+            open: 84_000.5,
+            high: 84_300.25,
+            low: 83_950.75,
+            close: 84_210.0,
+            funding_rate: Some(0.0001),
+        };
+        let s = serde_json::to_string(&b).unwrap();
+        let back: MarkPriceBar = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.open_time, b.open_time);
+        assert!((back.close - b.close).abs() < 1e-9);
+        assert!((back.funding_rate.unwrap() - 0.0001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mark_price_bar_funding_defaults_when_missing() {
+        // An old server frame without `funding_rate` still deserializes.
+        let back: MarkPriceBar = serde_json::from_str(
+            "{\"open_time\":1,\"open\":1.0,\"high\":2.0,\"low\":0.5,\"close\":1.5}",
+        )
+        .unwrap();
+        assert!(back.funding_rate.is_none());
+    }
+
+    #[test]
+    fn mark_price_snapshot_frame_shape() {
+        let f = ServerFrame::MarkPriceSnapshot {
+            id: SubId(14),
+            bars: vec![MarkPriceBar {
+                open_time: 1_700_000_000_000,
+                open: 84_000.0,
+                high: 84_300.0,
+                low: 83_950.0,
+                close: 84_210.0,
+                funding_rate: Some(-0.00005),
+            }],
+            server_v: 0,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"type\":\"mark_price_snapshot\""));
+        assert!(s.contains("\"funding_rate\":-0.00005"));
     }
 
     #[test]

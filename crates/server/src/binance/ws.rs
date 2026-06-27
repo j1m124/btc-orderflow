@@ -54,6 +54,21 @@ pub fn public_combined_url(symbol: &str) -> String {
     format!("{}/stream?streams={s}@depth@100ms", WS_BASE)
 }
 
+/// Combined-stream URL for the mark-price feed. Rides the `/market/stream`
+/// endpoint — the same family as kline / aggTrade / forceOrder, NOT the `/stream`
+/// (diff-depth) family. This is load-bearing and was verified empirically: a
+/// `<symbol>@markPrice@1s` subscription on `/stream` connects but silently
+/// delivers ZERO frames (the documented endpoint-family drop), while the same
+/// stream on `/market/stream` delivers normally. `@markPrice@1s` pushes a sample
+/// every second (bare `@markPrice` is 3s); we want the finer cadence for crisp
+/// USD open-interest notional and the future liquidation heatmap. Given its own
+/// connection (rather than folded into the market socket) so the kline/trade
+/// gap-heal + reconnect cadence stays independent of mark-price capture.
+pub fn mark_price_combined_url(symbol: &str) -> String {
+    let s = symbol.to_lowercase();
+    format!("{}/market/stream?streams={s}@markPrice@1s", WS_BASE)
+}
+
 /// Connect to the given combined-stream URL, parse every event, and fan into
 /// the right typed broadcast. Returns when the connection drops (either side);
 /// the caller decides whether to reconnect. `label` is purely for logging so
@@ -158,6 +173,15 @@ fn handle_text(txt: &str, txs: &BroadcastTxs) -> Result<()> {
                 "liquidation"
             );
             let _ = txs.liquidation.send(tick);
+        }
+        InboundEvent::MarkPrice(tick) => {
+            debug!(
+                symbol = %tick.symbol,
+                mark = tick.mark.mark_price,
+                funding = ?tick.mark.funding_rate,
+                "mark price"
+            );
+            let _ = txs.mark_price.send(tick);
         }
     }
     Ok(())

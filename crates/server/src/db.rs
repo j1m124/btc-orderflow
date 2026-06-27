@@ -608,6 +608,273 @@ fn build_open_interest_bars(
         .collect()
 }
 
+// --- mark price + funding (computed on read from raw samples) ---------------
+
+/// Latest stored mark-price sample `ts` for `symbol`, or `None`. Resume cursor
+/// for the `markPriceKlines` cold-start / gap-heal backfill.
+pub async fn max_mark_price_ts(pool: &PgPool, symbol: &str) -> Result<Option<DateTime<Utc>>> {
+    let row = sqlx::query("SELECT MAX(ts) AS t FROM mark_price WHERE symbol = $1")
+        .bind(symbol)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("t")?)
+}
+
+/// Latest stored settled-funding `ts` for `symbol`, or `None`. Resume cursor
+/// for the `fundingRate` backfill / refresh.
+pub async fn max_funding_rate_ts(pool: &PgPool, symbol: &str) -> Result<Option<DateTime<Utc>>> {
+    let row = sqlx::query("SELECT MAX(ts) AS t FROM funding_rate WHERE symbol = $1")
+        .bind(symbol)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("t")?)
+}
+
+/// Bulk-UPSERT a window of mark-price samples. PK `(symbol, ts)`; `ON CONFLICT
+/// DO NOTHING` absorbs the rare live/backfill tie (live event-time ms vs
+/// backfill minute boundaries essentially never collide) and reconnect
+/// redelivery. 6 params/row → ~10900-row cap; live flushes (≤1/s) and the
+/// 1500-row kline backfill page sit far under it.
+pub async fn upsert_mark_price(
+    pool: &PgPool,
+    symbol: &str,
+    rows: &[crate::binance::parse::MarkPriceRow],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "INSERT INTO mark_price (symbol, ts, mark_price, index_price, est_settle_price, funding_rate) ",
+    );
+
+    qb.push_values(rows.iter(), |mut b, row| {
+        b.push_bind(symbol)
+            .push_bind(row.ts)
+            .push_bind(row.mark_price)
+            .push_bind(row.index_price)
+            .push_bind(row.est_settle_price)
+            .push_bind(row.funding_rate);
+    });
+
+    qb.push(" ON CONFLICT (symbol, ts) DO NOTHING");
+    qb.build().execute(pool).await?;
+    Ok(())
+}
+
+/// Bulk-UPSERT settled funding rows. PK `(symbol, ts)`; `ON CONFLICT DO
+/// NOTHING` absorbs the hourly-refresh re-fetch of already-stored settlements.
+pub async fn upsert_funding_rate(
+    pool: &PgPool,
+    symbol: &str,
+    rows: &[crate::binance::parse::FundingRateRow],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut qb: QueryBuilder<sqlx::Postgres> =
+        QueryBuilder::new("INSERT INTO funding_rate (symbol, ts, rate) ");
+
+    qb.push_values(rows.iter(), |mut b, row| {
+        b.push_bind(symbol).push_bind(row.ts).push_bind(row.rate);
+    });
+
+    qb.push(" ON CONFLICT (symbol, ts) DO NOTHING");
+    qb.build().execute(pool).await?;
+    Ok(())
+}
+
+/// `time_bucket` interval literal for mark-price OHLC aggregation. Mirrors the
+/// open-interest interval map — every chart TF is valid.
+fn mark_price_bucket_interval(tf: Timeframe) -> &'static str {
+    match tf {
+        Timeframe::S1 => "1 second",
+        Timeframe::S5 => "5 seconds",
+        Timeframe::M1 => "1 minute",
+        Timeframe::M5 => "5 minutes",
+        Timeframe::M15 => "15 minutes",
+        Timeframe::M30 => "30 minutes",
+        Timeframe::H1 => "1 hour",
+        Timeframe::H2 => "2 hours",
+        Timeframe::H4 => "4 hours",
+        Timeframe::H6 => "6 hours",
+        Timeframe::D1 => "1 day",
+    }
+}
+
+/// Per-bar mark-price OHLC + funding for the most recent `bars` bars at `tf`,
+/// chronological. Mark OHLC and the *predicted* funding (last non-null in the
+/// bucket) come from `mark_price`; the *settled* 8h funding from `funding_rate`
+/// fills any bar whose predicted funding is absent (COALESCE: predicted wins).
+/// Only buckets with a mark-price sample emit a row — mark price backfills
+/// continuously, so coverage is dense; funding is sparse historically.
+pub async fn fetch_mark_price_snapshot(
+    pool: &PgPool,
+    symbol: &str,
+    tf: Timeframe,
+    bars: i64,
+) -> Result<Vec<protocol::MarkPriceBar>> {
+    let interval = mark_price_bucket_interval(tf);
+
+    let width_ms = tf.duration_ms().max(1);
+    let now_ms = Utc::now().timestamp_millis();
+    let lower_ms = (now_ms - now_ms.rem_euclid(width_ms)) - (bars - 1).max(0) * width_ms;
+    let lower = Utc
+        .timestamp_millis_opt(lower_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
+    let sql = format!(
+        "SELECT \
+            time_bucket(INTERVAL '{interval}', ts) AS open_time, \
+            first(mark_price, ts) AS open, \
+            max(mark_price) AS high, \
+            min(mark_price) AS low, \
+            last(mark_price, ts) AS close, \
+            last(funding_rate, ts) FILTER (WHERE funding_rate IS NOT NULL) AS funding_rate \
+         FROM mark_price \
+         WHERE symbol = $1 AND ts >= $2 \
+         GROUP BY open_time \
+         ORDER BY open_time ASC",
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(lower)
+        .fetch_all(pool)
+        .await?;
+
+    let mut bars_out = build_mark_price_bars(rows)?;
+    let settled = fetch_settled_funding_map(pool, symbol, interval, lower, None).await?;
+    merge_settled_funding(&mut bars_out, &settled);
+    Ok(bars_out)
+}
+
+/// Per-bar mark-price OHLC + funding for up to `bars` bars strictly older than
+/// `before_open_time_ms`, chronological. Same source/merge rules as the
+/// snapshot; bounded window lets Timescale prune chunks.
+pub async fn fetch_mark_price_history_page(
+    pool: &PgPool,
+    symbol: &str,
+    tf: Timeframe,
+    before_open_time_ms: i64,
+    bars: i64,
+) -> Result<Vec<protocol::MarkPriceBar>> {
+    let interval = mark_price_bucket_interval(tf);
+
+    let width_ms = tf.duration_ms().max(1);
+    let lower_ms = before_open_time_ms - bars.max(0) * width_ms;
+    let before = Utc
+        .timestamp_millis_opt(before_open_time_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+    let lower = Utc
+        .timestamp_millis_opt(lower_ms)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap());
+
+    let sql = format!(
+        "SELECT \
+            time_bucket(INTERVAL '{interval}', ts) AS open_time, \
+            first(mark_price, ts) AS open, \
+            max(mark_price) AS high, \
+            min(mark_price) AS low, \
+            last(mark_price, ts) AS close, \
+            last(funding_rate, ts) FILTER (WHERE funding_rate IS NOT NULL) AS funding_rate \
+         FROM mark_price \
+         WHERE symbol = $1 AND ts >= $2 AND ts < $3 \
+         GROUP BY open_time \
+         ORDER BY open_time ASC",
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(symbol)
+        .bind(lower)
+        .bind(before)
+        .fetch_all(pool)
+        .await?;
+
+    let mut bars_out = build_mark_price_bars(rows)?;
+    let settled = fetch_settled_funding_map(pool, symbol, interval, lower, Some(before)).await?;
+    merge_settled_funding(&mut bars_out, &settled);
+    Ok(bars_out)
+}
+
+/// Settled funding keyed by `time_bucket` open-time (ms), for the same window
+/// as a mark-price query. Used to backfill the per-bar funding where no live
+/// predicted sample exists.
+async fn fetch_settled_funding_map(
+    pool: &PgPool,
+    symbol: &str,
+    interval: &str,
+    lower: DateTime<Utc>,
+    before: Option<DateTime<Utc>>,
+) -> Result<std::collections::HashMap<i64, f64>> {
+    let rows = if let Some(before) = before {
+        let sql = format!(
+            "SELECT time_bucket(INTERVAL '{interval}', ts) AS open_time, last(rate, ts) AS settled \
+             FROM funding_rate WHERE symbol = $1 AND ts >= $2 AND ts < $3 GROUP BY open_time",
+        );
+        sqlx::query(&sql)
+            .bind(symbol)
+            .bind(lower)
+            .bind(before)
+            .fetch_all(pool)
+            .await?
+    } else {
+        let sql = format!(
+            "SELECT time_bucket(INTERVAL '{interval}', ts) AS open_time, last(rate, ts) AS settled \
+             FROM funding_rate WHERE symbol = $1 AND ts >= $2 GROUP BY open_time",
+        );
+        sqlx::query(&sql)
+            .bind(symbol)
+            .bind(lower)
+            .fetch_all(pool)
+            .await?
+    };
+
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        let bar: DateTime<Utc> = r.try_get("open_time")?;
+        let settled: f64 = r.try_get("settled")?;
+        map.insert(bar.timestamp_millis(), settled);
+    }
+    Ok(map)
+}
+
+/// Fill each bar's missing `funding_rate` from the settled map (predicted wins).
+fn merge_settled_funding(
+    bars: &mut [protocol::MarkPriceBar],
+    settled: &std::collections::HashMap<i64, f64>,
+) {
+    for b in bars.iter_mut() {
+        if b.funding_rate.is_none() {
+            if let Some(rate) = settled.get(&b.open_time) {
+                b.funding_rate = Some(*rate);
+            }
+        }
+    }
+}
+
+fn build_mark_price_bars(
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> Result<Vec<protocol::MarkPriceBar>> {
+    rows.into_iter()
+        .map(|r| -> Result<protocol::MarkPriceBar> {
+            let bar: DateTime<Utc> = r.try_get("open_time")?;
+            Ok(protocol::MarkPriceBar {
+                open_time: bar.timestamp_millis(),
+                open: r.try_get("open")?,
+                high: r.try_get("high")?,
+                low: r.try_get("low")?,
+                close: r.try_get("close")?,
+                funding_rate: r.try_get("funding_rate")?,
+            })
+        })
+        .collect()
+}
+
 // --- footprint (computed on read from `trades`) ----------------------------
 
 /// Pick the time_bucket interval literal for any TF (sub-second OR native).

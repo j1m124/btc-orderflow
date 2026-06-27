@@ -13,8 +13,9 @@ use serde_json::Value;
 use std::time::Duration;
 
 use super::{
-    AGGTRADES_PAGE_LIMIT, KLINES_PAGE_LIMIT, OPEN_INTEREST_HIST_PAGE_LIMIT, REST_BASE,
-    parse::{KlineRow, OpenInterestRow, TradeRow},
+    AGGTRADES_PAGE_LIMIT, FUNDING_RATE_PAGE_LIMIT, KLINES_PAGE_LIMIT,
+    OPEN_INTEREST_HIST_PAGE_LIMIT, REST_BASE,
+    parse::{FundingRateRow, KlineRow, MarkPriceRow, OpenInterestRow, TradeRow},
 };
 
 /// Bootstrap response from `GET /fapi/v1/depth`.
@@ -269,6 +270,111 @@ impl RestClient {
             rows.push(OpenInterestRow {
                 ts: ms_to_utc(ts_ms),
                 oi,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Mark-price OHLC klines from `GET /fapi/v1/markPriceKlines` (weight 1).
+    /// Same fixed-position array shape as `/fapi/v1/klines`, but the OHLC are
+    /// mark prices and the volume/trade columns are zero. Used for cold-start /
+    /// gap-heal backfill of the `mark_price` table; we keep only the bar close
+    /// (mapped to a sample at the bar open_time) — index / settle / funding
+    /// have no kline form, so those columns stay `None` on backfilled rows.
+    /// Returns rows in chronological order.
+    pub async fn mark_price_klines(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start_time_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<MarkPriceRow>> {
+        let limit = limit.min(KLINES_PAGE_LIMIT);
+        let url = format!("{}/fapi/v1/markPriceKlines", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("symbol", symbol),
+                ("interval", interval),
+                ("startTime", &start_time_ms.to_string()),
+                ("limit", &limit.to_string()),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("binance returned non-2xx for markPriceKlines {symbol}"))?;
+
+        let arr: Value = resp.json().await.context("decode markPriceKlines JSON")?;
+        let items = arr
+            .as_array()
+            .context("markPriceKlines response is not a JSON array")?;
+
+        let mut rows = Vec::with_capacity(items.len());
+        for (idx, v) in items.iter().enumerate() {
+            let row = KlineRow::from_value(v)
+                .with_context(|| format!("parse markPriceKline #{idx} for {symbol}"))?;
+            rows.push(MarkPriceRow {
+                ts: row.open_time,
+                mark_price: row.close,
+                index_price: None,
+                est_settle_price: None,
+                funding_rate: None,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Settled funding-rate history from `GET /fapi/v1/fundingRate` (weight 1).
+    /// One row per 8h settlement, ascending. `startTime` filters from that
+    /// instant; `limit` caps at [`FUNDING_RATE_PAGE_LIMIT`]. Only `fundingTime`
+    /// + `fundingRate` are decoded.
+    pub async fn funding_rate_hist(
+        &self,
+        symbol: &str,
+        start_time_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<FundingRateRow>> {
+        let limit = limit.min(FUNDING_RATE_PAGE_LIMIT);
+        let url = format!("{}/fapi/v1/fundingRate", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("symbol", symbol),
+                ("startTime", &start_time_ms.to_string()),
+                ("limit", &limit.to_string()),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("binance returned non-2xx for fundingRate {symbol}"))?;
+
+        let arr: Value = resp.json().await.context("decode fundingRate JSON")?;
+        let items = arr
+            .as_array()
+            .context("fundingRate response is not a JSON array")?;
+
+        let mut rows = Vec::with_capacity(items.len());
+        for (idx, v) in items.iter().enumerate() {
+            let obj = v
+                .as_object()
+                .with_context(|| format!("fundingRate #{idx} is not an object"))?;
+            let ts_ms = obj
+                .get("fundingTime")
+                .and_then(|x| x.as_i64())
+                .with_context(|| format!("fundingRate #{idx}.fundingTime missing"))?;
+            let rate = obj
+                .get("fundingRate")
+                .and_then(|x| x.as_str())
+                .with_context(|| format!("fundingRate #{idx}.fundingRate missing"))?
+                .parse::<f64>()
+                .with_context(|| format!("fundingRate #{idx}.fundingRate decode"))?;
+            rows.push(FundingRateRow {
+                ts: ms_to_utc(ts_ms),
+                rate,
             });
         }
         Ok(rows)
