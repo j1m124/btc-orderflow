@@ -18,6 +18,7 @@ mod drawings_view;
 mod footprint;
 mod footprint_settings;
 mod heatmap_settings;
+mod liq_heatmap_settings;
 mod paint;
 mod state;
 mod view;
@@ -32,7 +33,11 @@ pub use footprint::{
 };
 pub use footprint_settings::{ChartRenderSettingsView, OpenChartRenderSettings};
 pub use heatmap_settings::HeatmapSettingsView;
-pub use paint::{COLOR_RANGE_MAX, COLOR_RANGE_MIN, HEATMAP_DEPTH, HeatmapSettings};
+pub use liq_heatmap_settings::LiqHeatmapSettingsView;
+pub use paint::{
+    COLOR_RANGE_MAX, COLOR_RANGE_MIN, HEATMAP_DEPTH, HeatmapSettings, LIQ_COLOR_RANGE_MAX,
+    LIQ_COLOR_RANGE_MIN,
+};
 pub use state::ChartState;
 pub use view::render;
 

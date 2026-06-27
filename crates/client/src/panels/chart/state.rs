@@ -253,6 +253,12 @@ pub struct ChartState {
     /// 1s sampling that feed it are owned by `ContentPanel` (lazy on enable).
     /// Carries over symbol/timeframe switches like the render settings.
     pub(super) heatmap: super::paint::HeatmapLayer,
+    /// Predictive liquidation heatmap render layer — independent of `heatmap`
+    /// (its own texture cache + atlas tile), driven by a forward simulation
+    /// over the candle / OI / mark series this state already gathers rather than
+    /// a book subscription. Both heatmaps may be on at once. Carries over
+    /// symbol/timeframe switches like `heatmap`.
+    pub(super) liq_heatmap: super::paint::LiqHeatmapLayer,
 }
 
 /// Baseline captured at splitter mouse-down. The outer mouse-move handler
@@ -310,10 +316,12 @@ impl ChartState {
         // `refresh_heatmap` (empty new-symbol series ⇒ `drop_cache`) instead of
         // leaking when the old `ChartState` drops.
         let heatmap = std::mem::take(&mut self.heatmap);
+        let liq_heatmap = std::mem::take(&mut self.liq_heatmap);
         *self = Self::new(symbol, self.timeframe, candles);
         self.adopt_indicators(indicators);
         self.adopt_render_settings(render);
         self.heatmap = heatmap;
+        self.liq_heatmap = liq_heatmap;
         true
     }
 
@@ -333,10 +341,12 @@ impl ChartState {
         // new TF ⇒ the book sub is unchanged, but the candle x-mapping differs,
         // so the next `refresh_heatmap` rebuilds (and drops the old tile).
         let heatmap = std::mem::take(&mut self.heatmap);
+        let liq_heatmap = std::mem::take(&mut self.liq_heatmap);
         *self = Self::new(symbol.as_ref(), tf, candles);
         self.adopt_indicators(indicators);
         self.adopt_render_settings(render);
         self.heatmap = heatmap;
+        self.liq_heatmap = liq_heatmap;
         true
     }
 
@@ -1285,6 +1295,7 @@ impl ChartState {
             last_recomputed_view_range: None,
             volume_unit: VolumeUnit::default(),
             heatmap: super::paint::HeatmapLayer::default(),
+            liq_heatmap: super::paint::LiqHeatmapLayer::default(),
         };
         // No default indicator. Fresh charts are born empty; the user
         // adds indicators via the picker and persistence carries them
@@ -1521,5 +1532,106 @@ impl ChartState {
     /// overlay is off / unbuilt. Captured into the chart's paint closure.
     pub(super) fn heatmap_paint_rect(&self) -> Option<super::paint::HeatmapRect> {
         self.heatmap.paint_rect()
+    }
+
+    // --- Liquidation heatmap -------------------------------------------------
+    //
+    // The predictive liquidation heatmap is a singleton overlay *indicator*
+    // (`liq_heatmap`), mirroring `ob_heatmap`: on/off + settings + sim knobs
+    // live on the instance's `LiqHeatmapParams` (the single source of truth);
+    // `LiqHeatmapLayer` is just the texture cache. `refresh_liq_heatmap` syncs
+    // the instance into the layer's mirror fields and runs the sim. Unlike the
+    // orderbook heatmap it needs **no** book subscription — the sim reads the
+    // candle / OI / mark caches this state already holds.
+
+    fn liq_heatmap_instance(&self) -> Option<&IndicatorInstance> {
+        self.indicators.iter().find(|i| i.kind_id == "liq_heatmap")
+    }
+
+    /// Whether a liq-heatmap instance exists at all (even if hidden). Drives the
+    /// OI + mark-price subscription gate (the sim needs both).
+    pub fn has_liq_heatmap_indicator(&self) -> bool {
+        self.liq_heatmap_instance().is_some()
+    }
+
+    /// Whether the liq heatmap should paint this frame: an instance exists and
+    /// isn't hidden.
+    pub fn liq_heatmap_enabled(&self) -> bool {
+        self.liq_heatmap_instance().is_some_and(|i| !i.hidden)
+    }
+
+    /// `(sim_params, settings)` from the instance params, or defaults when no
+    /// instance is attached. The sim params carry MMR, lookback, and the
+    /// user-selected price-bucket ("tick size").
+    fn liq_heatmap_instance_params(
+        &self,
+    ) -> (
+        crate::indicators::liq_heatmap::sim::SimParams,
+        super::paint::HeatmapSettings,
+    ) {
+        self.liq_heatmap_instance()
+            .and_then(|i| {
+                i.kind
+                    .as_any()
+                    .downcast_ref::<crate::indicators::LiqHeatmapParams>()
+            })
+            .map(|p| (p.sim_params(), p.settings))
+            .unwrap_or_else(|| {
+                let p = crate::indicators::LiqHeatmapParams::default();
+                (p.sim_params(), p.settings)
+            })
+    }
+
+    /// Rebuild the liq-heatmap texture for the current view if needed. Syncs the
+    /// layer's mirror from the instance, then runs the sim over the candle / OI
+    /// / mark caches. No-op (beyond a possible cache drop) when off or unpainted.
+    /// Called by `ContentPanel::render` before `chart::render`, where a
+    /// `&mut Window` is available for atlas eviction.
+    pub fn refresh_liq_heatmap(&mut self, now_ms: i64, window: &mut Window) {
+        let on = self.liq_heatmap_enabled();
+        let (sim_params, settings) = self.liq_heatmap_instance_params();
+        self.liq_heatmap.enabled = on;
+        self.liq_heatmap.settings = settings;
+        if !on {
+            self.liq_heatmap.drop_cache(window);
+            return;
+        }
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        if self.candles.is_empty() {
+            return;
+        }
+        let tf_ms = self.timeframe.duration_ms();
+        let lo_ms = super::drawings_view::idx_to_time(self.view_start, &self.candles, tf_ms);
+        let hi_ms = super::drawings_view::idx_to_time(
+            self.view_start + self.view_size,
+            &self.candles,
+            tf_ms,
+        );
+        let (y_lo, y_hi) = self.y_range();
+        let canvas_w = f32::from(bounds.size.width);
+        let anchor_ms = self.candles[0].open_time;
+        self.liq_heatmap.refresh(
+            &self.candles,
+            &self.open_interest_cache,
+            &self.mark_price_cache,
+            sim_params,
+            lo_ms,
+            hi_ms,
+            y_lo,
+            y_hi,
+            canvas_w,
+            tf_ms,
+            anchor_ms,
+            now_ms,
+            window,
+        );
+    }
+
+    /// The built liq-heatmap texture + its data-rect for the paint pass, or
+    /// `None` when off / unbuilt. Captured into the chart's paint closure.
+    pub(super) fn liq_heatmap_paint_rect(&self) -> Option<super::paint::HeatmapRect> {
+        self.liq_heatmap.paint_rect()
     }
 }

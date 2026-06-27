@@ -781,6 +781,9 @@ pub fn render(
     // a `&mut Window` for atlas eviction); here we only capture the cheap
     // Arc-backed rect into the paint closure.
     let paint_heatmap_rect: Option<HeatmapRect> = state.heatmap_paint_rect();
+    // Predictive liquidation-heatmap texture (also behind candles). Independent
+    // layer / texture; painted after the orderbook heatmap, before the candles.
+    let paint_liq_heatmap_rect: Option<HeatmapRect> = state.liq_heatmap_paint_rect();
     // Pre-filter overlay indicators for the paint closure: skip hidden /
     // pane-placed instances, snapshot color + output so the closure stays
     // 'static. Per-render clone — `Series` is a `Vec<Option<f64>>`, so the
@@ -2390,8 +2393,29 @@ pub fn render(
                             // Mirrors what `render_drawings_overlay` does for
                             // drawing labels.
                             window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                                // Heatmap paints first — behind candles/grid.
+                                // Heatmaps paint first — behind candles/grid.
+                                // Orderbook liquidity, then liquidation magnets
+                                // (independent layers; both may be on at once).
                                 if let Some(rect) = &paint_heatmap_rect {
+                                    paint_heatmap(
+                                        rect,
+                                        bounds.origin,
+                                        &paint_candles,
+                                        paint_start_idx,
+                                        paint_candle_interval_ms,
+                                        paint_view_start,
+                                        paint_view_size,
+                                        f32::from(bounds.size.width),
+                                        paint_y_axis_gap,
+                                        y_lo,
+                                        y_hi,
+                                        f32::from(bounds.size.height),
+                                        paint_volume_unit,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                                if let Some(rect) = &paint_liq_heatmap_rect {
                                     paint_heatmap(
                                         rect,
                                         bounds.origin,

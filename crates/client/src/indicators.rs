@@ -14,6 +14,7 @@ pub mod funding;
 pub mod instance;
 pub mod kind;
 pub mod liq_bars;
+pub mod liq_heatmap;
 pub mod math;
 pub mod net_ls;
 pub mod ob_heatmap;
@@ -29,6 +30,7 @@ pub use bar_stat::{BarStatGrade, BarStatParams};
 pub use bb::BbParams;
 pub use funding::{FundingParams, FundingRenderMode};
 pub use liq_bars::{LiqBarsScale, LiquidationBarsParams};
+pub use liq_heatmap::LiqHeatmapParams;
 pub use net_ls::NetLsParams;
 pub use ob_heatmap::OrderbookHeatmapParams;
 pub use ob_imbalance::ObImbalanceParams;
@@ -160,6 +162,13 @@ pub fn kind_entries() -> Vec<KindEntry> {
             category: Category::Volume,
             spawn: || Box::new(OrderbookHeatmapParams::default()),
         },
+        KindEntry {
+            kind_id: "liq_heatmap",
+            name: "Liquidation Heatmap".into(),
+            description: "Predictive liquidation magnets behind the candles: estimated un-liquidated leverage from OI + taker delta, brighter = denser cluster. Singleton.".into(),
+            category: Category::Volume,
+            spawn: || Box::new(LiqHeatmapParams::default()),
+        },
     ]
 }
 
@@ -168,7 +177,7 @@ pub fn kind_entries() -> Vec<KindEntry> {
 /// refuses a duplicate. The heatmap is singleton because there is one order book
 /// / one texture cache per chart — a second instance would be redundant work.
 pub fn is_singleton_kind(kind_id: &str) -> bool {
-    matches!(kind_id, "ob_heatmap")
+    matches!(kind_id, "ob_heatmap" | "liq_heatmap")
 }
 
 /// Rebuild a boxed `dyn IndicatorKind` from a `kind_id` + serialized params.
@@ -211,6 +220,9 @@ pub fn build_kind(
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         "ob_heatmap" => serde_json::from_value::<OrderbookHeatmapParams>(params.clone())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
+        "liq_heatmap" => serde_json::from_value::<LiqHeatmapParams>(params.clone())
             .ok()
             .map(|p| Box::new(p) as Box<dyn IndicatorKind>),
         // Bollinger Bands is retained in-tree but isn't user-spawnable. Legacy

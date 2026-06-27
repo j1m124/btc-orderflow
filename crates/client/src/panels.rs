@@ -2140,7 +2140,11 @@ impl ContentPanel {
     pub(crate) fn refresh_chart_oi_bars_sub(&mut self, cx: &mut Context<Self>) {
         let want = self.chart_state.as_ref().and_then(|state| {
             let any_live = state.indicators().iter().any(|i| {
-                if i.kind_id == "open_interest" || i.kind_id == "net_ls" {
+                // The liq heatmap's sim needs ΔOI for magnitude.
+                if i.kind_id == "open_interest"
+                    || i.kind_id == "net_ls"
+                    || i.kind_id == "liq_heatmap"
+                {
                     return true;
                 }
                 if let Some(bs) = i
@@ -2194,7 +2198,13 @@ impl ContentPanel {
     pub(crate) fn refresh_chart_mark_price_sub(&mut self, cx: &mut Context<Self>) {
         let want = self.chart_state.as_ref().and_then(|state| {
             let any_live = state.indicators().iter().any(|i| {
-                if i.kind_id == "open_interest" || i.kind_id == "funding" || i.kind_id == "net_ls" {
+                // The liq heatmap's sim needs mark price as the OI USD factor
+                // (and a fallback entry/notional reference).
+                if i.kind_id == "open_interest"
+                    || i.kind_id == "funding"
+                    || i.kind_id == "net_ls"
+                    || i.kind_id == "liq_heatmap"
+                {
                     return true;
                 }
                 if let Some(bs) = i
@@ -2389,6 +2399,20 @@ impl ContentPanel {
         let series = svc.book_series(symbol.as_ref(), chart::HEATMAP_DEPTH);
         if let Some(chart) = self.chart_state.as_mut() {
             chart.refresh_heatmap(series, now_ms, window);
+        }
+    }
+
+    /// Rebuild the predictive liquidation-heatmap GPU texture for the current
+    /// view if needed. Unlike the orderbook heatmap this reads no service
+    /// series — the simulation runs over the candle / OI / mark caches
+    /// `ChartState` already owns — so it's a single delegating call.
+    /// `ChartState::refresh_liq_heatmap` throttles the actual rebuild and syncs
+    /// the layer's mirror off (dropping the tile) when no instance is painting.
+    /// Called from `render` because it needs a `&mut Window` (atlas eviction).
+    fn refresh_chart_liq_heatmap_texture(&mut self, window: &mut Window) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(chart) = self.chart_state.as_mut() {
+            chart.refresh_liq_heatmap(now_ms, window);
         }
     }
 
@@ -3163,6 +3187,10 @@ impl Render for ContentPanel {
                 // its Arc — needs `&mut Window` for atlas eviction, which the
                 // paint closure (App-only) can't do.
                 self.refresh_chart_heatmap_texture(window, cx);
+                // Rebuild the predictive liquidation-heatmap texture (if dirty).
+                // Independent layer; runs the sim over the candle/OI/mark caches
+                // ChartState already holds (no service read needed).
+                self.refresh_chart_liq_heatmap_texture(window);
                 // Reduce the book into the OB-imbalance cache (throttled) so the
                 // OB rows / pane stay fresh from the same book time-series.
                 self.maybe_refresh_book_imbalance(cx);

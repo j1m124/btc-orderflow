@@ -924,8 +924,12 @@ fn flush_candle(
 /// Flush one accumulated candle into its column block, mapping its candle-grid
 /// slot to texel columns. `is_last` marks the live (extend-right) candle, which
 /// stretches to the right edge. Appends the value-table sample when retained.
+///
+/// `pub(super)` so the sibling liquidation-heatmap layer (`paint/liq_heatmap.rs`)
+/// reuses the identical candle→column projection — its sim grid is fed through
+/// the same primitive, guaranteeing byte-identical column placement.
 #[allow(clippy::too_many_arguments)]
-fn flush_one(
+pub(super) fn flush_one(
     cand_start: i64,
     is_last: bool,
     half: i64,
@@ -969,8 +973,11 @@ fn flush_one(
 /// the colour maths (`ln` + `powf` + ramp — the bulk of the per-rebuild CPU
 /// cost) is computed once per distinct column and the rest are a byte copy of
 /// the left neighbour.
+// `pub(super)` so the liquidation-heatmap layer shares the exact log-ramp +
+// `max_opacity` mapping, keeping its texture colours consistent with the
+// crisp-cell / text painters (which recompute `norm` from `log_lo`/`log_span`).
 #[allow(clippy::too_many_arguments)]
-fn colorize_range(
+pub(super) fn colorize_range(
     grid: &[f32],
     cols: usize,
     rows: usize,
@@ -1022,8 +1029,10 @@ fn colorize_range(
 /// Wrap the retained logical-cell `samples` into the immutable value table the
 /// paint pass reads for crisp quads / in-cell text. `None` when the table isn't
 /// retained (too many buckets/candles) or nothing is lit.
+// `pub(super)` so the liquidation-heatmap layer wraps its sim-grid samples into
+// the same immutable value table the shared paint pass reads.
 #[allow(clippy::too_many_arguments)]
-fn build_values(
+pub(super) fn build_values(
     want_values: bool,
     samples: &[HeatmapSample],
     b: f64,
