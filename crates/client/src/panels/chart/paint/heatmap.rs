@@ -692,21 +692,21 @@ pub struct HeatmapRect {
     pub profile: Option<Arc<HeatmapProfile>>,
 }
 
-/// Aggregated per-price-bucket magnitude for the right-anchored **profile** — a
-/// horizontal histogram summarising the heatmap over the built time range
-/// (bucket `k` spans price `[price_lo + k·bucket, … + bucket)`). Each bucket
-/// holds the **peak** magnitude any single column reached there, *not* a sum:
-/// magnets persist across columns, so summing would inflate a level by how long
-/// it sat on screen rather than its strength — and the peak keeps each bar on
-/// the **same value scale as the heatmap cells**, so bar length + colour
-/// (both via the shared log ramp `lo` / `log_lo` / `log_span`) match the hottest
-/// cell at that price exactly.
+/// Per-price-bucket magnitude for the right-anchored **profile** — a horizontal
+/// histogram drawn on the price axis (bucket `k` spans price
+/// `[price_lo + k·bucket, … + bucket)`). The liquidation heatmap is its only
+/// producer: each bucket holds the magnitude of the **current** (most recent)
+/// sim column at that price — the live magnet snapshot, the same values
+/// `extend_right` projects to the right edge — *not* an aggregate over history.
+/// Because the values are exactly the heatmap's rightmost cells, bar length +
+/// colour (both via the shared log ramp `lo` / `log_lo` / `log_span`) match
+/// those cells exactly.
 pub struct HeatmapProfile {
     pub bucket: f64,
     pub price_lo: f64,
     pub n_buckets: usize,
-    /// `peaks[k]` = the largest magnitude bucket `k` reached in any one column.
-    pub peaks: Vec<f32>,
+    /// `values[k]` = the current sim column's magnitude at bucket `k`.
+    pub values: Vec<f32>,
     pub lo: f64,
     pub log_lo: f32,
     pub log_span: f32,
@@ -852,7 +852,7 @@ pub fn paint_heatmap_profile(
     let k_hi = k_hi.min(profile.n_buckets);
 
     for k in k_lo..k_hi {
-        let v = profile.peaks[k];
+        let v = profile.values[k];
         if v <= 0.0 || (v as f64) < profile.lo || v < lo_f {
             continue;
         }

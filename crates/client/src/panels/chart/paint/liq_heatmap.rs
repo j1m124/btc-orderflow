@@ -400,19 +400,21 @@ fn build_full(
         return None;
     }
 
-    // Profile: peak magnitude per price bucket across every built column
-    // (band-relative via `base`). Peak — not sum — because magnets persist
-    // across columns (a sum would scale a level by its on-screen dwell, not its
-    // strength) and the peak keeps each bar on the heatmap cells' value scale so
-    // the shared log ramp colours them identically. Cheap: one pass over the
-    // sparse per-column bucket lists, built inline when the toggle is on.
+    // Profile: the **current** estimated liquidation levels — the last (most
+    // recent) sim column, band-relative via `base`. This is exactly the column
+    // that `extend_right` projects to the right edge, so the profile bars line
+    // up with the heatmap's rightmost cells and colour-match them under the
+    // shared log ramp (the last column's cell values ARE the rendered cells).
+    // NOT a peak/sum across history — the user wants the live magnet snapshot,
+    // not where magnets ever were. Cheap: one pass over the last column's sparse
+    // bucket list, built inline when the toggle is on.
     let profile = if show_profile {
-        let mut peaks = vec![0.0f32; n_buckets];
-        for col in &columns {
+        let mut values = vec![0.0f32; n_buckets];
+        if let Some(col) = columns.last() {
             for &(k_abs, v) in &col.buckets {
                 let k = k_abs - base;
-                if k >= 0 && (k as usize) < n_buckets && v > peaks[k as usize] {
-                    peaks[k as usize] = v;
+                if k >= 0 && (k as usize) < n_buckets {
+                    values[k as usize] = v;
                 }
             }
         }
@@ -420,7 +422,7 @@ fn build_full(
             bucket: b,
             price_lo: pl,
             n_buckets,
-            peaks,
+            values,
             lo,
             log_lo,
             log_span,

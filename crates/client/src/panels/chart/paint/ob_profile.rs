@@ -7,9 +7,10 @@
 //!
 //! No texture / cache (unlike the heatmaps): the live snapshot is cheap to
 //! bucketize over just the visible band, so each frame re-bins straight into
-//! quads. Each side (bids below mid, asks above) scales to its own largest
-//! visible bucket and shares the right-edge anchor; the two never overlap in
-//! price, so a single anchor + band reads cleanly.
+//! quads. Both sides (bids below mid, asks above) scale to a **shared** max —
+//! the largest visible bucket across both sides — so a bid bar and an ask bar of
+//! equal length mean equal size; they share the right-edge anchor and never
+//! overlap in price, so a single anchor + band reads cleanly.
 
 use std::collections::BTreeMap;
 
@@ -49,7 +50,8 @@ fn bucket_mag(usd: bool, w: f64, k: i64, qty: f64) -> f64 {
 /// Paint the live order book as right-anchored horizontal bars on the price
 /// axis. Reads `book_snapshot` fresh from the service, drops crossed levels,
 /// bins each side onto buckets overlapping the visible price band, and scales
-/// each side independently to its own largest visible bucket.
+/// both sides to a single shared max (the largest visible bucket across both
+/// sides) so bid and ask bar lengths are directly comparable.
 #[allow(clippy::too_many_arguments)]
 pub fn paint_ob_profile(
     params: &ObProfilePaintParams,
@@ -129,8 +131,10 @@ pub fn paint_ob_profile(
             .map(|(&k, &q)| bucket_mag(usd, w, k, q))
             .fold(0.0_f64, f64::max)
     };
-    let max_bid = side_max(&bid_buckets);
-    let max_ask = side_max(&ask_buckets);
+    // Shared scale across both sides: a bid bar and an ask bar of equal length
+    // represent equal size. (Scaling sides independently would make the larger
+    // side of a lopsided book look the same as the smaller.)
+    let max_both = side_max(&bid_buckets).max(side_max(&ask_buckets));
 
     // Anchor at the plot's right edge (price axis excluded) so bars never paint
     // over the y-axis labels.
@@ -139,7 +143,7 @@ pub fn paint_ob_profile(
 
     paint_side(
         &bid_buckets,
-        max_bid,
+        max_both,
         usd,
         w,
         anchor_x,
@@ -153,7 +157,7 @@ pub fn paint_ob_profile(
     );
     paint_side(
         &ask_buckets,
-        max_ask,
+        max_both,
         usd,
         w,
         anchor_x,
@@ -168,7 +172,7 @@ pub fn paint_ob_profile(
 }
 
 /// Draw one side's bucket bars, right-anchored at `anchor_x`, each scaled to
-/// `max` (the side's largest visible bucket).
+/// `max` (the largest visible bucket across *both* sides — a shared scale).
 #[allow(clippy::too_many_arguments)]
 fn paint_side(
     buckets: &BTreeMap<i64, f64>,
