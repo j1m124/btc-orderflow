@@ -6,6 +6,8 @@
 //! caller wraps [`connect_and_stream`] in a reconnect loop that also runs
 //! gap-heal REST passes between connections.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 use protocol::Timeframe;
 use futures::{SinkExt, StreamExt};
@@ -16,6 +18,31 @@ use super::{
     BroadcastTxs, WS_BASE,
     parse::{CombinedStreamMsg, InboundEvent},
 };
+
+/// Cap on the initial WS handshake. A half-open TCP path can otherwise wedge
+/// `connect_async` on the OS SYN/TLS retry budget (minutes) with no way for the
+/// caller's reconnect loop to intervene. Normal connects finish in <1s, so 10s
+/// is ~10× headroom; a spurious timeout just backs off and retries.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Liveness watchdog for the read side — **the fix for the 2026-07-07 incident**
+/// where the market stream wedged for 3 days with no error logged.
+///
+/// A half-open TCP connection (a NAT/router silently drops the path without a
+/// FIN/RST reaching us) leaves `ws.next()` blocked *forever*: no error, so the
+/// caller's reconnect + gap-heal loop never fires. We defend by requiring *some*
+/// frame within this window; if none arrives we return an error and let the
+/// caller reconnect.
+///
+/// Chosen above Binance's server-side keepalive cadence so it never false-fires
+/// on a legitimately data-quiet connection: Binance sends an application `ping`
+/// every ~3 min on every stream family, and those pings surface through
+/// `ws.next()` (see the `Message::Ping` arm) and reset this timer. 4 min leaves
+/// a full ping interval of margin over that 3-min floor while still detecting a
+/// genuinely dead socket within minutes instead of never. (Our actual data
+/// cadence — kline updates every ~1–2s, depth@100ms, markPrice@1s — is far
+/// faster still, so in practice detection is bounded by data, not pings.)
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// Binance Futures partitions WS streams across two endpoint families and
 /// silently drops events for streams that don't belong to the connected
@@ -80,16 +107,27 @@ pub async fn connect_and_stream(
 ) -> Result<()> {
     info!(label, url = %url, "connecting to Binance combined stream");
 
-    let (mut ws, _resp) = connect_async(url)
+    let (mut ws, _resp) = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(url))
         .await
+        .map_err(|_| anyhow!("connect to {url} timed out after {WS_CONNECT_TIMEOUT:?}"))?
         .with_context(|| format!("connect to {url}"))?;
     info!(label, "binance combined stream connected");
 
     loop {
-        let msg = match ws.next().await {
-            Some(Ok(msg)) => msg,
-            Some(Err(e)) => return Err(anyhow!("ws read error: {e}")),
-            None => return Err(anyhow!("ws stream ended")),
+        // Bound the read on a liveness watchdog: a half-open connection leaves
+        // `ws.next()` pending forever, so without this the reconnect loop can
+        // never fire (the 2026-07-07 3-day stall). Any frame — data, ping, or
+        // pong — resets the window.
+        let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, ws.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            Ok(Some(Err(e))) => return Err(anyhow!("ws read error: {e}")),
+            Ok(None) => return Err(anyhow!("ws stream ended")),
+            Err(_) => {
+                return Err(anyhow!(
+                    "ws idle: no frame from Binance in {WS_IDLE_TIMEOUT:?} \
+                     ({label}); treating connection as half-open"
+                ));
+            }
         };
 
         match msg {
